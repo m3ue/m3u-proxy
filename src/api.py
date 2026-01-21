@@ -701,7 +701,8 @@ async def create_stream(request: StreamCreateRequest):
                 "primary_url": request.url,
                 "failover_urls": request.failover_urls or [],
                 "user_agent": request.user_agent,
-                "stream_type": "direct" if is_direct_stream(request.url) else "hls"
+                "stream_type": "direct" if is_direct_stream(request.url) else "hls",
+                "metadata": request.metadata or {}
             }
         )
         await event_manager.emit_event(event)
@@ -817,7 +818,8 @@ async def create_transcode_stream(request: TranscodeCreateRequest):
                 "stream_type": "transcoded",
                 "profile": profile_name,
                 "profile_variables": request.profile_variables or {},
-                "ffmpeg_args": ffmpeg_args
+                "ffmpeg_args": ffmpeg_args,
+                "metadata": request.metadata or {}
             }
         )
         await event_manager.emit_event(event)
@@ -951,6 +953,7 @@ async def get_hls_playlist(
             )
 
             # Emit client connected event
+            stream_info = stream_manager.streams.get(stream_id)
             event = StreamEvent(
                 event_type=EventType.CLIENT_CONNECTED,
                 stream_id=stream_id,
@@ -958,7 +961,8 @@ async def get_hls_playlist(
                     "client_id": client_id,
                     "user_agent": client_info_data["user_agent"],
                     "ip_address": client_info_data["ip_address"],
-                    "username": client_info_data.get("username")
+                    "username": client_info_data.get("username"),
+                    "metadata": stream_info.metadata if stream_info else {}
                 }
             )
             await event_manager.emit_event(event)
@@ -1603,7 +1607,8 @@ async def delete_oldest_stream_by_metadata(
             "filter_field": field,
             "filter_value": value,
             "was_transcoded": stream_info.is_transcoded,
-            "stream_age_seconds": (datetime.now(timezone.utc) - oldest_created_at).total_seconds() if oldest_created_at else None
+            "stream_age_seconds": (datetime.now(timezone.utc) - oldest_created_at).total_seconds() if oldest_created_at else None,
+            "metadata": stream_info.metadata
         })
 
         # Remove stream
@@ -1690,7 +1695,8 @@ async def delete_streams_by_metadata(
                     "reason": "metadata_filter_deletion",
                     "filter_field": field,
                     "filter_value": value,
-                    "was_transcoded": stream_info.is_transcoded
+                    "was_transcoded": stream_info.is_transcoded,
+                    "metadata": stream_info.metadata
                 })
 
                 # Remove stream
@@ -1745,7 +1751,8 @@ async def delete_stream(stream_id: str):
         # Emit stream_stopped event before removing the stream
         await stream_manager._emit_event("STREAM_STOPPED", stream_id, {
             "reason": "manual_deletion",
-            "was_transcoded": stream_info.is_transcoded
+            "was_transcoded": stream_info.is_transcoded,
+            "metadata": stream_info.metadata
         })
 
         # Remove stream
