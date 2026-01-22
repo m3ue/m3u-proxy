@@ -77,6 +77,7 @@ class Settings(BaseSettings):
     REDIS_ENABLED: bool = False
     ENABLE_TRANSCODING_POOLING: bool = True
     MAX_CLIENTS_PER_SHARED_STREAM: int = 10
+    CHANGE_BUFFER_CHUNKS: int = 100
 
     # Worker configuration
     WORKER_ID: Optional[str] = None
