@@ -455,7 +455,7 @@ class SharedTranscodingProcess:
         """Add a client to this shared process and return their queue"""
         async with self._broadcaster_lock:
             # Create a queue for this client (max 100 chunks buffered)
-            client_queue = asyncio.Queue(maxsize=100)
+            client_queue = asyncio.Queue(maxsize=settings.CHANGE_BUFFER_CHUNKS)
             self.client_queues[client_id] = client_queue
             self.clients[client_id] = time.time()
             self.last_access = time.time()
