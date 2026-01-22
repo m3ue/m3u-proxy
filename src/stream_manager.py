@@ -476,7 +476,8 @@ class StreamManager:
             "user_agent": user_agent,
             "ip_address": ip_address,
             "username": username,
-            "stream_client_count": len(self.stream_clients[effective_stream_id]) if effective_stream_id in self.stream_clients else 0
+            "stream_client_count": len(self.stream_clients[effective_stream_id]) if effective_stream_id in self.stream_clients else 0,
+            "metadata": self.streams[effective_stream_id].metadata if effective_stream_id in self.streams else {}
         })
 
         return client_info
@@ -504,7 +505,8 @@ class StreamManager:
             await self._emit_event("CLIENT_DISCONNECTED", stream_id or "unknown", {
                 "client_id": client_id,
                 "bytes_served": client_info.bytes_served,
-                "segments_served": client_info.segments_served
+                "segments_served": client_info.segments_served,
+                "metadata": self.streams[stream_id].metadata if stream_id and stream_id in self.streams else {}
             })
             # Notify pooled manager (if any) that this client is gone so shared
             # transcoding processes can be cleaned up when no clients remain.
@@ -628,7 +630,8 @@ class StreamManager:
                         await self._emit_event("STREAM_STARTED", stream_id, {
                             "url": active_url,
                             "client_id": client_id,
-                            "mode": "direct_proxy"
+                            "mode": "direct_proxy",
+                            "metadata": stream_info.metadata
                         })
                     else:
                         logger.info(
@@ -1006,7 +1009,8 @@ class StreamManager:
                         await self._emit_event("STREAM_STOPPED", stream_id, {
                             "client_id": client_id,
                             "bytes_served": bytes_served,
-                            "chunks_served": chunk_count
+                            "chunks_served": chunk_count,
+                            "metadata": stream_info.metadata
                         })
                         break  # Exit the failover loop
                     # else: failover event was set, continue to next iteration
@@ -2453,7 +2457,8 @@ class StreamManager:
                 # Emit stream_stopped event before removing the stream
                 await self._emit_event("STREAM_STOPPED", stream_id, {
                     "reason": "inactive_timeout",
-                    "timeout_seconds": self.stream_timeout
+                    "timeout_seconds": self.stream_timeout,
+                    "metadata": stream_info.metadata
                 })
 
                 del self.streams[stream_id]
