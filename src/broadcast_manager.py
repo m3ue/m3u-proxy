@@ -82,7 +82,8 @@ class NetworkBroadcastProcess:
     def __init__(self, config: BroadcastConfig, hls_base_dir: str):
         self.config = config
         self.network_id = config.network_id
-        self.hls_dir = os.path.join(hls_base_dir, f"broadcast_{config.network_id}")
+        self.hls_dir = os.path.join(
+            hls_base_dir, f"broadcast_{config.network_id}")
         self.process: Optional[asyncio.subprocess.Process] = None
         self.status = "starting"
         self.current_segment_number = config.segment_start_number
@@ -128,7 +129,8 @@ class NetworkBroadcastProcess:
                 cmd.extend(["-b:v", f"{self.config.video_bitrate}k"])
             if self.config.video_resolution:
                 cmd.extend(["-vf", f"scale={self.config.video_resolution}"])
-            cmd.extend(["-c:a", "aac", "-b:a", f"{self.config.audio_bitrate}k"])
+            cmd.extend(
+                ["-c:a", "aac", "-b:a", f"{self.config.audio_bitrate}k"])
         else:
             cmd.extend(["-c:v", "copy", "-c:a", "copy"])
 
@@ -167,10 +169,12 @@ class NetworkBroadcastProcess:
             try:
                 os.chmod(self.hls_dir, 0o755)
             except Exception as e:
-                logger.warning(f"Failed to set permissions on {self.hls_dir}: {e}")
+                logger.warning(
+                    f"Failed to set permissions on {self.hls_dir}: {e}")
 
             cmd = self._build_ffmpeg_command()
-            logger.info(f"Starting broadcast {self.network_id}: {' '.join(cmd)}")
+            logger.info(
+                f"Starting broadcast {self.network_id}: {' '.join(cmd)}")
 
             self.process = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -185,7 +189,8 @@ class NetworkBroadcastProcess:
             self._stderr_task = asyncio.create_task(self._log_stderr())
             self._monitor_task = asyncio.create_task(self._monitor_process())
 
-            logger.info(f"Broadcast {self.network_id} started with PID {self.process.pid}")
+            logger.info(
+                f"Broadcast {self.network_id} started with PID {self.process.pid}")
             return True
 
         except Exception as e:
@@ -214,7 +219,8 @@ class NetworkBroadcastProcess:
                     try:
                         await asyncio.wait_for(self.process.wait(), timeout=5.0)
                     except asyncio.TimeoutError:
-                        logger.warning(f"Broadcast {self.network_id} did not terminate gracefully, killing")
+                        logger.warning(
+                            f"Broadcast {self.network_id} did not terminate gracefully, killing")
                         self.process.kill()
                         await self.process.wait()
                 else:
@@ -237,7 +243,8 @@ class NetworkBroadcastProcess:
         self.current_segment_number = final_segment
         self.status = "stopped"
 
-        logger.info(f"Broadcast {self.network_id} stopped, final segment: {final_segment}")
+        logger.info(
+            f"Broadcast {self.network_id} stopped, final segment: {final_segment}")
         return final_segment
 
     # Patterns to skip in FFmpeg output (verbose/noisy messages)
@@ -281,7 +288,8 @@ class NetworkBroadcastProcess:
                         if pattern in line_lower:
                             self.error_message = line_str
                             self.status = "failed"
-                            logger.error(f"Broadcast {self.network_id} error: {line_str}")
+                            logger.error(
+                                f"Broadcast {self.network_id} error: {line_str}")
                             # Send failure callback
                             await self._send_callback("broadcast_failed", {
                                 "error": line_str,
@@ -290,18 +298,21 @@ class NetworkBroadcastProcess:
                             return
 
                     # Skip verbose/noisy messages entirely
-                    should_skip = any(pattern in line_lower for pattern in self.SKIP_LOG_PATTERNS)
+                    should_skip = any(
+                        pattern in line_lower for pattern in self.SKIP_LOG_PATTERNS)
                     if should_skip:
                         continue
 
                     # Log warnings and errors only
                     if 'error' in line_lower or 'warning' in line_lower or 'failed' in line_lower:
-                        logger.warning(f"Broadcast {self.network_id}: {line_str}")
+                        logger.warning(
+                            f"Broadcast {self.network_id}: {line_str}")
 
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            logger.error(f"Error reading FFmpeg stderr for {self.network_id}: {e}")
+            logger.error(
+                f"Error reading FFmpeg stderr for {self.network_id}: {e}")
 
     async def _monitor_process(self):
         """Monitor FFmpeg process and send callback when it exits."""
@@ -322,7 +333,8 @@ class NetworkBroadcastProcess:
             # Calculate duration streamed
             duration_streamed = 0.0
             if self.started_at:
-                duration_streamed = (datetime.now(timezone.utc) - self.started_at).total_seconds()
+                duration_streamed = (datetime.now(
+                    timezone.utc) - self.started_at).total_seconds()
 
             exit_code = self.process.returncode
             if exit_code == 0:
@@ -352,7 +364,8 @@ class NetworkBroadcastProcess:
     async def _send_callback(self, event: str, data: dict):
         """Send webhook callback to Laravel."""
         if not self.config.callback_url:
-            logger.debug(f"No callback URL for broadcast {self.network_id}, skipping callback")
+            logger.debug(
+                f"No callback URL for broadcast {self.network_id}, skipping callback")
             return
 
         payload = {
@@ -378,9 +391,11 @@ class NetworkBroadcastProcess:
                         f"Callback to {self.config.callback_url} failed with status {response.status_code}"
                     )
                 else:
-                    logger.info(f"Callback sent for broadcast {self.network_id}: {event}")
+                    logger.info(
+                        f"Callback sent for broadcast {self.network_id}: {event}")
         except Exception as e:
-            logger.error(f"Error sending callback for broadcast {self.network_id}: {e}")
+            logger.error(
+                f"Error sending callback for broadcast {self.network_id}: {e}")
 
     def _get_final_segment_number(self) -> int:
         """Get the highest segment number from existing files."""
@@ -400,7 +415,8 @@ class NetworkBroadcastProcess:
 
             return max_segment
         except Exception as e:
-            logger.error(f"Error getting final segment number for {self.network_id}: {e}")
+            logger.error(
+                f"Error getting final segment number for {self.network_id}: {e}")
             return self.config.segment_start_number
 
     def get_status(self) -> BroadcastStatus:
@@ -450,7 +466,8 @@ class BroadcastManager:
 
         # Ensure base directory exists
         os.makedirs(self.hls_base_dir, exist_ok=True)
-        logger.info(f"BroadcastManager initialized with base dir: {self.hls_base_dir}")
+        logger.info(
+            f"BroadcastManager initialized with base dir: {self.hls_base_dir}")
 
     async def start_broadcast(self, config: BroadcastConfig) -> BroadcastStatus:
         """
@@ -465,7 +482,8 @@ class BroadcastManager:
             # Check if broadcast already running
             if network_id in self.broadcasts:
                 existing = self.broadcasts[network_id]
-                logger.info(f"Transitioning broadcast {network_id} to new programme")
+                logger.info(
+                    f"Transitioning broadcast {network_id} to new programme")
 
                 # Stop existing process gracefully
                 final_segment = await existing.stop(graceful=True)
@@ -488,7 +506,8 @@ class BroadcastManager:
             success = await process.start()
 
             if not success:
-                raise RuntimeError(f"Failed to start broadcast: {process.error_message}")
+                raise RuntimeError(
+                    f"Failed to start broadcast: {process.error_message}")
 
             self.broadcasts[network_id] = process
             return process.get_status()
@@ -524,13 +543,15 @@ class BroadcastManager:
         """Read the HLS playlist content for a network."""
         if network_id not in self.broadcasts:
             # Check if directory exists even without active broadcast (for recovery)
-            playlist_path = os.path.join(self.hls_base_dir, f"broadcast_{network_id}", "live.m3u8")
+            playlist_path = os.path.join(
+                self.hls_base_dir, f"broadcast_{network_id}", "live.m3u8")
             if os.path.exists(playlist_path):
                 try:
                     with open(playlist_path, 'r') as f:
                         return f.read()
                 except Exception as e:
-                    logger.error(f"Error reading playlist for {network_id}: {e}")
+                    logger.error(
+                        f"Error reading playlist for {network_id}: {e}")
             return None
 
         process = self.broadcasts[network_id]
@@ -558,7 +579,8 @@ class BroadcastManager:
             return self.broadcasts[network_id].get_segment_path(filename)
 
         # Check directory even without active broadcast
-        segment_path = os.path.join(self.hls_base_dir, f"broadcast_{network_id}", safe_filename)
+        segment_path = os.path.join(
+            self.hls_base_dir, f"broadcast_{network_id}", safe_filename)
         return segment_path if os.path.exists(segment_path) else None
 
     async def cleanup_broadcast(self, network_id: str) -> bool:
@@ -570,15 +592,18 @@ class BroadcastManager:
                 del self.broadcasts[network_id]
 
             # Remove directory
-            broadcast_dir = os.path.join(self.hls_base_dir, f"broadcast_{network_id}")
+            broadcast_dir = os.path.join(
+                self.hls_base_dir, f"broadcast_{network_id}")
             if os.path.exists(broadcast_dir):
                 try:
                     import shutil
                     shutil.rmtree(broadcast_dir)
-                    logger.info(f"Cleaned up broadcast directory: {broadcast_dir}")
+                    logger.info(
+                        f"Cleaned up broadcast directory: {broadcast_dir}")
                     return True
                 except Exception as e:
-                    logger.error(f"Error cleaning up broadcast {network_id}: {e}")
+                    logger.error(
+                        f"Error cleaning up broadcast {network_id}: {e}")
                     return False
 
             return True
