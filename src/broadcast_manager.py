@@ -40,6 +40,11 @@ class BroadcastConfig:
     video_bitrate: Optional[str] = None
     audio_bitrate: int = 192
     video_resolution: Optional[str] = None
+    # Optional explicit codec/preset/hwaccel options (populated from Network transcode config)
+    video_codec: Optional[str] = None
+    audio_codec: Optional[str] = None
+    preset: Optional[str] = None
+    hwaccel: Optional[str] = None
     callback_url: Optional[str] = None
 
 
@@ -124,13 +129,27 @@ class NetworkBroadcastProcess:
 
         # Codec selection
         if self.config.transcode:
-            cmd.extend(["-c:v", "libx264", "-preset", "veryfast"])
+            # Hardware accel args (if present and the environment supports it) should be prepended
+            if getattr(self.config, 'hwaccel', None):
+                cmd.extend(["-hwaccel", self.config.hwaccel])
+
+            # Video codec selection (allow explicit codec like libx264 or h264_nvenc)
+            video_codec = self.config.video_codec or "libx264"
+            cmd.extend(["-c:v", video_codec])
+
+            # Preset if provided (libx264/libx265 and some encoders accept -preset)
+            if getattr(self.config, 'preset', None):
+                cmd.extend(["-preset", self.config.preset])
+
             if self.config.video_bitrate:
                 cmd.extend(["-b:v", f"{self.config.video_bitrate}k"])
             if self.config.video_resolution:
                 cmd.extend(["-vf", f"scale={self.config.video_resolution}"])
-            cmd.extend(
-                ["-c:a", "aac", "-b:a", f"{self.config.audio_bitrate}k"])
+
+            # Audio codec and bitrate
+            audio_codec = self.config.audio_codec or "aac"
+            cmd.extend(["-c:a", audio_codec, "-b:a",
+                       f"{self.config.audio_bitrate}k"])
         else:
             cmd.extend(["-c:v", "copy", "-c:a", "copy"])
 

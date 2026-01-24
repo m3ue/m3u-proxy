@@ -2020,6 +2020,11 @@ class BroadcastStartRequest(BaseModel):
     video_bitrate: Optional[str] = None
     audio_bitrate: int = 192
     video_resolution: Optional[str] = None
+    # Optional codec/preset/hwaccel to pass to the broadcast process
+    video_codec: Optional[str] = None
+    audio_codec: Optional[str] = None
+    preset: Optional[str] = None
+    hwaccel: Optional[str] = None
     callback_url: Optional[str] = None
 
     @field_validator('stream_url')
@@ -2075,6 +2080,10 @@ async def start_broadcast(
             video_bitrate=request.video_bitrate,
             audio_bitrate=request.audio_bitrate,
             video_resolution=request.video_resolution,
+            video_codec=request.video_codec,
+            audio_codec=request.audio_codec,
+            preset=request.preset,
+            hwaccel=request.hwaccel,
             callback_url=request.callback_url
         )
         status = await broadcast_manager.start_broadcast(config)
@@ -2220,7 +2229,8 @@ async def cleanup_broadcast(network_id: str) -> dict:
         if success:
             return {"message": f"Broadcast {network_id} cleaned up successfully"}
         else:
-            raise HTTPException(status_code=500, detail="Failed to clean up broadcast")
+            raise HTTPException(
+                status_code=500, detail="Failed to clean up broadcast")
     except Exception as e:
         logger.error(f"Error cleaning up broadcast {network_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
