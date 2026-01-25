@@ -2026,6 +2026,7 @@ class BroadcastStartRequest(BaseModel):
     preset: Optional[str] = None
     hwaccel: Optional[str] = None
     callback_url: Optional[str] = None
+    headers: Optional[Dict[str, str]] = None
 
     @field_validator('stream_url')
     @classmethod
@@ -2038,6 +2039,25 @@ class BroadcastStartRequest(BaseModel):
         if v is not None:
             return validate_url(v)
         return v
+
+    @field_validator('headers')
+    @classmethod
+    def validate_headers(cls, v):
+        """Ensure headers is a dictionary of string keys and values; trim whitespace."""
+        if v is None:
+            return v
+        if not isinstance(v, dict):
+            raise ValueError(
+                'headers must be an object/dict of header name -> value')
+        cleaned = {}
+        for k, val in v.items():
+            if not isinstance(k, str):
+                raise ValueError('header names must be strings')
+            if not isinstance(val, (str, int, float, bool)):
+                raise ValueError(
+                    'header values must be strings or convertible to strings')
+            cleaned[str(k).strip()] = str(val).strip()
+        return cleaned
 
 
 class BroadcastStatusResponse(BaseModel):
@@ -2084,7 +2104,8 @@ async def start_broadcast(
             audio_codec=request.audio_codec,
             preset=request.preset,
             hwaccel=request.hwaccel,
-            callback_url=request.callback_url
+            callback_url=request.callback_url,
+            headers=request.headers
         )
         status = await broadcast_manager.start_broadcast(config)
         return BroadcastStatusResponse(

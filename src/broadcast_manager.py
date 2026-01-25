@@ -46,6 +46,8 @@ class BroadcastConfig:
     preset: Optional[str] = None
     hwaccel: Optional[str] = None
     callback_url: Optional[str] = None
+    # Optional custom headers to include when FFmpeg fetches the input URL
+    headers: Optional[Dict[str, str]] = None
 
 
 @dataclass
@@ -117,7 +119,28 @@ class NetworkBroadcastProcess:
         ])
 
         # Input URL
-        cmd.extend(["-i", self.config.stream_url])
+        # If headers are provided explicitly in the BroadcastConfig, prefer them.
+        if getattr(self.config, 'headers', None) and isinstance(self.config.headers, dict) and isinstance(self.config.stream_url, str) and ('://' in self.config.stream_url and not self.config.stream_url.startswith('file://')):
+            try:
+                headers = []
+                for hk, hv in self.config.headers.items():
+                    # sanitize header names/values
+                    k = str(hk).replace('\r', '').replace('\n', '').strip()
+                    v = str(hv).replace('\r', '').replace('\n', '').strip()
+                    if not k:
+                        continue
+                    headers.append(f"{k}: {v}")
+
+                if headers:
+                    header_str = '\r\n'.join(headers) + '\r\n'
+                    cmd.extend(["-headers", header_str,
+                               "-i", self.config.stream_url])
+                else:
+                    cmd.extend(["-i", self.config.stream_url])
+            except Exception as e:
+                logger.warning(
+                    f"Failed to construct headers for FFmpeg input: {e}")
+                cmd.extend(["-i", self.config.stream_url])
 
         # Duration limiting for programme boundary
         if self.config.duration_seconds > 0:

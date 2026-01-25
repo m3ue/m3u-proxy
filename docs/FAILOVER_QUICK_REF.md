@@ -304,6 +304,7 @@ curl -X DELETE "http://localhost:8085/hls/{stream_id}/clients/{client_id}" \
 | `/streams/{stream_id}/failover` | POST | Manually trigger failover |
 | `/stats/detailed` | GET | View stream status and failover history |
 | `/webhooks` | POST | Register webhook for failover events |
+| `/broadcast/{network_id}/start` | POST | Start or transition a network broadcast. Supports optional `headers` object (key/value) to be sent to FFmpeg when fetching the input URL |
 
 ## Environment Variables
 
