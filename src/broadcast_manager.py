@@ -104,6 +104,13 @@ class NetworkBroadcastProcess:
         """Build the FFmpeg command for HLS broadcast output."""
         cmd = ["ffmpeg", "-y"]
 
+        # Hardware acceleration for DECODING must come BEFORE -i (input options)
+        # Only add if it's a valid value (not None, empty, or "none")
+        if self.config.transcode:
+            hwaccel = getattr(self.config, 'hwaccel', None)
+            if hwaccel and hwaccel.lower() not in ('none', ''):
+                cmd.extend(["-hwaccel", hwaccel])
+
         # Input-level seeking (BEFORE -i for accuracy)
         if self.config.seek_seconds > 0:
             cmd.extend(["-ss", str(self.config.seek_seconds)])
@@ -158,17 +165,14 @@ class NetworkBroadcastProcess:
 
         # Codec selection
         if self.config.transcode:
-            # Hardware accel args (if present and the environment supports it) should be prepended
-            if getattr(self.config, 'hwaccel', None):
-                cmd.extend(["-hwaccel", self.config.hwaccel])
-
             # Video codec selection (allow explicit codec like libx264 or h264_nvenc)
             video_codec = self.config.video_codec or "libx264"
             cmd.extend(["-c:v", video_codec])
 
-            # Preset if provided (libx264/libx265 and some encoders accept -preset)
-            if getattr(self.config, 'preset', None):
-                cmd.extend(["-preset", self.config.preset])
+            # Preset - default to 'veryfast' for real-time encoding if not specified
+            # This is critical for avoiding encoding bottlenecks that cause audio drift
+            preset = getattr(self.config, 'preset', None) or "veryfast"
+            cmd.extend(["-preset", preset])
 
             if self.config.video_bitrate:
                 cmd.extend(["-b:v", f"{self.config.video_bitrate}k"])
