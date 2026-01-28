@@ -183,6 +183,11 @@ class NetworkBroadcastProcess:
             audio_codec = self.config.audio_codec or "aac"
             cmd.extend(["-c:a", audio_codec, "-b:a",
                        f"{self.config.audio_bitrate}k"])
+
+            # Force standard broadcast audio settings to prevent sample rate mismatches
+            # that cause "deep/slow" audio playback issues
+            cmd.extend(["-ar", "48000"])  # 48kHz is standard for broadcast
+            cmd.extend(["-ac", "2"])       # Force stereo output
         else:
             cmd.extend(["-c:v", "copy", "-c:a", "copy"])
 
