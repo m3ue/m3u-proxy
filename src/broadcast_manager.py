@@ -521,6 +521,8 @@ class BroadcastManager:
             getattr(settings, 'BROADCAST_MAX_START_RETRIES', 3))
         self.START_RETRY_WINDOW = float(
             getattr(settings, 'BROADCAST_START_RETRY_WINDOW', 300.0))
+        self.START_RETRY_COOLDOWN = float(
+            getattr(settings, 'BROADCAST_START_RETRY_COOLDOWN', 15.0))
         self.START_FAILURE_GRACE = float(
             getattr(settings, 'BROADCAST_START_FAILURE_GRACE', 2.0))
 
@@ -573,19 +575,32 @@ class BroadcastManager:
                     attempts = None
                     del self._start_attempts[network_id]
 
+            # If we've hit the max retries, check cooldown period to allow automatic retry
             if attempts and attempts.get('count', 0) >= self.MAX_START_RETRIES:
-                logger.error(
-                    f"Exceeded max start retries ({self.MAX_START_RETRIES}) for broadcast {network_id}; refusing to start until manual intervention.")
-                raise RuntimeError(
-                    f"Exceeded max start retries for broadcast {network_id}")
+                last = attempts.get('last_attempt_at',
+                                    attempts.get('first_attempt_at', now))
+                # If cooldown elapsed, clear attempts and allow retry
+                if now - last >= self.START_RETRY_COOLDOWN:
+                    logger.info(
+                        f"Cooldown elapsed for broadcast {network_id}; resetting start retry counter and allowing automatic start.")
+                    del self._start_attempts[network_id]
+                    attempts = None
+                else:
+                    seconds_left = int(
+                        self.START_RETRY_COOLDOWN - (now - last))
+                    logger.error(
+                        f"Exceeded max start retries ({self.MAX_START_RETRIES}) for broadcast {network_id}; refusing to start for another {seconds_left}s.")
+                    raise RuntimeError(
+                        f"Exceeded max start retries for broadcast {network_id}; retry allowed after {seconds_left}s")
 
             success = await process.start()
 
             if not success:
                 # Record failure immediately
                 at = self._start_attempts.setdefault(
-                    network_id, {'count': 0, 'first_attempt_at': now})
+                    network_id, {'count': 0, 'first_attempt_at': now, 'last_attempt_at': now})
                 at['count'] += 1
+                at['last_attempt_at'] = now
                 logger.warning(
                     f"Start attempt {at['count']} failed for {network_id}: {process.error_message}")
                 raise RuntimeError(
@@ -603,8 +618,9 @@ class BroadcastManager:
             # If process already failed within the grace period, treat as a start failure
             if process.status == 'failed' or (process.process and process.process.returncode is not None and process.process.returncode != 0):
                 at = self._start_attempts.setdefault(
-                    network_id, {'count': 0, 'first_attempt_at': now})
+                    network_id, {'count': 0, 'first_attempt_at': now, 'last_attempt_at': now})
                 at['count'] += 1
+                at['last_attempt_at'] = now
                 logger.warning(
                     f"Start attempt {at['count']} failed (post-start) for {network_id}: {process.error_message}")
 
@@ -616,10 +632,10 @@ class BroadcastManager:
                 if network_id in self.broadcasts:
                     del self.broadcasts[network_id]
 
-                # If we've exceeded attempts, log an error
+                # If we've exceeded attempts, log an error (cooldown will be enforced on next start attempt)
                 if at['count'] >= self.MAX_START_RETRIES:
                     logger.error(
-                        f"Exceeded max start retries ({self.MAX_START_RETRIES}) for broadcast {network_id}; refusing further automatic starts.")
+                        f"Exceeded max start retries ({self.MAX_START_RETRIES}) for broadcast {network_id}; refusing further automatic starts until cooldown elapses.")
                 raise RuntimeError(
                     f"Broadcast {network_id} failed shortly after start: {process.error_message}")
 

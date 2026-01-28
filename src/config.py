@@ -2,7 +2,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
 
 # Application version
-VERSION = "0.3.4"
+VERSION = "0.3.5"
 
 
 class Settings(BaseSettings):
@@ -101,8 +101,11 @@ class Settings(BaseSettings):
     HLS_BROADCAST_DIR: str = "/tmp/m3u-proxy-broadcasts"
     # Timeout (seconds) for webhook callbacks to the broadcast creator when broadcasts end
     BROADCAST_CALLBACK_TIMEOUT: int = 3
+    BROADCAST_MAX_START_RETRIES: int = 3
     BROADCAST_START_RETRY_WINDOW: float = 300.0  # seconds
-    BROADCAST_START_FAILURE_GRACE: float = 2.0  # seconds
+    # seconds - cooldown after hitting max start retries before allowing auto-retry
+    BROADCAST_START_RETRY_COOLDOWN: float = 15.0
+    BROADCAST_START_FAILURE_GRACE: float = 3.0  # seconds
 
     # API Authentication
     API_TOKEN: Optional[str] = None
