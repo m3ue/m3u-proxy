@@ -139,8 +139,8 @@ class SharedTranscodingProcess:
                         # Enable following HTTP redirects for HLS streams
                         processed_args.extend(
                             ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "2"])
-                        # Disable extension checking to allow extensionless segment URLs
-                        processed_args.extend(["-extension_picky", "false"])
+                        # Allow any extensions (including extensionless) for segments
+                        processed_args.extend(["-allowed_extensions", "ALL"])
                     # Add -i flag and use self.url as the input
                     processed_args.append(arg)
                     # Use current URL (updated during failover)
