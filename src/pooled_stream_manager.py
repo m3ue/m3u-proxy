@@ -162,11 +162,11 @@ class SharedTranscodingProcess:
                             str(a) == '-map' for a in self.ffmpeg_args)
                         if not has_map:
                             # Map all video and audio streams
-                            # The '?' makes audio optional - won't fail if no audio exists
+                            # The '?' makes streams optional - won't fail if stream type doesn't exist (e.g. audio only)
                             processed_args.extend(
-                                ['-map', '0:v:0', '-map', '0:a:0?'])
+                                ['-map', '0:v:0?', '-map', '0:a:0?'])
                             logger.debug(
-                                f"Added stream mapping for transcoding profile: -map 0:v:0 -map 0:a:0?")
+                                f"Added stream mapping for transcoding profile: -map 0:v:0? -map 0:a:0?")
 
                     i += 2  # Skip the old URL in ffmpeg_args
                 else:
