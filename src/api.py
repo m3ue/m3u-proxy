@@ -233,6 +233,8 @@ class StreamCreateRequest(BaseModel):
     headers: Optional[Dict[str, str]] = None
     # Enable Strict Live TS Mode for this stream
     strict_live_ts: Optional[bool] = None
+    # Enable Sticky Session Handler for this stream
+    use_sticky_session: Optional[bool] = None
 
     @field_validator('url')
     @classmethod
@@ -278,6 +280,10 @@ class TranscodeCreateRequest(BaseModel):
     failover_resolver_url: Optional[str] = None
     user_agent: Optional[str] = None
     metadata: Optional[dict] = None
+    # Enable Strict Live TS Mode for this stream
+    strict_live_ts: Optional[bool] = None
+    # Enable Sticky Session Handler for this stream
+    use_sticky_session: Optional[bool] = None
     profile: Optional[str] = None  # Profile name or custom template
     profile_variables: Optional[Dict[str, str]] = None
     output_format: Optional[str] = None  # mp4, mkv, ts, etc.
@@ -693,7 +699,8 @@ async def create_stream(request: StreamCreateRequest):
             request.user_agent,
             metadata=request.metadata,
             headers=request.headers,
-            strict_live_ts=request.strict_live_ts
+            strict_live_ts=request.strict_live_ts,
+            use_sticky_session=request.use_sticky_session
         )
 
         # Emit stream started event
@@ -807,7 +814,9 @@ async def create_transcode_stream(request: TranscodeCreateRequest):
             metadata=transcoding_metadata,
             is_transcoded=True,
             transcode_profile=profile_name,
-            transcode_ffmpeg_args=ffmpeg_args
+            transcode_ffmpeg_args=ffmpeg_args,
+            strict_live_ts=request.strict_live_ts,
+            use_sticky_session=request.use_sticky_session
         )
 
         # Emit stream started event with transcoding info
