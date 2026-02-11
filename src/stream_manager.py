@@ -98,6 +98,9 @@ class StreamInfo:
     strict_live_ts: bool = False
     # Circuit breaker - track bad upstream endpoints temporarily
     upstream_marked_bad_until: Optional[datetime] = None
+    # Sticky Session Handler - lock to specific backend origin after redirects
+    # Prevents playback loops from load balancers bouncing between origins
+    use_sticky_session: bool = False
     # Bitrate monitoring - track bytes and detect degraded streams
     bitrate_check_start_time: Optional[float] = None
     bitrate_bytes_window: int = 0
@@ -348,7 +351,8 @@ class StreamManager:
         is_transcoded: bool = False,
         transcode_profile: Optional[str] = None,
         transcode_ffmpeg_args: Optional[List[str]] = None,
-        strict_live_ts: Optional[bool] = None
+        strict_live_ts: Optional[bool] = None,
+        use_sticky_session: Optional[bool] = None
     ) -> str:
         """Get or create a stream and return its ID
 
@@ -364,6 +368,7 @@ class StreamManager:
             transcode_profile: Name of the transcoding profile to use
             transcode_ffmpeg_args: FFmpeg arguments for transcoding
             strict_live_ts: Enable Strict Live TS Mode for this stream
+            use_sticky_session: Enable Sticky Session Handler for this stream (defaults to config setting)
         """
         import hashlib
         stream_id = hashlib.md5(stream_url.encode()).hexdigest()
@@ -381,6 +386,9 @@ class StreamManager:
             is_variant = parent_stream_id is not None
             if is_variant and parent_stream_id in self.streams:
                 user_agent = self.streams[parent_stream_id].user_agent
+
+            # Determine use_sticky_session: use parameter if provided, otherwise use global config
+            effective_use_sticky_session = use_sticky_session if use_sticky_session is not None else settings.USE_STICKY_SESSION
 
             self.streams[stream_id] = StreamInfo(
                 stream_id=stream_id,
@@ -401,7 +409,8 @@ class StreamManager:
                 is_transcoded=is_transcoded,
                 transcode_profile=transcode_profile,
                 transcode_ffmpeg_args=transcode_ffmpeg_args or [],
-                strict_live_ts=strict_live_ts or False
+                strict_live_ts=strict_live_ts or False,
+                use_sticky_session=effective_use_sticky_session
             )
             self.stream_clients[stream_id] = set()
 
@@ -2029,12 +2038,14 @@ class StreamManager:
                 stream_info.final_playlist_url = final_url
 
                 # STICKY SESSION HANDLER:
-                # If we followed a redirect, update current_url to the final URL.
+                # If enabled and we followed a redirect, update current_url to the final URL.
                 # This ensures we stick to the specific backend origin for subsequent requests,
                 # preventing playback loops caused by non-monotonic sequence numbers when
                 # load balancers bounce between origins with different playlist states.
-                if current_url and final_url != current_url:
+                if stream_info.use_sticky_session and current_url and final_url != current_url:
                     stream_info.current_url = final_url
+                    logger.debug(
+                        f"Sticky session: Locking stream {stream_id} to origin: {final_url}")
 
                 parsed_url = urlparse(final_url)
                 base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
@@ -2070,14 +2081,15 @@ class StreamManager:
                 stream_info.error_count += 1
 
                 # STICKY SESSION RECOVERY:
-                # If we were stuck to a specific origin (via redirect) and it failed,
-                # revert to the configured URL to allow implicit load balancer failover.
-                known_urls = [stream_info.original_url] + \
-                    (stream_info.failover_urls or [])
-                if stream_info.current_url and stream_info.current_url not in known_urls:
-                    logger.warning(
-                        f"Sticky origin {stream_info.current_url} failed. Reverting to original configured entry point.")
-                    stream_info.current_url = None
+                # If sticky session is enabled and we were stuck to a specific origin (via redirect)
+                # and it failed, revert to the configured URL to allow implicit load balancer failover.
+                if stream_info.use_sticky_session:
+                    known_urls = [stream_info.original_url] + \
+                        (stream_info.failover_urls or [])
+                    if stream_info.current_url and stream_info.current_url not in known_urls:
+                        logger.warning(
+                            f"Sticky origin {stream_info.current_url} failed. Reverting to original configured entry point.")
+                        stream_info.current_url = None
 
                 # Try failover if available and not the last attempt
                 has_failovers = bool(

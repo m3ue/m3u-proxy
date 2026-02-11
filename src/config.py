@@ -2,7 +2,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
 
 # Application version
-VERSION = "0.3.10"
+VERSION = "0.3.11"
 
 
 class Settings(BaseSettings):
@@ -142,6 +142,14 @@ class Settings(BaseSettings):
     # using a short per-chunk timeout allows the proxy to detect the stall
     # and trigger existing failover/reconnect logic instead of hanging.
     LIVE_CHUNK_TIMEOUT_SECONDS: float = 15.0
+
+    # Sticky Session Handler Configuration
+    # Enable sticky session handling by default to lock clients to specific backend origins
+    # after redirects. This prevents playback loops caused by load balancers bouncing
+    # between origins with different playlist states.
+    # Can be overridden per stream during creation.
+    USE_STICKY_SESSION: bool = False
+
     # Model configuration
     model_config = SettingsConfigDict(
         env_file=".env",
