@@ -240,6 +240,22 @@ CLIENT_TIMEOUT=300
 
 # Cleanup interval (seconds)
 CLEANUP_INTERVAL=60
+
+# Stream Retry Configuration (improves reliability for unstable connections)
+# Number of retry attempts before failover or giving up
+STREAM_RETRY_ATTEMPTS=3
+# Delay between retries (seconds)
+STREAM_RETRY_DELAY=1.0
+# Total timeout across all retries (seconds, 0 to disable)
+STREAM_TOTAL_TIMEOUT=60.0
+# Use exponential backoff for retry delays (false/true)
+STREAM_RETRY_EXPONENTIAL_BACKOFF=false
+# Timeout for receiving data chunks (seconds)
+LIVE_CHUNK_TIMEOUT_SECONDS=15.0
+
+# Sticky Session Handler (prevents playback loops with load-balanced providers)
+# Locks to specific backend after redirect to maintain playlist consistency
+USE_STICKY_SESSION=false
 ```
 
 ### API Authentication
