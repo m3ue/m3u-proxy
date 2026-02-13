@@ -2,7 +2,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
 
 # Application version
-VERSION = "0.3.11"
+VERSION = "0.3.12"
 
 
 class Settings(BaseSettings):
@@ -142,6 +142,20 @@ class Settings(BaseSettings):
     # using a short per-chunk timeout allows the proxy to detect the stall
     # and trigger existing failover/reconnect logic instead of hanging.
     LIVE_CHUNK_TIMEOUT_SECONDS: float = 15.0
+
+    # Stream Retry Configuration (similar to iptv-proxy)
+    # These settings control retry behavior for temporary connection issues before
+    # attempting failover or giving up entirely. Retries help handle brief network
+    # hiccups or temporary upstream issues without immediately failing the stream.
+    # Number of retry attempts for the same URL before trying failover
+    STREAM_RETRY_ATTEMPTS: int = 3
+    # Delay (in seconds) between retry attempts
+    STREAM_RETRY_DELAY: float = 1.0
+    # Total timeout (in seconds) across all retry attempts before giving up
+    # Set to 0 to disable total timeout constraint
+    STREAM_TOTAL_TIMEOUT: float = 30.0
+    # Whether to use exponential backoff for retry delays (multiplies delay by 1.5 each retry)
+    STREAM_RETRY_EXPONENTIAL_BACKOFF: bool = False
 
     # Sticky Session Handler Configuration
     # Enable sticky session handling by default to lock clients to specific backend origins

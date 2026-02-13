@@ -628,6 +628,13 @@ class StreamManager:
             max_failovers = 3
             max_vod_reconnects = 5
 
+            # Retry tracking variables for handling temporary connection issues
+            retry_count = 0
+            max_retries = settings.STREAM_RETRY_ATTEMPTS
+            retry_delay = settings.STREAM_RETRY_DELAY
+            total_timeout_start = asyncio.get_event_loop().time()
+            total_timeout = settings.STREAM_TOTAL_TIMEOUT
+
             # Main streaming loop with automatic reconnection on failover
             while failover_count <= max_failovers:
                 try:
@@ -712,6 +719,13 @@ class StreamManager:
                         logger.info(
                             f"Provider Content-Range: {provider_content_range}")
 
+                    # Reset retry counter on successful connection
+                    # This gives us fresh retries for any issues during streaming
+                    if retry_count > 0:
+                        logger.info(
+                            f"Connection successful after {retry_count} retries, resetting retry counter")
+                        retry_count = 0
+
                     # Create a single iterator for the response stream
                     # IMPORTANT: Async iterators can only be consumed once! We must use the same
                     # iterator for both pre-buffering and main streaming. The pre-buffer phase yields
@@ -792,16 +806,50 @@ class StreamManager:
                                 try:
                                     chunk = await asyncio.wait_for(stream_iterator.__anext__(), timeout=chunk_timeout)
                                 except asyncio.TimeoutError:
-                                    # No data received within chunk timeout - attempt failover if possible
+                                    # No data received within chunk timeout
                                     logger.warning(
                                         f"No data received for {chunk_timeout}s from upstream for stream {stream_id}, client {client_id}")
+
+                                    # Check if we've exceeded total timeout across all retries
+                                    elapsed_total = asyncio.get_event_loop().time() - total_timeout_start
+                                    total_timeout_exceeded = total_timeout > 0 and elapsed_total > total_timeout
+
+                                    # Try retrying the current URL first before failover
+                                    if retry_count < max_retries and not total_timeout_exceeded and not stream_info.is_vod:
+                                        retry_count += 1
+                                        current_delay = retry_delay * \
+                                            (1.5 ** (retry_count - 1)
+                                             ) if settings.STREAM_RETRY_EXPONENTIAL_BACKOFF else retry_delay
+                                        logger.info(
+                                            f"Retrying connection for stream {stream_id}, client {client_id} "
+                                            f"(attempt {retry_count}/{max_retries}, delay: {current_delay}s)"
+                                        )
+
+                                        # Clean up current connection
+                                        if stream_context is not None:
+                                            try:
+                                                await stream_context.__aexit__(None, None, None)
+                                            except Exception:
+                                                pass
+                                        stream_context = None
+                                        response = None
+
+                                        # Wait before retrying
+                                        await asyncio.sleep(current_delay)
+
+                                        # Break to reconnect with same URL
+                                        break
+
+                                    # Retries exhausted or total timeout exceeded, try failover
                                     has_failover = bool(
                                         stream_info.failover_resolver_url or stream_info.failover_urls)
                                     if has_failover and failover_count < max_failovers and not stream_info.is_vod:
                                         logger.info(
-                                            f"Attempting failover due to chunk timeout for client {client_id} (attempt {failover_count + 1}/{max_failovers})")
-                                        await self._try_update_failover_url(stream_id, "chunk_timeout")
-                                        # Reset and reconnect
+                                            f"Retries exhausted, attempting failover due to chunk timeout for client {client_id} "
+                                            f"(failover attempt {failover_count + 1}/{max_failovers})")
+                                        await self._try_update_failover_url(stream_id, "chunk_timeout_after_retries")
+                                        # Reset retry counter for new URL
+                                        retry_count = 0
                                         failover_count += 1
                                         if stream_context is not None:
                                             try:
@@ -829,10 +877,13 @@ class StreamManager:
                                             response = None
                                             break  # break inner loop -> reconnect outer loop
                                         else:
+                                            reason = "total_timeout_exceeded" if total_timeout_exceeded else "no_failover_available"
                                             await self._emit_event("STREAM_FAILED", stream_id, {
                                                 "client_id": client_id,
                                                 "error": f"No data received for {chunk_timeout}s",
                                                 "error_type": "chunk_timeout",
+                                                "reason": reason,
+                                                "retry_count": retry_count,
                                                 "no_failover": not has_failover
                                             })
                                             # Terminate streaming for this client
@@ -1033,14 +1084,44 @@ class StreamManager:
                         f"ReadError for client {client_id}: {error_str} (bytes_served: {bytes_served}, chunk_count: {chunk_count})")
 
                     if bytes_served == 0:
-                        # No data was sent - try failover if available (check both resolver URL and static list)
-                        # Skip failover for VOD/timeshift since it's provider-specific
+                        # No data was sent - check if we can retry before failover
+                        elapsed_total = asyncio.get_event_loop().time() - total_timeout_start
+                        total_timeout_exceeded = total_timeout > 0 and elapsed_total > total_timeout
+
+                        # Try retrying the current URL first
+                        if retry_count < max_retries and not total_timeout_exceeded and not stream_info.is_vod:
+                            retry_count += 1
+                            current_delay = retry_delay * \
+                                (1.5 ** (retry_count - 1)
+                                 ) if settings.STREAM_RETRY_EXPONENTIAL_BACKOFF else retry_delay
+                            logger.info(
+                                f"Retrying connection after ReadError for stream {stream_id}, client {client_id} "
+                                f"(attempt {retry_count}/{max_retries}, delay: {current_delay}s)"
+                            )
+
+                            # Clean up current connection
+                            if stream_context is not None:
+                                try:
+                                    await stream_context.__aexit__(None, None, None)
+                                except Exception:
+                                    pass
+                            stream_context = None
+                            response = None
+
+                            # Wait before retrying
+                            await asyncio.sleep(current_delay)
+
+                            continue  # Retry with same URL
+
+                        # Retries exhausted, try failover if available
                         has_failover = bool(
                             stream_info.failover_resolver_url or stream_info.failover_urls)
                         if has_failover and failover_count < max_failovers and not stream_info.is_vod:
                             logger.info(
-                                f"Attempting automatic failover for client {client_id} (ReadError, no data)")
-                            await self._try_update_failover_url(stream_id, "connection_error")
+                                f"Retries exhausted, attempting automatic failover for client {client_id} (ReadError, no data)")
+                            await self._try_update_failover_url(stream_id, "connection_error_after_retries")
+                            # Reset retry counter for new URL
+                            retry_count = 0
                             failover_count += 1
                             # Clean up current connection
                             if stream_context is not None:
@@ -1051,6 +1132,18 @@ class StreamManager:
                             stream_context = None
                             response = None
                             continue  # Retry with failover URL
+                        else:
+                            # No retries or failover available, emit failure event
+                            reason = "total_timeout_exceeded" if total_timeout_exceeded else "no_failover_available"
+                            await self._emit_event("STREAM_FAILED", stream_id, {
+                                "client_id": client_id,
+                                "error": error_str,
+                                "error_type": "ReadError",
+                                "reason": reason,
+                                "retry_count": retry_count,
+                                "no_failover": not has_failover
+                            })
+                            break
                     else:
                         # Some data was sent.
                         # For VOD, upstream can drop mid-stream; reconnect using Range instead of treating as client disconnect.
@@ -1088,14 +1181,45 @@ class StreamManager:
                     logger.warning(
                         f"Stream error for client {client_id}: {type(e).__name__}: {e}")
 
-                    # Try automatic failover (check both resolver URL and static list)
-                    # Skip failover for VOD/timeshift since it's provider-specific
+                    # Check if we can retry before failover
+                    elapsed_total = asyncio.get_event_loop().time() - total_timeout_start
+                    total_timeout_exceeded = total_timeout > 0 and elapsed_total > total_timeout
+
+                    # Try retrying the current URL first
+                    if retry_count < max_retries and not total_timeout_exceeded and not stream_info.is_vod:
+                        retry_count += 1
+                        current_delay = retry_delay * \
+                            (1.5 ** (retry_count - 1)
+                             ) if settings.STREAM_RETRY_EXPONENTIAL_BACKOFF else retry_delay
+                        logger.info(
+                            f"Retrying connection after {type(e).__name__} for stream {stream_id}, client {client_id} "
+                            f"(attempt {retry_count}/{max_retries}, delay: {current_delay}s)"
+                        )
+
+                        # Clean up current connection
+                        if stream_context is not None:
+                            try:
+                                await stream_context.__aexit__(None, None, None)
+                            except Exception:
+                                pass
+                        stream_context = None
+                        response = None
+
+                        # Wait before retrying
+                        await asyncio.sleep(current_delay)
+
+                        continue  # Retry with same URL
+
+                    # Retries exhausted, try automatic failover
                     has_failover = bool(
                         stream_info.failover_resolver_url or stream_info.failover_urls)
                     if has_failover and failover_count < max_failovers and not stream_info.is_vod:
                         logger.info(
-                            f"Attempting automatic failover for client {client_id} (attempt {failover_count + 1}/{max_failovers})")
-                        await self._try_update_failover_url(stream_id, f"stream_error_{type(e).__name__}")
+                            f"Retries exhausted, attempting automatic failover for client {client_id} "
+                            f"(failover attempt {failover_count + 1}/{max_failovers})")
+                        await self._try_update_failover_url(stream_id, f"stream_error_{type(e).__name__}_after_retries")
+                        # Reset retry counter for new URL
+                        retry_count = 0
                         failover_count += 1
                         # Clean up current connection
                         if stream_context is not None:
@@ -1124,10 +1248,13 @@ class StreamManager:
                             response = None
                             continue
 
+                        reason = "total_timeout_exceeded" if total_timeout_exceeded else "no_failover_available"
                         await self._emit_event("STREAM_FAILED", stream_id, {
                             "client_id": client_id,
                             "error": str(e),
                             "error_type": type(e).__name__,
+                            "reason": reason,
+                            "retry_count": retry_count,
                             "no_failover": not has_failover
                         })
                         break
@@ -1165,14 +1292,44 @@ class StreamManager:
                         })
                         break
                     else:
-                        # Try failover for unknown errors too (check both resolver URL and static list)
-                        # Skip failover for VOD/timeshift since it's provider-specific
+                        # Check if we can retry before failover
+                        elapsed_total = asyncio.get_event_loop().time() - total_timeout_start
+                        total_timeout_exceeded = total_timeout > 0 and elapsed_total > total_timeout
+
+                        # Try retrying the current URL first
+                        if retry_count < max_retries and not total_timeout_exceeded and not stream_info.is_vod:
+                            retry_count += 1
+                            current_delay = retry_delay * \
+                                (1.5 ** (retry_count - 1)
+                                 ) if settings.STREAM_RETRY_EXPONENTIAL_BACKOFF else retry_delay
+                            logger.info(
+                                f"Retrying connection after {type(e).__name__} for stream {stream_id}, client {client_id} "
+                                f"(attempt {retry_count}/{max_retries}, delay: {current_delay}s)"
+                            )
+
+                            # Clean up current connection
+                            if stream_context is not None:
+                                try:
+                                    await stream_context.__aexit__(None, None, None)
+                                except Exception:
+                                    pass
+                            stream_context = None
+                            response = None
+
+                            # Wait before retrying
+                            await asyncio.sleep(current_delay)
+
+                            continue  # Retry with same URL
+
+                        # Try failover for unknown errors too
                         has_failover = bool(
                             stream_info.failover_resolver_url or stream_info.failover_urls)
                         if has_failover and failover_count < max_failovers and not stream_info.is_vod:
                             logger.info(
-                                f"Attempting automatic failover for client {client_id} (unknown error)")
-                            await self._try_update_failover_url(stream_id, f"unknown_error_{type(e).__name__}")
+                                f"Retries exhausted, attempting automatic failover for client {client_id} (unknown error)")
+                            await self._try_update_failover_url(stream_id, f"unknown_error_{type(e).__name__}_after_retries")
+                            # Reset retry counter for new URL
+                            retry_count = 0
                             failover_count += 1
                             # Clean up current connection
                             if stream_context is not None:
@@ -1184,10 +1341,13 @@ class StreamManager:
                             response = None
                             continue  # Retry with failover URL
                         else:
+                            reason = "total_timeout_exceeded" if total_timeout_exceeded else "no_failover_available"
                             await self._emit_event("STREAM_FAILED", stream_id, {
                                 "client_id": client_id,
                                 "error": error_str,
                                 "error_type": type(e).__name__,
+                                "reason": reason,
+                                "retry_count": retry_count,
                                 "bytes_served": bytes_served
                             })
                             break

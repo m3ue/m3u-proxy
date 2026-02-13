@@ -4,6 +4,16 @@
 
 A high-performance HTTP proxy server for IPTV content with **true live proxying**, per-client connection management, and seamless failover support. Built with FastAPI and optimized for efficiency.
 
+### Questions/issues/suggestions
+
+Feel free to [open an issue](https://github.com/m3ue/m3u-proxy/issues/new?template=bug_report.md) on this repo, or hit us up on [Discord](https://discord.gg/rS3abJ5dz7)
+
+### Join us on Discord
+
+[![](https://dcbadge.limes.pink/api/server/rS3abJ5dz7)](https://discord.gg/rS3abJ5dz7)
+
+Join our [Discord](https://discord.gg/rS3abJ5dz7) server to ask questions and get help, help others, suggest new ideas, and offer suggestions for improvements! You can also try out and help test new features! 🎉
+
 ## Features
 
 ### Core Streaming
@@ -240,6 +250,22 @@ CLIENT_TIMEOUT=300
 
 # Cleanup interval (seconds)
 CLEANUP_INTERVAL=60
+
+# Stream Retry Configuration (improves reliability for unstable connections)
+# Number of retry attempts before failover or giving up
+STREAM_RETRY_ATTEMPTS=3
+# Delay between retries (seconds)
+STREAM_RETRY_DELAY=1.0
+# Total timeout across all retries (seconds, 0 to disable)
+STREAM_TOTAL_TIMEOUT=60.0
+# Use exponential backoff for retry delays (false/true)
+STREAM_RETRY_EXPONENTIAL_BACKOFF=false
+# Timeout for receiving data chunks (seconds)
+LIVE_CHUNK_TIMEOUT_SECONDS=15.0
+
+# Sticky Session Handler (prevents playback loops with load-balanced providers)
+# Locks to specific backend after redirect to maintain playlist consistency
+USE_STICKY_SESSION=false
 ```
 
 ### API Authentication
@@ -497,53 +523,73 @@ python demo_events.py
 
 ## Additional Documentation
 
-- **[Strict Live TS Mode](docs/STRICT_LIVE_TS_MODE.md)** - Enhanced live stream stability
-- **[Architecture Overview](docs/ARCHITECTURE.md)** - System design and components
-- **[Event System](docs/EVENT_SYSTEM.md)** - Webhook notifications and events
-- **[Testing Guide](docs/TESTING.md)** - Test suite and development
-- **[Authentication](docs/AUTHENTICATION.md)** - API token authentication
+- **[Documentation Index](docs/README.md)** - Complete, always-current list of all documentation
 
 ## Development
 
 ### Project Structure
 ```
+├── docker/                  # Container and deployment assets
+├── docs/                    # Full documentation set
+│   ├── README.md            # Canonical docs index
+│   └── *.md                 # Architecture, failover, retry, auth, etc.
+├── logs/                    # Runtime logs (local/dev)
 ├── src/
-│   ├── stream_manager.py  # v2.0 Core: Per-client direct proxy
-│   ├── api.py             # FastAPI server application
-│   ├── models.py          # Data models and schemas
-│   ├── config.py          # Configuration management
-│   └── events.py          # Event system with webhooks
-├── docs/
-│   ├── ARCHITECTURE.md           # Architecture design overview
-│   ├── EVENT_SYSTEM.md           # Webhook integration guide
-│   └── TESTING.md                # Testing documentation
-├── tests/                 # Test suite
-│   ├── integration/       # Integration tests
-│   └── test_*.py          # Unit tests
-├── tools/                 # Utility scripts and tools
-│   ├── performance_test.py # Performance testing
-│   ├── m3u_client.py      # CLI client
-│   ├── demo_events.py     # Event system demo
-│   └── run_tests.py       # Enhanced test runner
-├── main.py                # Server entry point (uvloop support)
-└── README.md              # This file
+│   ├── __init__.py          # Package marker
+│   ├── api.py               # FastAPI server application
+│   ├── broadcast_manager.py # Client broadcast coordination
+│   ├── config.py            # Configuration management
+│   ├── events.py            # Event system with webhooks
+│   ├── hwaccel.py           # Hardware acceleration detection/helpers
+│   ├── models.py            # Data models and schemas
+│   ├── pooled_stream_manager.py # Shared/pooling stream orchestration
+│   ├── redis_config.py      # Redis settings
+│   ├── redis_manager.py     # Redis coordination layer
+│   ├── stream_manager.py    # Per-client direct proxy core
+│   └── transcoding.py       # FFmpeg transcoding pipeline
+├── static/                  # Static assets (icons, images)
+├── tests/                   # Test suite
+│   ├── integration/         # Integration tests
+│   └── test_*.py            # Unit tests
+├── tools/                   # Utility scripts and tools
+│   ├── performance_test.py  # Performance testing
+│   ├── m3u_client.py        # CLI client
+│   ├── demo_events.py       # Event system demo
+│   └── run_tests.py         # Enhanced test runner
+├── docker-compose.yml       # Default compose stack
+├── Dockerfile               # Container build definition
+├── main.py                  # Server entry point (uvloop support)
+├── requirements.txt         # Python dependencies
+├── pytest.ini               # Test configuration
+└── README.md                # This file
 ```
+---
 
-### Contributing
+## 🤝 Want to Contribute?
+
+> Whether it’s writing docs, squashing bugs, or building new features, your contribution matters! ❤️
+
+We welcome **PRs, issues, ideas, and suggestions**!\
+Here’s how you can join the party:
+
+- Follow our coding style and best practices.
+- Be respectful, helpful, and open-minded.
+- Respect the **CC BY-NC-SA license**.
 
 1. Fork the repository
 2. Create a feature branch
 3. Add tests for new functionality
 4. Submit a pull request
 
-## License
+---
 
-MIT License - see LICENSE file for details.
+## ⚖️ License  
 
-## Credits
+> m3u editor is licensed under **CC BY-NC-SA 4.0**:  
 
-Built with FastAPI and inspired by MediaFlow Proxy. Designed for production IPTV streaming with emphasis on efficiency, correctness, and zero transcoding.
+- **BY**: Give credit where credit’s due.  
+- **NC**: No commercial use.  
+- **SA**: Share alike if you remix.  
 
-## Support
+For full license details, see [LICENSE](https://creativecommons.org/licenses/by-nc-sa/4.0/).
 
-For issues, feature requests, or questions, please open a GitHub issue.
