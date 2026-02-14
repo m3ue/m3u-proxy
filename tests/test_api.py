@@ -1,13 +1,15 @@
 # Add src to path first
+from stream_manager import StreamManager
+from api import app, get_content_type, is_direct_stream
+import httpx
+import asyncio
+import pytest
+from fastapi.testclient import TestClient
+from unittest.mock import Mock, AsyncMock, patch
+import json
 import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
-
-import json
-from unittest.mock import Mock, AsyncMock, patch
-from fastapi.testclient import TestClient
-import pytest
-from api import app, get_content_type, is_direct_stream
 
 
 class TestHelperFunctions:
@@ -249,7 +251,7 @@ class TestAPI:
         # Mock the stream_continuous_direct method used by the endpoint
         mock_response = StreamingResponse(
             mock_stream_generator(), media_type="video/mp4")
-        
+
         # Create proper async mocks that accept any arguments
         mock_stream_manager.stream_continuous_direct = AsyncMock(
             return_value=mock_response)
@@ -262,6 +264,187 @@ class TestAPI:
 
         response = client.get("/stream/test_stream_123")
         assert response.status_code == 200
+
+    def test_direct_stream_endpoint_recovers_from_redirect_502(self, monkeypatch):
+        """API regression: /stream recovers when sticky redirected upstream returns 502 on reconnect."""
+        manager = StreamManager()
+
+        primary_url = "http://provider.example.com/live/channel.ts"
+        sticky_redirect_url = "http://edge-2.provider.example.com/live/channel.ts"
+
+        monkeypatch.setattr('config.settings.STREAM_RETRY_ATTEMPTS', 0)
+        monkeypatch.setattr('config.settings.STREAM_TOTAL_TIMEOUT', 5.0)
+
+        stream_id = asyncio.run(manager.get_or_create_stream(
+            primary_url,
+            use_sticky_session=True
+        ))
+        stream_info = manager.streams[stream_id]
+        stream_info.current_url = sticky_redirect_url
+
+        class _OneChunkIterator:
+            def __init__(self, chunk: bytes):
+                self.chunk = chunk
+                self.sent = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self.sent:
+                    raise StopAsyncIteration
+                self.sent = True
+                return self.chunk
+
+        class _MockResponse:
+            def __init__(self, status_code: int, chunk: bytes | None = None, request_url: str = "http://example.com"):
+                self.status_code = status_code
+                self.headers = {"content-type": "video/mp2t"}
+                self._chunk = chunk
+                self._request_url = request_url
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    request = httpx.Request("GET", self._request_url)
+                    response = httpx.Response(
+                        self.status_code, request=request)
+                    raise httpx.HTTPStatusError(
+                        f"{self.status_code} Bad Gateway",
+                        request=request,
+                        response=response
+                    )
+
+            def aiter_bytes(self, chunk_size=32768):
+                if self._chunk is None:
+                    return _OneChunkIterator(b"")
+                return _OneChunkIterator(self._chunk)
+
+        class _MockStreamCM:
+            def __init__(self, response):
+                self.response = response
+
+            async def __aenter__(self):
+                return self.response
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        called_urls = []
+
+        async def fake_stream(method, url, headers=None, follow_redirects=True):
+            called_urls.append(url)
+            if url == sticky_redirect_url:
+                return _MockStreamCM(_MockResponse(502, request_url=url))
+            if url == primary_url:
+                return _MockStreamCM(_MockResponse(200, chunk=b"ok-api", request_url=url))
+            return _MockStreamCM(_MockResponse(500, request_url=url))
+
+        monkeypatch.setattr(manager.live_stream_client, 'stream', fake_stream)
+
+        try:
+            with patch('api.stream_manager', manager):
+                client = TestClient(app)
+                response = client.get(f"/stream/{stream_id}")
+
+            assert response.status_code == 200
+            assert response.content == b"ok-api"
+            assert called_urls == [sticky_redirect_url, primary_url]
+            assert stream_info.current_url is None
+        finally:
+            asyncio.run(manager.http_client.aclose())
+            asyncio.run(manager.live_stream_client.aclose())
+
+    def test_direct_stream_endpoint_recovers_after_retry_exhaustion(self, monkeypatch):
+        """API regression: /stream recovers to entry URL after sticky redirect 502 retries are exhausted."""
+        manager = StreamManager()
+
+        primary_url = "http://provider.example.com/live/channel.ts"
+        sticky_redirect_url = "http://edge-2.provider.example.com/live/channel.ts"
+
+        monkeypatch.setattr('config.settings.STREAM_RETRY_ATTEMPTS', 2)
+        monkeypatch.setattr('config.settings.STREAM_RETRY_DELAY', 0.0)
+        monkeypatch.setattr('config.settings.STREAM_TOTAL_TIMEOUT', 5.0)
+
+        stream_id = asyncio.run(manager.get_or_create_stream(
+            primary_url,
+            use_sticky_session=True
+        ))
+        stream_info = manager.streams[stream_id]
+        stream_info.current_url = sticky_redirect_url
+
+        class _OneChunkIterator:
+            def __init__(self, chunk: bytes):
+                self.chunk = chunk
+                self.sent = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self.sent:
+                    raise StopAsyncIteration
+                self.sent = True
+                return self.chunk
+
+        class _MockResponse:
+            def __init__(self, status_code: int, chunk: bytes | None = None, request_url: str = "http://example.com"):
+                self.status_code = status_code
+                self.headers = {"content-type": "video/mp2t"}
+                self._chunk = chunk
+                self._request_url = request_url
+
+            def raise_for_status(self):
+                if self.status_code >= 400:
+                    request = httpx.Request("GET", self._request_url)
+                    response = httpx.Response(
+                        self.status_code, request=request)
+                    raise httpx.HTTPStatusError(
+                        f"{self.status_code} Bad Gateway",
+                        request=request,
+                        response=response
+                    )
+
+            def aiter_bytes(self, chunk_size=32768):
+                if self._chunk is None:
+                    return _OneChunkIterator(b"")
+                return _OneChunkIterator(self._chunk)
+
+        class _MockStreamCM:
+            def __init__(self, response):
+                self.response = response
+
+            async def __aenter__(self):
+                return self.response
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        called_urls = []
+
+        async def fake_stream(method, url, headers=None, follow_redirects=True):
+            called_urls.append(url)
+            if url == sticky_redirect_url:
+                return _MockStreamCM(_MockResponse(502, request_url=url))
+            if url == primary_url:
+                return _MockStreamCM(_MockResponse(200, chunk=b"ok-api-retry", request_url=url))
+            return _MockStreamCM(_MockResponse(500, request_url=url))
+
+        monkeypatch.setattr(manager.live_stream_client, 'stream', fake_stream)
+
+        try:
+            with patch('api.stream_manager', manager):
+                client = TestClient(app)
+                response = client.get(f"/stream/{stream_id}")
+
+            assert response.status_code == 200
+            assert response.content == b"ok-api-retry"
+            assert called_urls[:3] == [sticky_redirect_url,
+                                       sticky_redirect_url, sticky_redirect_url]
+            assert called_urls[3] == primary_url
+            assert stream_info.current_url is None
+        finally:
+            asyncio.run(manager.http_client.aclose())
+            asyncio.run(manager.live_stream_client.aclose())
 
     def test_stats_endpoint(self, client, mock_stream_manager):
         response = client.get("/stats")

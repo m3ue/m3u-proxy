@@ -635,6 +635,23 @@ class StreamManager:
             total_timeout_start = asyncio.get_event_loop().time()
             total_timeout = settings.STREAM_TOTAL_TIMEOUT
 
+            def _recover_sticky_origin_if_needed() -> bool:
+                """If sticky session is pinned to a redirected backend that failed, reset to entry URL."""
+                if not stream_info.use_sticky_session:
+                    return False
+
+                known_urls = [stream_info.original_url] + \
+                    (stream_info.failover_urls or [])
+                if stream_info.current_url and stream_info.current_url not in known_urls:
+                    logger.warning(
+                        f"Sticky origin {stream_info.current_url} failed during direct stream. "
+                        f"Reverting to configured entry point."
+                    )
+                    stream_info.current_url = None
+                    return True
+
+                return False
+
             # Main streaming loop with automatic reconnection on failover
             while failover_count <= max_failovers:
                 try:
@@ -815,7 +832,9 @@ class StreamManager:
                                     total_timeout_exceeded = total_timeout > 0 and elapsed_total > total_timeout
 
                                     # Try retrying the current URL first before failover
-                                    if retry_count < max_retries and not total_timeout_exceeded and not stream_info.is_vod:
+                                    allow_initial_retry = (
+                                        not stream_info.is_vod) or bytes_served == 0
+                                    if retry_count < max_retries and not total_timeout_exceeded and allow_initial_retry:
                                         retry_count += 1
                                         current_delay = retry_delay * \
                                             (1.5 ** (retry_count - 1)
@@ -860,6 +879,21 @@ class StreamManager:
                                         response = None
                                         break  # Reconnect with new URL
                                     else:
+                                        # Sticky-session recovery path: if we were pinned to a redirected backend,
+                                        # reset to the configured entry URL and reconnect once before failing.
+                                        if _recover_sticky_origin_if_needed():
+                                            logger.info(
+                                                f"Retrying stream {stream_id} after sticky origin recovery")
+                                            retry_count = 0
+                                            if stream_context is not None:
+                                                try:
+                                                    await stream_context.__aexit__(None, None, None)
+                                                except Exception:
+                                                    pass
+                                            stream_context = None
+                                            response = None
+                                            continue
+
                                         # For VOD, upstream can stall; reconnect instead of terminating client stream
                                         if stream_info.is_vod and bytes_served > 0 and vod_reconnects < max_vod_reconnects:
                                             vod_reconnects += 1
@@ -1089,7 +1123,9 @@ class StreamManager:
                         total_timeout_exceeded = total_timeout > 0 and elapsed_total > total_timeout
 
                         # Try retrying the current URL first
-                        if retry_count < max_retries and not total_timeout_exceeded and not stream_info.is_vod:
+                        allow_initial_retry = (
+                            not stream_info.is_vod) or bytes_served == 0
+                        if retry_count < max_retries and not total_timeout_exceeded and allow_initial_retry:
                             retry_count += 1
                             current_delay = retry_delay * \
                                 (1.5 ** (retry_count - 1)
@@ -1116,6 +1152,12 @@ class StreamManager:
                         # Retries exhausted, try failover if available
                         has_failover = bool(
                             stream_info.failover_resolver_url or stream_info.failover_urls)
+                        if _recover_sticky_origin_if_needed():
+                            logger.info(
+                                f"Retrying stream {stream_id} after sticky origin recovery")
+                            retry_count = 0
+                            continue
+
                         if has_failover and failover_count < max_failovers and not stream_info.is_vod:
                             logger.info(
                                 f"Retries exhausted, attempting automatic failover for client {client_id} (ReadError, no data)")
@@ -1186,7 +1228,9 @@ class StreamManager:
                     total_timeout_exceeded = total_timeout > 0 and elapsed_total > total_timeout
 
                     # Try retrying the current URL first
-                    if retry_count < max_retries and not total_timeout_exceeded and not stream_info.is_vod:
+                    allow_initial_retry = (
+                        not stream_info.is_vod) or bytes_served == 0
+                    if retry_count < max_retries and not total_timeout_exceeded and allow_initial_retry:
                         retry_count += 1
                         current_delay = retry_delay * \
                             (1.5 ** (retry_count - 1)
@@ -1213,6 +1257,12 @@ class StreamManager:
                     # Retries exhausted, try automatic failover
                     has_failover = bool(
                         stream_info.failover_resolver_url or stream_info.failover_urls)
+                    if _recover_sticky_origin_if_needed():
+                        logger.info(
+                            f"Retrying stream {stream_id} after sticky origin recovery")
+                        retry_count = 0
+                        continue
+
                     if has_failover and failover_count < max_failovers and not stream_info.is_vod:
                         logger.info(
                             f"Retries exhausted, attempting automatic failover for client {client_id} "
@@ -1297,7 +1347,9 @@ class StreamManager:
                         total_timeout_exceeded = total_timeout > 0 and elapsed_total > total_timeout
 
                         # Try retrying the current URL first
-                        if retry_count < max_retries and not total_timeout_exceeded and not stream_info.is_vod:
+                        allow_initial_retry = (
+                            not stream_info.is_vod) or bytes_served == 0
+                        if retry_count < max_retries and not total_timeout_exceeded and allow_initial_retry:
                             retry_count += 1
                             current_delay = retry_delay * \
                                 (1.5 ** (retry_count - 1)
@@ -1324,6 +1376,12 @@ class StreamManager:
                         # Try failover for unknown errors too
                         has_failover = bool(
                             stream_info.failover_resolver_url or stream_info.failover_urls)
+                        if _recover_sticky_origin_if_needed():
+                            logger.info(
+                                f"Retrying stream {stream_id} after sticky origin recovery")
+                            retry_count = 0
+                            continue
+
                         if has_failover and failover_count < max_failovers and not stream_info.is_vod:
                             logger.info(
                                 f"Retries exhausted, attempting automatic failover for client {client_id} (unknown error)")

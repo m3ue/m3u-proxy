@@ -119,7 +119,7 @@ Retries are automatically applied for:
 
 Retries are NOT applied for:
 
-- **VOD Streams**: VOD uses a different reconnection strategy with Range headers
+- **VOD Mid-Stream Failures**: After bytes have started flowing, VOD uses a reconnection strategy with Range headers instead of same-URL retry loops
 - **Client Disconnections**: Connection errors from the client side
 - **Streams with Active Data**: Retries only apply when connection fails before data is received
 
