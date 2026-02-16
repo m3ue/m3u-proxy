@@ -2,7 +2,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
 
 # Application version
-VERSION = "0.3.13"
+VERSION = "0.3.14"
 
 
 class Settings(BaseSettings):
@@ -46,7 +46,7 @@ class Settings(BaseSettings):
     # HTTP Client Timeout Configuration for Streaming
     # VOD (Video On Demand) timeout - allows clients to pause content for extended periods
     # 5 minutes - allows upstream CDN stalls/re-buffering
-    VOD_READ_TIMEOUT: float = 300.0
+    VOD_READ_TIMEOUT: float = 3600.0
     # 1 hour - allows client pause without losing session
     VOD_WRITE_TIMEOUT: float = 3600.0
     # Live TV timeout - emphasizes keeping connection alive during client buffering
