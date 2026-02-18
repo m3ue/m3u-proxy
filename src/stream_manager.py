@@ -13,6 +13,7 @@ import signal
 import os
 import time
 import re
+import uuid
 from typing import Dict, Optional, AsyncIterator, List, Set, Any
 from urllib.parse import urljoin, urlparse, quote, unquote
 from datetime import datetime, timezone, timedelta
@@ -45,6 +46,9 @@ class ClientInfo:
     # Alert flag to prevent duplicate warnings
     idle_warning_logged: bool = False
     idle_error_logged: bool = False
+    # Active connection ID - tracks the currently active streaming connection
+    # Used to prevent race conditions when multiple concurrent connections share the same client_id
+    active_connection_id: Optional[str] = None
 
 
 @dataclass
@@ -181,8 +185,9 @@ class StreamManager:
         self.stream_timeout = settings.STREAM_TIMEOUT
 
         # Track cancellation flags for active streaming generators
-        # Key: client_id, Value: asyncio.Event that gets set when stream should stop
-        self.client_cancel_events: Dict[str, asyncio.Event] = {}
+        # Key: connection_id (unique per streaming request), Value: asyncio.Event that gets set when stream should stop
+        # Changed from client_id to connection_id to fix race condition when clients make concurrent connections
+        self.connection_cancel_events: Dict[str, asyncio.Event] = {}
 
         # Pooling configuration
         self.enable_pooling = enable_pooling
@@ -491,17 +496,42 @@ class StreamManager:
 
         return client_info
 
-    async def cleanup_client(self, client_id: str):
-        """Clean up a client and signal its streaming generator to stop"""
+    async def cleanup_client(self, client_id: str, connection_id: Optional[str] = None):
+        """Clean up a client and signal its streaming generator to stop
+
+        Args:
+            client_id: The client identifier
+            connection_id: Optional connection identifier. If provided, only cleanup if it matches
+                          the active connection. This prevents race conditions when clients make
+                          concurrent connections.
+        """
         if client_id in self.clients:
             client_info = self.clients[client_id]
             stream_id = client_info.stream_id
 
+            # Check if this cleanup request is for the current active connection
+            # If connection_id is provided but doesn't match, skip cleanup to prevent
+            # race condition where an old connection cleans up a new one
+            if connection_id and client_info.active_connection_id != connection_id:
+                logger.debug(
+                    f"Skipping cleanup for client {client_id}: connection {connection_id} is not active "
+                    f"(active: {client_info.active_connection_id})")
+                # Still clean up the cancel event for this specific connection
+                if connection_id in self.connection_cancel_events:
+                    del self.connection_cancel_events[connection_id]
+                return
+
             # Signal the streaming generator to stop
-            if client_id in self.client_cancel_events:
-                self.client_cancel_events[client_id].set()
+            if connection_id and connection_id in self.connection_cancel_events:
+                self.connection_cancel_events[connection_id].set()
                 logger.info(
-                    f"Signaled streaming generator to stop for client: {client_id}")
+                    f"Signaled streaming generator to stop for client: {client_id}, connection: {connection_id}")
+            elif client_info.active_connection_id and client_info.active_connection_id in self.connection_cancel_events:
+                # Fallback: if no connection_id provided, use the active one from client_info
+                self.connection_cancel_events[client_info.active_connection_id].set(
+                )
+                logger.info(
+                    f"Signaled streaming generator to stop for client: {client_id}, active connection: {client_info.active_connection_id}")
 
             if stream_id and stream_id in self.stream_clients:
                 self.stream_clients[stream_id].discard(client_id)
@@ -513,6 +543,7 @@ class StreamManager:
 
             await self._emit_event("CLIENT_DISCONNECTED", stream_id or "unknown", {
                 "client_id": client_id,
+                "connection_id": connection_id,
                 "bytes_served": client_info.bytes_served,
                 "segments_served": client_info.segments_served,
                 "metadata": self.streams[stream_id].metadata if stream_id and stream_id in self.streams else {}
@@ -529,9 +560,11 @@ class StreamManager:
             del self.clients[client_id]
             self._stats.active_clients -= 1
 
-            # Clean up cancel event
-            if client_id in self.client_cancel_events:
-                del self.client_cancel_events[client_id]
+            # Clean up cancel event for this connection
+            if connection_id and connection_id in self.connection_cancel_events:
+                del self.connection_cancel_events[connection_id]
+            elif client_info.active_connection_id and client_info.active_connection_id in self.connection_cancel_events:
+                del self.connection_cancel_events[client_info.active_connection_id]
 
             logger.info(f"Cleaned up client: {client_id}")
 
@@ -566,9 +599,19 @@ class StreamManager:
         if client_id not in self.clients:
             await self.register_client(client_id, stream_id)
 
-        # Create cancellation event for this client
+        # Generate a unique connection ID for this streaming request
+        # This prevents race conditions when the same client makes concurrent connections (e.g., Kodi seeking)
+        connection_id = str(uuid.uuid4())
+
+        # Create cancellation event for this specific connection
         cancel_event = asyncio.Event()
-        self.client_cancel_events[client_id] = cancel_event
+        self.connection_cancel_events[connection_id] = cancel_event
+
+        # Update the client's active connection ID
+        if client_id in self.clients:
+            self.clients[client_id].active_connection_id = connection_id
+            logger.debug(
+                f"Client {client_id} now has active connection: {connection_id}")
 
         # Determine if strict mode is enabled (global or per-stream)
         # NEVER apply strict mode to VOD/timeshift content - it needs more time to start
@@ -1465,8 +1508,8 @@ class StreamManager:
 
                 self._stats.total_bytes_served += bytes_remaining
 
-            # Cleanup client
-            await self.cleanup_client(client_id)
+            # Cleanup client - pass connection_id to prevent race conditions
+            await self.cleanup_client(client_id, connection_id)
 
         # Determine content type
         # Add `or current_url.endswith('?profile=pass')` to handle TVHeadend passthrough URLs
@@ -1572,9 +1615,19 @@ class StreamManager:
         if client_id not in self.clients:
             await self.register_client(client_id, stream_id)
 
-        # Create cancellation event for this client
+        # Generate a unique connection ID for this streaming request
+        # This prevents race conditions when the same client makes concurrent connections (e.g., Kodi seeking)
+        connection_id = str(uuid.uuid4())
+
+        # Create cancellation event for this specific connection
         cancel_event = asyncio.Event()
-        self.client_cancel_events[client_id] = cancel_event
+        self.connection_cancel_events[connection_id] = cancel_event
+
+        # Update the client's active connection ID
+        if client_id in self.clients:
+            self.clients[client_id].active_connection_id = connection_id
+            logger.debug(
+                f"Client {client_id} now has active connection: {connection_id}")
 
         logger.info(
             f"Requesting pooled transcoded stream for client {client_id}, stream {stream_id}")
@@ -1882,8 +1935,8 @@ class StreamManager:
                 except Exception:
                     pass
 
-            # Final client cleanup
-            await self.cleanup_client(client_id)
+            # Final client cleanup - pass connection_id to prevent race conditions
+            await self.cleanup_client(client_id, connection_id)
             logger.info(
                 f"Finished pooled stream for client {client_id}, served {bytes_served} bytes")
 
