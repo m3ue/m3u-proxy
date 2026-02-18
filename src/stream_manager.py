@@ -1096,7 +1096,36 @@ class StreamManager:
                                 response = None
                                 continue  # Retry with failover URL
 
-                    # If we reach here, streaming completed successfully (failover event not set)
+                    # If we reach here, the upstream response iterator ended without error.
+                    # For live continuous streams, this is unexpected — it likely means the
+                    # provider silently closed the connection (e.g., connection limit reached).
+                    # Treat this as a failure and attempt failover if available.
+                    if stream_info.is_live_continuous and not stream_info.failover_event.is_set():
+                        has_failover = bool(
+                            stream_info.failover_resolver_url or stream_info.failover_urls)
+                        if has_failover and failover_count < max_failovers:
+                            logger.warning(
+                                f"Live stream ended unexpectedly for client {client_id} "
+                                f"({chunk_count} chunks, {bytes_served} bytes) — "
+                                f"provider may have closed connection. "
+                                f"Attempting failover (attempt {failover_count + 1}/{max_failovers})")
+                            await self._try_update_failover_url(stream_id, "live_stream_silent_close")
+
+                            # Reset circuit breaker state for the old upstream
+                            stream_info.upstream_marked_bad_until = None
+
+                            # Clean up current connection before failover
+                            if stream_context is not None:
+                                try:
+                                    await stream_context.__aexit__(None, None, None)
+                                except Exception:
+                                    pass
+                            stream_context = None
+                            response = None
+                            failover_count += 1
+                            continue  # Retry with failover URL
+
+                    # Stream completed normally (VOD, or live with no failover available)
                     if not stream_info.failover_event.is_set():
                         logger.info(
                             f"Stream completed for client {client_id}: {chunk_count} chunks, {bytes_served} bytes")
