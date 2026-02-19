@@ -85,14 +85,13 @@ http://original.com/segment2.ts"""
         result = processor.process_playlist(
             playlist, proxy_base_url, "http://original.com/")
 
-        # Verify that the segment URLs are correctly rewritten and encoded
-        # Note: Changed from 'segment.ts' to 'segment' to match actual API endpoint
+        # Verify that the segment URLs are correctly rewritten and encoded, .ts added back
         encoded_segment1 = quote("http://original.com/segment1.ts", safe='')
-        expected_url1 = f"{proxy_base_url}/segment?url={encoded_segment1}&client_id=stream123"
+        expected_url1 = f"{proxy_base_url}/segment.ts?url={encoded_segment1}&client_id=stream123"
         assert expected_url1 in result
 
         encoded_segment2 = quote("http://original.com/segment2.ts", safe='')
-        expected_url2 = f"{proxy_base_url}/segment?url={encoded_segment2}&client_id=stream123"
+        expected_url2 = f"{proxy_base_url}/segment.ts?url={encoded_segment2}&client_id=stream123"
         assert expected_url2 in result
 
 
