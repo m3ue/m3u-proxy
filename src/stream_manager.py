@@ -64,7 +64,7 @@ class StreamInfo:
     is_active: bool = True
     failover_urls: List[str] = field(default_factory=list)
     failover_resolver_url: Optional[str] = None
-    current_failover_index: int = 0
+    current_failover_index: int = -1
     current_url: Optional[str] = None
     final_playlist_url: Optional[str] = None
     user_agent: str = settings.DEFAULT_USER_AGENT
@@ -2628,8 +2628,12 @@ class StreamManager:
 
         # Fall back to static failover URLs list
         if stream_info.failover_urls:
-            next_index = (stream_info.current_failover_index +
-                          1) % len(stream_info.failover_urls)
+            next_index = stream_info.current_failover_index + 1
+            if next_index >= len(stream_info.failover_urls):
+                logger.info(
+                    f"All static failover URLs exhausted for stream {stream_id} "
+                    f"({len(stream_info.failover_urls)} URLs tried)")
+                return None
             next_url = stream_info.failover_urls[next_index]
             stream_info.current_failover_index = next_index
             logger.info(f"Using static failover URL #{next_index}: {next_url}")

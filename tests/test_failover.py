@@ -50,7 +50,7 @@ class TestHLSPlaylistFailover:
         stream_info = stream_manager.streams[stream_id]
         assert stream_info.failover_urls == [failover_url]
         assert stream_info.current_url == primary_url
-        assert stream_info.current_failover_index == 0
+        assert stream_info.current_failover_index == -1
 
         # Mock HTTP client to simulate primary failure and backup success
         mock_response_backup = Mock()
@@ -544,7 +544,7 @@ class TestFailoverStats:
 
     @pytest.mark.asyncio
     async def test_multiple_failover_cycles(self, stream_manager):
-        """Test that failover can cycle through multiple URLs"""
+        """Test that failover walks through all URLs then stops (no wrap-around)"""
         primary_url = "http://primary.example.com/stream.ts"
         failover_urls = [
             "http://backup1.example.com/stream.ts",
@@ -559,13 +559,12 @@ class TestFailoverStats:
 
         stream_info = stream_manager.streams[stream_id]
 
-        # Initial state: current_failover_index is 0, pointing to backup1
-        # Each call to _try_update_failover_url increments the index
-        # So first call gives backup2 (index 1), second gives backup3 (index 2), third cycles to backup1 (index 0)
+        # Initial state: current_failover_index is -1 (no failover used yet)
+        # Each call increments: -1 -> 0 (backup1), 0 -> 1 (backup2), 1 -> 2 (backup3)
         expected_sequence = [
-            (failover_urls[1], 1),  # First failover: backup2
-            (failover_urls[2], 2),  # Second failover: backup3
-            (failover_urls[0], 0),  # Third failover: cycles back to backup1
+            (failover_urls[0], 0),  # First failover: backup1
+            (failover_urls[1], 1),  # Second failover: backup2
+            (failover_urls[2], 2),  # Third failover: backup3
         ]
 
         # Trigger multiple failovers
@@ -576,8 +575,13 @@ class TestFailoverStats:
             assert stream_info.current_failover_index == expected_index
             assert stream_info.failover_attempts == i + 1
 
-        # Verify we cycled through all URLs
+        # Verify we used all URLs
         assert stream_info.failover_attempts == 3
+
+        # Fourth call should return False — all URLs exhausted, no wrap-around
+        result = await stream_manager._try_update_failover_url(stream_id, "attempt_3")
+        assert result is False
+        assert stream_info.failover_attempts == 3  # unchanged
 
 
 class TestFailoverIntegration:
