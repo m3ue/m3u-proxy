@@ -172,8 +172,7 @@ class M3U8Processor:
             parent_param = f"&parent={self.parent_stream_id}" if self.parent_stream_id else ""
             return f"{base_proxy_url}/playlist.m3u8?url={encoded_url}&client_id={self.client_id}{parent_param}"
         else:
-            # Fix: Remove .ts extension to match actual API endpoint /hls/{stream_id}/segment
-            return f"{base_proxy_url}/segment?url={encoded_url}&client_id={self.client_id}"
+            return f"{base_proxy_url}/segment.ts?url={encoded_url}&client_id={self.client_id}"
 
 
 class StreamManager:
