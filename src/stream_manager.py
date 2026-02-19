@@ -110,6 +110,8 @@ class StreamInfo:
     bitrate_bytes_window: int = 0
     low_bitrate_count: int = 0
     bitrate_monitoring_started: bool = False
+    # Last HTTP error status code from upstream - passed to failover resolver
+    last_error_status_code: Optional[int] = None
 
 
 @dataclass
@@ -785,6 +787,8 @@ class StreamManager:
                         logger.info(
                             f"Connection successful after {retry_count} retries, resetting retry counter")
                         retry_count = 0
+                    # Clear any previous error status code on successful connection
+                    stream_info.last_error_status_code = None
 
                     # Create a single iterator for the response stream
                     # IMPORTANT: Async iterators can only be consumed once! We must use the same
@@ -1294,6 +1298,10 @@ class StreamManager:
                 except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPError) as e:
                     logger.warning(
                         f"Stream error for client {client_id}: {type(e).__name__}: {e}")
+
+                    # Capture HTTP status code for failover resolver context
+                    if isinstance(e, httpx.HTTPStatusError):
+                        stream_info.last_error_status_code = e.response.status_code
 
                     # Check if we can retry before failover
                     elapsed_total = asyncio.get_event_loop().time() - total_timeout_start
@@ -2027,7 +2035,7 @@ class StreamManager:
 
         return StreamingResponse(generate(), media_type=content_type, headers=headers)
 
-    async def _seamless_failover(self, stream_id: str, error: Exception) -> Optional[httpx.Response]:
+    async def _seamless_failover(self, stream_id: str, error: Exception, reason: str = "seamless_failover") -> Optional[httpx.Response]:
         """
         Attempt seamless failover to next URL.
         Returns new response object if successful, None if all failovers exhausted.
@@ -2046,7 +2054,7 @@ class StreamManager:
             return None
 
         # Resolve next failover URL using the preferred method
-        next_url = await self._resolve_next_failover_url(stream_id)
+        next_url = await self._resolve_next_failover_url(stream_id, reason=reason)
 
         if not next_url:
             logger.warning(
@@ -2093,6 +2101,11 @@ class StreamManager:
         except Exception as e:
             logger.error(
                 f"Failover attempt failed for stream {stream_id}: {e}")
+
+            # Capture HTTP status code for failover resolver context
+            if isinstance(e, httpx.HTTPStatusError):
+                stream_info.last_error_status_code = e.response.status_code
+
             stream_info.failover_attempts += 1
 
             # Try next failover URL recursively if available
@@ -2107,7 +2120,7 @@ class StreamManager:
                 max_attempts = 0
 
             if stream_info.failover_attempts < max_attempts:
-                return await self._seamless_failover(stream_id, e)
+                return await self._seamless_failover(stream_id, e, reason=reason)
 
             return None
 
@@ -2570,13 +2583,14 @@ class StreamManager:
             logger.warning(f"Health check failed for stream {stream_id}: {e}")
             return False
 
-    async def _resolve_next_failover_url(self, stream_id: str) -> Optional[str]:
+    async def _resolve_next_failover_url(self, stream_id: str, reason: str = "unknown") -> Optional[str]:
         """Resolve the next failover URL using either resolver callback or static list
 
         Prioritizes failover_resolver_url over failover_urls for maximum flexibility.
 
         Args:
             stream_id: The stream ID to get failover URL for
+            reason: Reason for the failover (e.g. stream_error, circuit_breaker, etc.)
 
         Returns:
             Next failover URL or None if no more failovers available
@@ -2595,7 +2609,9 @@ class StreamManager:
                 payload = {
                     'current_url': stream_info.current_url,
                     'metadata': stream_info.metadata,
-                    'current_failover_index': stream_info.current_failover_index
+                    'current_failover_index': stream_info.current_failover_index,
+                    'status_code': stream_info.last_error_status_code,
+                    'reason': reason,
                 }
 
                 async with httpx.AsyncClient(timeout=10) as client:
@@ -2667,7 +2683,7 @@ class StreamManager:
 
         # Resolve the next failover URL using the preferred method
         old_url = stream_info.current_url
-        next_url = await self._resolve_next_failover_url(stream_id)
+        next_url = await self._resolve_next_failover_url(stream_id, reason=reason)
 
         if not next_url:
             logger.warning(
