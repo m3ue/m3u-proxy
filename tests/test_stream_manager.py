@@ -283,8 +283,8 @@ segment1.ts"""
         assert stream_info.error_count == 0
 
         # We can't easily test actual failover without complex mocking
-        # so just verify the structure is correct
-        assert stream_info.current_failover_index == 0
+        # so just verify the structure is correct (-1 means no failover used yet)
+        assert stream_info.current_failover_index == -1
         assert stream_info.current_url == url
 
 

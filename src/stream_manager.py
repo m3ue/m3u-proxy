@@ -64,7 +64,7 @@ class StreamInfo:
     is_active: bool = True
     failover_urls: List[str] = field(default_factory=list)
     failover_resolver_url: Optional[str] = None
-    current_failover_index: int = 0
+    current_failover_index: int = -1
     current_url: Optional[str] = None
     final_playlist_url: Optional[str] = None
     user_agent: str = settings.DEFAULT_USER_AGENT
