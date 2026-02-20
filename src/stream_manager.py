@@ -2392,6 +2392,10 @@ class StreamManager:
                     f"Error fetching playlist for stream {stream_id}: {e}")
                 stream_info.error_count += 1
 
+                # Capture HTTP status code for failover resolver context
+                if isinstance(e, httpx.HTTPStatusError):
+                    stream_info.last_error_status_code = e.response.status_code
+
                 # STICKY SESSION RECOVERY:
                 # If sticky session is enabled and we were stuck to a specific origin (via redirect)
                 # and it failed, revert to the configured URL to allow implicit load balancer failover.
@@ -2495,6 +2499,10 @@ class StreamManager:
                 except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPError) as e:
                     logger.warning(
                         f"Error fetching HLS segment (attempt {retry_count + 1}/{max_retries + 1}): {e}")
+
+                    # Capture HTTP status code for failover resolver context
+                    if isinstance(e, httpx.HTTPStatusError) and stream_info:
+                        stream_info.last_error_status_code = e.response.status_code
 
                     # If we have a stream with failover URLs, try triggering failover
                     if stream_info and stream_info.failover_urls and retry_count < max_retries:
