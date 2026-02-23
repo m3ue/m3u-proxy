@@ -912,10 +912,13 @@ class StreamManager:
                                         logger.info(
                                             f"Retries exhausted, attempting failover due to chunk timeout for client {client_id} "
                                             f"(failover attempt {failover_count + 1}/{max_failovers})")
-                                        await self._try_update_failover_url(stream_id, "chunk_timeout_after_retries")
+                                        failover_ok = await self._try_update_failover_url(stream_id, "chunk_timeout_after_retries")
+                                        failover_count += 1
+                                        if not failover_ok:
+                                            logger.warning(f"Failover failed for stream {stream_id}, giving up")
+                                            break
                                         # Reset retry counter for new URL
                                         retry_count = 0
-                                        failover_count += 1
                                         if stream_context is not None:
                                             try:
                                                 await stream_context.__aexit__(None, None, None)
@@ -1236,10 +1239,13 @@ class StreamManager:
                         if has_failover and failover_count < max_failovers and not stream_info.is_vod:
                             logger.info(
                                 f"Retries exhausted, attempting automatic failover for client {client_id} (ReadError, no data)")
-                            await self._try_update_failover_url(stream_id, "connection_error_after_retries")
+                            failover_ok = await self._try_update_failover_url(stream_id, "connection_error_after_retries")
+                            failover_count += 1
+                            if not failover_ok:
+                                logger.warning(f"Failover failed for stream {stream_id}, giving up")
+                                break
                             # Reset retry counter for new URL
                             retry_count = 0
-                            failover_count += 1
                             # Clean up current connection
                             if stream_context is not None:
                                 try:
@@ -1346,10 +1352,13 @@ class StreamManager:
                         logger.info(
                             f"Retries exhausted, attempting automatic failover for client {client_id} "
                             f"(failover attempt {failover_count + 1}/{max_failovers})")
-                        await self._try_update_failover_url(stream_id, f"stream_error_{type(e).__name__}_after_retries")
+                        failover_ok = await self._try_update_failover_url(stream_id, f"stream_error_{type(e).__name__}_after_retries")
+                        failover_count += 1
+                        if not failover_ok:
+                            logger.warning(f"Failover failed for stream {stream_id}, giving up")
+                            break
                         # Reset retry counter for new URL
                         retry_count = 0
-                        failover_count += 1
                         # Clean up current connection
                         if stream_context is not None:
                             try:
@@ -1464,10 +1473,13 @@ class StreamManager:
                         if has_failover and failover_count < max_failovers and not stream_info.is_vod:
                             logger.info(
                                 f"Retries exhausted, attempting automatic failover for client {client_id} (unknown error)")
-                            await self._try_update_failover_url(stream_id, f"unknown_error_{type(e).__name__}_after_retries")
+                            failover_ok = await self._try_update_failover_url(stream_id, f"unknown_error_{type(e).__name__}_after_retries")
+                            failover_count += 1
+                            if not failover_ok:
+                                logger.warning(f"Failover failed for stream {stream_id}, giving up")
+                                break
                             # Reset retry counter for new URL
                             retry_count = 0
-                            failover_count += 1
                             # Clean up current connection
                             if stream_context is not None:
                                 try:
