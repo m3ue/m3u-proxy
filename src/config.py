@@ -157,6 +157,25 @@ class Settings(BaseSettings):
     # Whether to use exponential backoff for retry delays (multiplies delay by 1.5 each retry)
     STREAM_RETRY_EXPONENTIAL_BACKOFF: bool = False
 
+    # Silence Detection - detect silent audio streams and trigger failover
+    # Enable silence detection for automatic failover on silent streams
+    ENABLE_SILENCE_DETECTION: bool = False
+    # Audio level threshold in dB below which audio is considered silent
+    # -50 dB is a good default; raise to -40 dB for stricter detection
+    SILENCE_THRESHOLD_DB: float = -50.0
+    # Minimum duration of continuous silence (seconds) within a check window
+    # to count as a "silent" check. Shorter values catch brief silence.
+    SILENCE_DURATION: float = 3.0
+    # How often to run silence analysis (seconds) - determines the analysis window
+    # Each window buffers stream data and runs ffmpeg silencedetect on it
+    SILENCE_CHECK_INTERVAL: float = 10.0
+    # Number of consecutive silent checks before triggering failover
+    # Prevents failover on brief silent moments (e.g., between songs)
+    SILENCE_FAILOVER_THRESHOLD: int = 3
+    # Grace period (seconds) at stream start before silence monitoring kicks in
+    # Allows for initial buffering and audio decoder startup
+    SILENCE_MONITORING_GRACE_PERIOD: float = 15.0
+
     # Sticky Session Handler Configuration
     # Enable sticky session handling by default to lock clients to specific backend origins
     # after redirects. This prevents playback loops caused by load balancers bouncing
