@@ -4,7 +4,7 @@ on:
   pull_request:
     branches: [main, master, dev, experimental]
   push:
-    branches: [main, master]
+    branches: [main, master, dev, experimental]
   workflow_call:
     secrets:
       DOCKERHUB_USERNAME:
