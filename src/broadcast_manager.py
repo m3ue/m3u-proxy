@@ -16,7 +16,7 @@ import time
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 import httpx
 
@@ -86,6 +86,13 @@ class NetworkBroadcastProcess:
         "invalid data found",
         "no such file or directory",
         "protocol not found",
+    ]
+
+    # Patterns that match INPUT_ERROR_PATTERNS but are non-fatal — log as warning and continue.
+    # e.g. FFmpeg's HLS muxer emits "failed to delete old segment" when it can't remove a
+    # segment that was already cleaned up externally; this should never kill the broadcast.
+    INPUT_ERROR_SUPPRESSIONS = [
+        "failed to delete old segment",
     ]
 
     def __init__(self, config: BroadcastConfig, hls_base_dir: str):
@@ -239,6 +246,33 @@ class NetworkBroadcastProcess:
             except Exception as e:
                 logger.warning(f"Failed to set permissions on {self.hls_dir}: {e}")
 
+            # On a fresh start (not a transition), remove any leftover segments/playlists
+            # so FFmpeg's rolling-window deletion doesn't hit files it didn't write.
+            if (
+                self.config.segment_start_number == 0
+                and not self.config.add_discontinuity
+            ):
+                stale_count = 0
+                for filename in (
+                    list(os.listdir(self.hls_dir))
+                    if os.path.isdir(self.hls_dir)
+                    else []
+                ):
+                    if filename.endswith((".ts", ".m3u8")):
+                        try:
+                            os.remove(os.path.join(self.hls_dir, filename))
+                            stale_count += 1
+                        except FileNotFoundError:
+                            pass
+                        except OSError as e:
+                            logger.warning(
+                                f"Broadcast {self.network_id}: could not remove stale file {filename}: {e}"
+                            )
+                if stale_count:
+                    logger.info(
+                        f"Broadcast {self.network_id}: removed {stale_count} stale file(s) before fresh start"
+                    )
+
             cmd = self._build_ffmpeg_command()
             logger.info(f"Starting broadcast {self.network_id}: {' '.join(cmd)}")
 
@@ -350,20 +384,29 @@ class NetworkBroadcastProcess:
 
                     line_lower = line_str.lower()
 
-                    # Check for input errors - these are always logged
-                    for pattern in self.INPUT_ERROR_PATTERNS:
-                        if pattern in line_lower:
-                            self.error_message = line_str
-                            self.status = "failed"
-                            logger.error(
-                                f"Broadcast {self.network_id} error: {line_str}"
+                    # Check for input errors
+                    is_input_error = any(
+                        p in line_lower for p in self.INPUT_ERROR_PATTERNS
+                    )
+                    if is_input_error:
+                        # Some error patterns are non-fatal (e.g. segment already deleted)
+                        is_suppressed = any(
+                            p in line_lower for p in self.INPUT_ERROR_SUPPRESSIONS
+                        )
+                        if is_suppressed:
+                            logger.warning(
+                                f"Broadcast {self.network_id} (non-fatal): {line_str}"
                             )
-                            # Send failure callback
-                            await self._send_callback(
-                                "broadcast_failed",
-                                {"error": line_str, "error_type": "input_error"},
-                            )
-                            return
+                            continue
+
+                        self.error_message = line_str
+                        self.status = "failed"
+                        logger.error(f"Broadcast {self.network_id} error: {line_str}")
+                        await self._send_callback(
+                            "broadcast_failed",
+                            {"error": line_str, "error_type": "input_error"},
+                        )
+                        return
 
                     # Skip verbose/noisy messages entirely
                     should_skip = any(
@@ -499,6 +542,74 @@ class NetworkBroadcastProcess:
             )
             return self.config.segment_start_number
 
+    @staticmethod
+    def parse_playlist_segments(playlist_path: str) -> Set[str]:
+        """Return the set of .ts filenames referenced by an HLS playlist."""
+        segments: Set[str] = set()
+        try:
+            with open(playlist_path, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        segments.add(os.path.basename(line))
+        except Exception:
+            pass
+        return segments
+
+    def cleanup_orphaned_segments(self, age_threshold: int = 0) -> int:
+        """
+        Remove .ts files in the HLS dir that are not referenced by the current playlist.
+
+        Args:
+            age_threshold: Only remove files older than this many seconds.
+                           0 = remove immediately (used during programme transitions).
+
+        Returns:
+            Number of files removed.
+        """
+        playlist_path = os.path.join(self.hls_dir, "live.m3u8")
+        if not os.path.exists(playlist_path):
+            return 0
+
+        referenced = self.parse_playlist_segments(playlist_path)
+        removed = 0
+        now = time.time()
+
+        try:
+            for filename in os.listdir(self.hls_dir):
+                if not filename.endswith(".ts"):
+                    continue
+                if filename in referenced:
+                    continue
+
+                full_path = os.path.join(self.hls_dir, filename)
+                if age_threshold > 0:
+                    try:
+                        if now - os.path.getmtime(full_path) < age_threshold:
+                            continue
+                    except OSError:
+                        continue
+
+                try:
+                    os.remove(full_path)
+                    removed += 1
+                except FileNotFoundError:
+                    pass
+                except OSError as e:
+                    logger.warning(
+                        f"Broadcast {self.network_id}: could not remove orphaned segment {filename}: {e}"
+                    )
+        except Exception as e:
+            logger.error(
+                f"Broadcast {self.network_id}: error during orphan cleanup: {e}"
+            )
+
+        if removed:
+            logger.info(
+                f"Broadcast {self.network_id}: removed {removed} orphaned segment(s)"
+            )
+        return removed
+
     def get_status(self) -> BroadcastStatus:
         """Get current broadcast status."""
         return BroadcastStatus(
@@ -563,9 +674,13 @@ class BroadcastManager:
         )
 
         # Broadcast GC configuration (reuses HLS_GC_* thresholds)
-        self.broadcast_gc_enabled = bool(getattr(settings, "BROADCAST_GC_ENABLED", True))
+        self.broadcast_gc_enabled = bool(
+            getattr(settings, "BROADCAST_GC_ENABLED", True)
+        )
         self.broadcast_gc_interval = int(getattr(settings, "HLS_GC_INTERVAL", 600))
-        self.broadcast_gc_age_threshold = int(getattr(settings, "HLS_GC_AGE_THRESHOLD", 3600))
+        self.broadcast_gc_age_threshold = int(
+            getattr(settings, "HLS_GC_AGE_THRESHOLD", 3600)
+        )
         self._gc_task: Optional[asyncio.Task] = None
 
         # Ensure base directory exists
@@ -596,10 +711,10 @@ class BroadcastManager:
                     # Force discontinuity on transition
                     config.add_discontinuity = True
 
-                # Note: We intentionally do NOT delete the old playlist here.
-                # The old segments remain valid until FFmpeg's delete_segments removes them.
-                # The new FFmpeg will overwrite the playlist with a discontinuity marker,
-                # allowing players to smoothly transition to the new content.
+                # Clean up segments no longer referenced by the playlist before handing
+                # off to the new FFmpeg process. The playlist itself is left in place so
+                # the new process can overwrite it with a discontinuity marker.
+                existing.cleanup_orphaned_segments(age_threshold=0)
 
                 del self.broadcasts[network_id]
 
@@ -828,18 +943,30 @@ class BroadcastManager:
 
     async def _gc_broadcast_dirs(self):
         """
-        Remove orphaned broadcast directories that are no longer active and
-        have not been modified within the age threshold.
+        Two-phase broadcast GC:
 
-        Uses shutil.rmtree (unlike HLS GC which uses os.rmdir) because broadcast
-        directories contain .ts segments and .m3u8 playlists even after FFmpeg exits.
+        1. Active broadcasts — remove .ts files that are no longer referenced by the
+           current playlist and are older than 60 seconds (guard against race with
+           a concurrent transition writing new segments).
+        2. Inactive directories — remove entire stale broadcast dirs (no active process,
+           age > gc_age_threshold) using shutil.rmtree.
         """
-        removed = skipped_active = skipped_too_young = 0
+        dirs_removed = skipped_too_young = 0
 
-        # Snapshot active dirs without holding the lock during I/O
+        # Snapshot active processes without holding the lock during I/O
         async with self._lock:
-            active_dirs = {p.hls_dir for p in self.broadcasts.values()}
+            active_snapshot = {
+                hls_dir: process
+                for hls_dir, process in (
+                    (p.hls_dir, p) for p in self.broadcasts.values()
+                )
+            }
 
+        # Phase 1: clean orphaned segments from active broadcasts
+        for process in active_snapshot.values():
+            process.cleanup_orphaned_segments(age_threshold=60)
+
+        # Phase 2: remove entire stale inactive directories
         try:
             entries = os.listdir(self.hls_base_dir)
         except Exception as e:
@@ -855,8 +982,7 @@ class BroadcastManager:
             if not os.path.isdir(full_path):
                 continue
 
-            if full_path in active_dirs:
-                skipped_active += 1
+            if full_path in active_snapshot:
                 continue
 
             try:
@@ -870,17 +996,16 @@ class BroadcastManager:
 
             try:
                 shutil.rmtree(full_path)
-                removed += 1
+                dirs_removed += 1
                 logger.info(
                     f"Broadcast GC: removed stale directory {full_path} (age={age:.0f}s)"
                 )
             except Exception as e:
                 logger.error(f"Broadcast GC: failed to remove {full_path}: {e}")
 
-        if removed or skipped_active or skipped_too_young:
+        if dirs_removed or skipped_too_young:
             logger.info(
-                f"Broadcast GC: removed={removed}, skipped_active={skipped_active}, "
-                f"skipped_too_young={skipped_too_young}"
+                f"Broadcast GC: dirs_removed={dirs_removed}, skipped_too_young={skipped_too_young}"
             )
 
     async def shutdown(self):
