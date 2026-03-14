@@ -98,7 +98,9 @@ class Settings(BaseSettings):
 
     # Network Broadcast Configuration
     # Base directory for broadcast HLS output. Each network gets a subdirectory.
-    HLS_BROADCAST_DIR: str = "/tmp/m3u-proxy-broadcasts"
+    # When None (default), derives from HLS_TEMP_DIR if set, otherwise falls
+    # back to /tmp/m3u-proxy-broadcasts. Can be overridden explicitly via env var.
+    HLS_BROADCAST_DIR: Optional[str] = None
     # Timeout (seconds) for webhook callbacks to the broadcast creator when broadcasts end
     BROADCAST_CALLBACK_TIMEOUT: int = 3
     BROADCAST_MAX_START_RETRIES: int = 3

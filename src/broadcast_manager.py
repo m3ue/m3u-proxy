@@ -88,6 +88,14 @@ class NetworkBroadcastProcess:
         "protocol not found",
     ]
 
+    # Lines matching INPUT_ERROR_PATTERNS are suppressed (not treated as fatal)
+    # if they also match any of these patterns. For example, FFmpeg's HLS muxer
+    # logs "failed to delete old segment ... No such file or directory" when
+    # delete_segments can't find a segment — this is a non-fatal warning.
+    INPUT_ERROR_SUPPRESSIONS = [
+        "failed to delete old segment",
+    ]
+
     def __init__(self, config: BroadcastConfig, hls_base_dir: str):
         self.config = config
         self.network_id = config.network_id
@@ -239,6 +247,33 @@ class NetworkBroadcastProcess:
             except Exception as e:
                 logger.warning(f"Failed to set permissions on {self.hls_dir}: {e}")
 
+            # Clean stale segment/playlist files before launching FFmpeg.
+            # When starting fresh (start_number=0, no discontinuity), any pre-existing
+            # .ts/.m3u8 files are leftovers from a previous run (e.g. after a container
+            # reboot where the DELETE cleanup failed or was incomplete). If FFmpeg starts
+            # writing at segment 0 with delete_segments enabled, its rolling-window
+            # deletion will eventually try to remove segment files that it didn't write
+            # itself, producing "failed to delete old segment" errors.
+            # For programme transitions (start_number > 0), BroadcastManager.start_broadcast()
+            # already calls cleanup_orphaned_segments() before creating this process.
+            if self.config.segment_start_number == 0 and not self.config.add_discontinuity:
+                stale_count = 0
+                for filename in list(os.listdir(self.hls_dir)):
+                    if filename.endswith((".ts", ".m3u8")):
+                        try:
+                            os.remove(os.path.join(self.hls_dir, filename))
+                            stale_count += 1
+                        except FileNotFoundError:
+                            pass
+                        except OSError as e:
+                            logger.warning(
+                                f"Failed to remove stale file {filename} from {self.hls_dir}: {e}"
+                            )
+                if stale_count:
+                    logger.info(
+                        f"Cleaned {stale_count} stale file(s) from {self.hls_dir} before fresh start"
+                    )
+
             cmd = self._build_ffmpeg_command()
             logger.info(f"Starting broadcast {self.network_id}: {' '.join(cmd)}")
 
@@ -351,19 +386,33 @@ class NetworkBroadcastProcess:
                     line_lower = line_str.lower()
 
                     # Check for input errors - these are always logged
-                    for pattern in self.INPUT_ERROR_PATTERNS:
-                        if pattern in line_lower:
-                            self.error_message = line_str
-                            self.status = "failed"
-                            logger.error(
-                                f"Broadcast {self.network_id} error: {line_str}"
+                    is_input_error = any(
+                        pattern in line_lower
+                        for pattern in self.INPUT_ERROR_PATTERNS
+                    )
+                    if is_input_error:
+                        # Check if this is a suppressed (non-fatal) error
+                        is_suppressed = any(
+                            pattern in line_lower
+                            for pattern in self.INPUT_ERROR_SUPPRESSIONS
+                        )
+                        if is_suppressed:
+                            logger.warning(
+                                f"Broadcast {self.network_id} (non-fatal): {line_str}"
                             )
-                            # Send failure callback
-                            await self._send_callback(
-                                "broadcast_failed",
-                                {"error": line_str, "error_type": "input_error"},
-                            )
-                            return
+                            continue
+
+                        self.error_message = line_str
+                        self.status = "failed"
+                        logger.error(
+                            f"Broadcast {self.network_id} error: {line_str}"
+                        )
+                        # Send failure callback
+                        await self._send_callback(
+                            "broadcast_failed",
+                            {"error": line_str, "error_type": "input_error"},
+                        )
+                        return
 
                     # Skip verbose/noisy messages entirely
                     should_skip = any(
@@ -595,8 +644,17 @@ class BroadcastManager:
     """
 
     def __init__(self, hls_base_dir: Optional[str] = None):
-        self.hls_base_dir = hls_base_dir or getattr(
-            settings, "HLS_BROADCAST_DIR", "/tmp/m3u-proxy-broadcasts"
+        # Resolve broadcast HLS directory:
+        # 1. Explicit hls_base_dir argument (highest priority)
+        # 2. HLS_BROADCAST_DIR env var / setting (if explicitly set)
+        # 3. HLS_TEMP_DIR + "/broadcasts" (derive from transcoding temp dir)
+        # 4. /tmp/m3u-proxy-broadcasts (final fallback)
+        hls_temp = getattr(settings, "HLS_TEMP_DIR", None)
+        self.hls_base_dir = (
+            hls_base_dir
+            or getattr(settings, "HLS_BROADCAST_DIR", None)
+            or (os.path.join(hls_temp, "broadcasts") if hls_temp else None)
+            or "/tmp/m3u-proxy-broadcasts"
         )
         self.broadcasts: Dict[str, NetworkBroadcastProcess] = {}
         self._lock = asyncio.Lock()
