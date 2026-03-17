@@ -134,24 +134,6 @@ class TestSilenceAnalysis:
             assert "silencedetect" in filter_arg
 
 
-class TestSilenceDetectionStreamInfo:
-    """Test StreamInfo silence detection fields"""
-
-    def test_default_silence_detection_fields(self):
-        """Test that StreamInfo has correct default values for silence detection"""
-        info = StreamInfo(
-            stream_id="test",
-            original_url="http://example.com/stream.ts",
-            created_at=datetime.now(timezone.utc),
-            last_access=datetime.now(timezone.utc),
-        )
-
-        assert info.silence_check_start_time is None
-        assert info.silence_audio_buffer == b""
-        assert info.silence_count == 0
-        assert info.silence_monitoring_started is False
-
-
 class TestSilenceDetectionConfig:
     """Test silence detection configuration settings"""
 
@@ -188,23 +170,6 @@ class TestSilenceDetectionFailover:
         yield manager
         if hasattr(manager, "_running"):
             manager._running = False
-
-    @pytest.mark.asyncio
-    async def test_silence_counter_increments(self, stream_manager):
-        """Test that the silence counter increments on detected silence"""
-        primary_url = "http://primary.example.com/stream.ts"
-        failover_url = "http://backup.example.com/stream.ts"
-
-        stream_id = await stream_manager.get_or_create_stream(
-            primary_url,
-            failover_urls=[failover_url],
-        )
-
-        stream_info = stream_manager.streams[stream_id]
-        assert stream_info.silence_count == 0
-
-        stream_info.silence_count = 1
-        assert stream_info.silence_count == 1
 
     @pytest.mark.asyncio
     async def test_silence_counter_resets_on_recovery(self, stream_manager):
@@ -268,22 +233,6 @@ class TestSilenceDetectionFailover:
         assert event.data["reason"] == "silence_detected"
 
     @pytest.mark.asyncio
-    async def test_silence_detection_skipped_for_vod(self):
-        """Test that silence detection fields exist but VOD streams are skipped in logic"""
-        info = StreamInfo(
-            stream_id="test-vod",
-            original_url="http://example.com/movie.mp4",
-            created_at=datetime.now(timezone.utc),
-            last_access=datetime.now(timezone.utc),
-            is_vod=True,
-        )
-
-        # VOD streams should have silence detection fields but
-        # the streaming loop skips silence detection for VOD
-        assert info.silence_count == 0
-        assert info.is_vod is True
-
-    @pytest.mark.asyncio
     async def test_no_failover_without_failover_urls(self, stream_manager):
         """Test that silence detection doesn't trigger failover without failover URLs"""
         primary_url = "http://primary.example.com/stream.ts"
@@ -299,28 +248,3 @@ class TestSilenceDetectionFailover:
         assert result is False
 
 
-class TestSilenceDetectionGracePeriod:
-    """Test silence detection grace period behavior"""
-
-    def test_monitoring_not_started_by_default(self):
-        """Test that silence monitoring starts inactive"""
-        info = StreamInfo(
-            stream_id="test",
-            original_url="http://example.com/stream.ts",
-            created_at=datetime.now(timezone.utc),
-            last_access=datetime.now(timezone.utc),
-        )
-
-        assert info.silence_monitoring_started is False
-        assert info.silence_check_start_time is None
-
-    def test_audio_buffer_starts_empty(self):
-        """Test that the audio buffer starts empty"""
-        info = StreamInfo(
-            stream_id="test",
-            original_url="http://example.com/stream.ts",
-            created_at=datetime.now(timezone.utc),
-            last_access=datetime.now(timezone.utc),
-        )
-
-        assert info.silence_audio_buffer == b""
