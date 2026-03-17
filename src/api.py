@@ -2,9 +2,11 @@ from fastapi import FastAPI, HTTPException, Query, Response, Request, Depends, H
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
+import asyncio
 import logging
 import hashlib
 import subprocess
+import uuid
 from urllib.parse import unquote, urlparse
 from typing import Optional, List, Dict
 from pydantic import BaseModel, field_validator
@@ -981,14 +983,40 @@ async def get_hls_playlist(
 ):
     """Get HLS playlist for a stream (supports both direct proxy and transcoded HLS streams)"""
     try:
-        # Generate or reuse client ID based on request characteristics
-        # Use IP + User-Agent + Stream ID to create a consistent client ID
+        # Generate or reuse client ID based on request characteristics.
+        # The deterministic hash lets the same device reconnect to the same
+        # client record.  However, two devices behind the same NAT with the
+        # same User-Agent produce an identical hash.  If the existing client
+        # record still has an active connection (different device), we must
+        # create a unique client ID — otherwise cleanup_client for one device
+        # deletes the shared record and kills the other device's stream.
         if not client_id:
             client_info_data = get_client_info(request)
+            username_part = client_info_data.get("username") or ""
             client_hash = hashlib.md5(
-                f"{client_info_data['ip_address']}-{client_info_data['user_agent']}-{stream_id}".encode()
+                f"{client_info_data['ip_address']}-{client_info_data['user_agent']}-{stream_id}-{username_part}".encode()
             ).hexdigest()[:16]
             client_id = f"client_{client_hash}"
+
+            # Collision check: if this client_id already has an active
+            # connection on the same stream, this is a different device.
+            if (
+                client_id in stream_manager.clients
+                and stream_manager.clients[client_id].stream_id == stream_id
+                and stream_manager.clients[client_id].active_connection_id
+                and stream_manager.clients[client_id].active_connection_id
+                    in stream_manager.connection_cancel_events
+                and not stream_manager.connection_cancel_events[
+                    stream_manager.clients[client_id].active_connection_id
+                ].is_set()
+            ):
+                # Active connection exists — make this client unique
+                unique_suffix = uuid.uuid4().hex[:8]
+                client_id = f"client_{client_hash}_{unique_suffix}"
+                logger.info(
+                    f"Client ID collision detected for stream {stream_id}, "
+                    f"assigning unique ID: {client_id}"
+                )
 
         # Only register client if not already registered for this stream
         if (
@@ -1174,6 +1202,64 @@ async def get_hls_segment_ts(
     return await get_hls_segment(stream_id, request, client_id, url)
 
 
+def _start_disconnect_monitor(
+    request: Request, client_id: str, sm: StreamManager
+) -> None:
+    """Start a background task that detects ASGI client disconnect and sets cancel_event.
+
+    When a client disconnects, the ASGI receive channel delivers an
+    ``http.disconnect`` message.  We set the connection's cancel_event AND
+    directly signal broadcast subscribers.  We cannot rely on the streaming
+    generator to reach post-loop cleanup because Starlette stops iterating
+    the generator once the client is gone — the generator stays suspended at
+    ``yield`` and only its ``finally`` blocks run during GC.
+    """
+    client_info = sm.clients.get(client_id)
+    if not client_info or not client_info.active_connection_id:
+        return
+
+    conn_id = client_info.active_connection_id
+    stream_id = client_info.stream_id
+    cancel_event = sm.connection_cancel_events.get(conn_id)
+    if not cancel_event:
+        return
+
+    async def _monitor() -> None:
+        try:
+            while not cancel_event.is_set():
+                message = await request.receive()
+                if message.get("type") == "http.disconnect":
+                    if not cancel_event.is_set():
+                        logger.info(
+                            f"ASGI disconnect detected for client {client_id} "
+                            f"(connection {conn_id}), setting cancel event"
+                        )
+                        cancel_event.set()
+
+                    # If this client was the primary reader for a broadcast
+                    # stream, signal subscribers immediately so they can
+                    # promote without waiting for the generator's post-loop
+                    # cleanup (which may never run — see docstring).
+                    if (
+                        stream_id
+                        and stream_id in sm._direct_broadcast_primary
+                        and sm._direct_broadcast_primary[stream_id] == conn_id
+                    ):
+                        logger.info(
+                            f"ASGI disconnect: signaling subscribers for "
+                            f"stream {stream_id} (primary was {client_id})"
+                        )
+                        sm._signal_subscribers_end(stream_id)
+
+                    return
+        except Exception:
+            # Connection already closed or error reading — set cancel to be safe
+            if not cancel_event.is_set():
+                cancel_event.set()
+
+    asyncio.create_task(_monitor())
+
+
 @app.get("/stream/{stream_id}")
 async def get_direct_stream(
     request: Request,
@@ -1188,14 +1274,40 @@ async def get_direct_stream(
         stream_info = stream_manager.streams[stream_id]
         stream_url = stream_info.current_url or stream_info.original_url
 
-        # Generate or reuse client ID based on request characteristics
-        # Use IP + User-Agent + Stream ID to create a consistent client ID
+        # Generate or reuse client ID based on request characteristics.
+        # The deterministic hash lets the same device reconnect to the same
+        # client record.  However, two devices behind the same NAT with the
+        # same User-Agent produce an identical hash.  If the existing client
+        # record still has an active connection (different device), we must
+        # create a unique client ID — otherwise cleanup_client for one device
+        # deletes the shared record and kills the other device's stream.
         if not client_id:
             client_info_data = get_client_info(request)
+            username_part = client_info_data.get("username") or ""
             client_hash = hashlib.md5(
-                f"{client_info_data['ip_address']}-{client_info_data['user_agent']}-{stream_id}".encode()
+                f"{client_info_data['ip_address']}-{client_info_data['user_agent']}-{stream_id}-{username_part}".encode()
             ).hexdigest()[:16]
             client_id = f"client_{client_hash}"
+
+            # Collision check: if this client_id already has an active
+            # connection on the same stream, this is a different device.
+            if (
+                client_id in stream_manager.clients
+                and stream_manager.clients[client_id].stream_id == stream_id
+                and stream_manager.clients[client_id].active_connection_id
+                and stream_manager.clients[client_id].active_connection_id
+                    in stream_manager.connection_cancel_events
+                and not stream_manager.connection_cancel_events[
+                    stream_manager.clients[client_id].active_connection_id
+                ].is_set()
+            ):
+                # Active connection exists — make this client unique
+                unique_suffix = uuid.uuid4().hex[:8]
+                client_id = f"client_{client_hash}_{unique_suffix}"
+                logger.info(
+                    f"Client ID collision detected for stream {stream_id}, "
+                    f"assigning unique ID: {client_id}"
+                )
 
         # Only register client if not already registered for this stream
         if (
@@ -1249,9 +1361,17 @@ async def get_direct_stream(
         else:
             # Use direct proxy for continuous streams
             # This provides true byte-for-byte proxying with per-client connections
-            return await stream_manager.stream_continuous_direct(
+            response = await stream_manager.stream_continuous_direct(
                 stream_id, client_id, range_header=range_header
             )
+
+            # Start ASGI disconnect monitor so the generator exits promptly
+            # when the client disconnects.  Without this, the primary generator
+            # stays stuck in reconnect/failover loops because GeneratorExit is
+            # not reliably delivered with uvloop.
+            _start_disconnect_monitor(request, client_id, stream_manager)
+
+            return response
 
     except HTTPException:
         raise
@@ -1522,8 +1642,9 @@ async def get_streams_by_metadata(
         if stream_info.is_variant_stream:
             continue
 
-        # Check metadata field match
-        if stream_info.metadata.get(field) != value:
+        # Check metadata field match (compare as strings to avoid type
+        # mismatch — query params are always str, metadata values may be int/bool)
+        if str(stream_info.metadata.get(field, "")) != str(value):
             continue
 
         # Count only ACTIVE clients, not all clients in the set

@@ -102,24 +102,16 @@ class StreamInfo:
     # Sticky Session Handler - lock to specific backend origin after redirects
     # Prevents playback loops from load balancers bouncing between origins
     use_sticky_session: bool = False
-    # Bitrate monitoring - track bytes and detect degraded streams
-    bitrate_check_start_time: Optional[float] = None
-    bitrate_bytes_window: int = 0
-    low_bitrate_count: int = 0
-    bitrate_monitoring_started: bool = False
-    # Silence detection - detect silent audio and trigger failover
-    # Per-stream overrides (None = fall back to global settings/ENV vars)
+    # Silence detection - per-stream config overrides (None = fall back to global settings/ENV vars)
+    # NOTE: Runtime monitoring state (byte windows, counters, buffers) is intentionally
+    # NOT stored here. It lives in local variables inside each client's generate()
+    # coroutine to prevent corruption when multiple clients share one StreamInfo.
     enable_silence_detection: Optional[bool] = None
     silence_threshold_db: Optional[float] = None
     silence_duration: Optional[float] = None
     silence_check_interval: Optional[float] = None
     silence_failover_threshold: Optional[int] = None
     silence_monitoring_grace_period: Optional[float] = None
-    # Runtime state
-    silence_check_start_time: Optional[float] = None
-    silence_audio_buffer: bytes = b""
-    silence_count: int = 0
-    silence_monitoring_started: bool = False
     # Last HTTP error status code from upstream - passed to failover resolver
     last_error_status_code: Optional[int] = None
 
@@ -216,6 +208,19 @@ class StreamManager:
         # Key: connection_id (unique per streaming request), Value: asyncio.Event that gets set when stream should stop
         # Changed from client_id to connection_id to fix race condition when clients make concurrent connections
         self.connection_cancel_events: Dict[str, asyncio.Event] = {}
+
+        # Direct stream broadcasting — shares one upstream connection across multiple clients.
+        # For non-transcoded live streams, the first client ("primary") reads from the provider
+        # and broadcasts chunks to subscriber queues. Additional clients read from those queues
+        # instead of opening duplicate upstream connections (which waste provider connection
+        # slots and may cause the provider to kill the original connection).
+        self._direct_broadcast_queues: Dict[str, Dict[str, asyncio.Queue]] = {}  # stream_id -> {connection_id: queue}
+        self._direct_broadcast_primary: Dict[str, str] = {}  # stream_id -> primary connection_id
+        # Upstream connection handoff for seamless subscriber promotion.
+        # When a primary disconnects, we hand off its existing upstream
+        # connection so the promoted subscriber can continue without opening
+        # a new TCP connection (which would cause a ~250ms gap/skip).
+        self._handoff_upstream: Dict[str, tuple] = {}  # stream_id -> (stream_context, response, stream_iterator)
 
         # Pooling configuration
         self.enable_pooling = enable_pooling
@@ -499,6 +504,23 @@ class StreamManager:
 
         stream_id = hashlib.md5(stream_url.encode()).hexdigest()
 
+        # If the stream exists but has no active clients, it's orphaned from a
+        # previous session.  Delete it so we get a fresh StreamInfo below —
+        # stale fields (failover state, error counts, circuit-breaker markers)
+        # from the old session can prevent the new connection from succeeding.
+        if stream_id in self.streams:
+            active_clients = len(self.stream_clients.get(stream_id, set()))
+            if active_clients == 0:
+                logger.info(
+                    f"Recycling orphaned stream {stream_id} (0 clients) — "
+                    f"creating fresh state for new session"
+                )
+                del self.streams[stream_id]
+                self.stream_clients.pop(stream_id, None)
+                self._direct_broadcast_primary.pop(stream_id, None)
+                self._direct_broadcast_queues.pop(stream_id, None)
+                self._stats.active_streams = max(0, self._stats.active_streams - 1)
+
         if stream_id not in self.streams:
             now = datetime.now(timezone.utc)
             if user_agent is None:
@@ -672,6 +694,7 @@ class StreamManager:
                 return
 
             # Signal the streaming generator to stop
+            effective_conn_id = connection_id or client_info.active_connection_id
             if connection_id and connection_id in self.connection_cancel_events:
                 self.connection_cancel_events[connection_id].set()
                 logger.info(
@@ -686,6 +709,22 @@ class StreamManager:
                 logger.info(
                     f"Signaled streaming generator to stop for client: {client_id}, active connection: {client_info.active_connection_id}"
                 )
+
+            # If this client was the primary reader for a broadcast stream,
+            # signal all subscribers so they can promote to primary.
+            # This is critical because the primary generator may exit via
+            # multiple paths (return, break, GeneratorExit, etc.) and not
+            # all of them reach _signal_subscribers_end() in the post-loop code.
+            if (
+                stream_id
+                and stream_id in self._direct_broadcast_primary
+                and self._direct_broadcast_primary[stream_id] == effective_conn_id
+            ):
+                logger.info(
+                    f"Primary reader {client_id} disconnecting from broadcast stream {stream_id}, "
+                    f"signaling subscribers to promote"
+                )
+                self._signal_subscribers_end(stream_id)
 
             if stream_id and stream_id in self.stream_clients:
                 self.stream_clients[stream_id].discard(client_id)
@@ -766,13 +805,319 @@ class StreamManager:
     # DIRECT PROXY FOR CONTINUOUS STREAMS (New Architecture)
     # ============================================================================
 
+    def _broadcast_chunk_to_subscribers(self, stream_id: str, chunk: bytes) -> None:
+        """Broadcast a chunk from the primary reader to all subscriber queues."""
+        queues = self._direct_broadcast_queues.get(stream_id)
+        if not queues:
+            return
+        for conn_id, queue in list(queues.items()):
+            try:
+                queue.put_nowait(chunk)
+            except asyncio.QueueFull:
+                # Drop oldest chunk to make room (subscriber is slow)
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    queue.put_nowait(chunk)
+                except asyncio.QueueFull:
+                    pass
+
+    def _signal_subscribers_end(self, stream_id: str) -> None:
+        """Signal all subscribers that the primary reader has stopped."""
+        queues = self._direct_broadcast_queues.pop(stream_id, {})
+        for queue in queues.values():
+            try:
+                queue.put_nowait(None)  # None sentinel = end of stream
+            except Exception:
+                pass
+        self._direct_broadcast_primary.pop(stream_id, None)
+
+    async def _serve_subscriber_stream(
+        self,
+        stream_id: str,
+        client_id: str,
+        connection_id: str,
+        cancel_event: asyncio.Event,
+    ) -> StreamingResponse:
+        """Return a StreamingResponse that reads from a broadcast queue instead of upstream."""
+        stream_info = self.streams[stream_id]
+        queue: asyncio.Queue = asyncio.Queue(maxsize=512)
+
+        if stream_id not in self._direct_broadcast_queues:
+            self._direct_broadcast_queues[stream_id] = {}
+        self._direct_broadcast_queues[stream_id][connection_id] = queue
+
+        logger.info(
+            f"Client {client_id} subscribing to existing direct stream {stream_id} "
+            f"(avoiding duplicate upstream connection)"
+        )
+
+        async def subscriber_generate():
+            bytes_served = 0
+            consecutive_timeouts = 0
+            queue_timeout = 10.0
+            try:
+                while True:
+                    try:
+                        chunk = await asyncio.wait_for(queue.get(), timeout=queue_timeout)
+                    except asyncio.TimeoutError:
+                        consecutive_timeouts += 1
+                        if cancel_event.is_set():
+                            return
+                        # Check if stream still exists
+                        if stream_id not in self.streams:
+                            return
+                        # Determine if the primary reader is gone.
+                        # Check: primary entry removed, primary's cancel_event
+                        # set/missing, OR consecutive timeouts with no data.
+                        # For live IPTV, even a single 3s gap with no data is
+                        # highly abnormal, so we promote quickly.
+                        primary_conn_id = self._direct_broadcast_primary.get(stream_id)
+                        primary_gone = primary_conn_id is None
+                        if not primary_gone and primary_conn_id:
+                            primary_cancel = self.connection_cancel_events.get(primary_conn_id)
+                            if primary_cancel is None or primary_cancel.is_set():
+                                primary_gone = True
+                        if not primary_gone and consecutive_timeouts >= 2:
+                            # 2 × 10s = 20 seconds with zero data from primary
+                            logger.info(
+                                f"Subscriber {client_id} has had {consecutive_timeouts} "
+                                f"consecutive timeouts ({consecutive_timeouts * queue_timeout:.0f}s) "
+                                f"with no data from primary — treating as dead"
+                            )
+                            # Clear stale primary entry so we can promote.
+                            # Do NOT call _signal_subscribers_end here — that
+                            # would send None to other subscribers' queues,
+                            # causing them all to try promoting simultaneously.
+                            # Instead, just remove the stale primary entry;
+                            # _promoted_primary_generate will register us as the
+                            # new primary and broadcast to remaining subscribers.
+                            self._direct_broadcast_primary.pop(stream_id, None)
+                            primary_gone = True
+                        if primary_gone:
+                            logger.info(
+                                f"Subscriber {client_id} detected primary gone "
+                                f"(timeout path), promoting to primary"
+                            )
+                            async for promoted_chunk in self._promoted_primary_generate(
+                                stream_id, client_id, connection_id, cancel_event
+                            ):
+                                yield promoted_chunk
+                                bytes_served += len(promoted_chunk)
+                            return
+                        continue
+
+                    if chunk is None:
+                        # Primary reader stopped — promote this subscriber
+                        # to primary so the stream continues without interruption.
+                        logger.info(
+                            f"Subscriber {client_id} promoting to primary for stream {stream_id} "
+                            f"(previous primary disconnected), bytes_served so far: {bytes_served}"
+                        )
+                        async for promoted_chunk in self._promoted_primary_generate(
+                            stream_id, client_id, connection_id, cancel_event
+                        ):
+                            yield promoted_chunk
+                            bytes_served += len(promoted_chunk)
+                        return
+
+                    if cancel_event.is_set():
+                        return
+
+                    consecutive_timeouts = 0  # Reset on successful data
+                    yield chunk
+                    bytes_served += len(chunk)
+
+                    # Update client stats
+                    if client_id in self.clients:
+                        self.clients[client_id].bytes_served += len(chunk)
+                        self.clients[client_id].last_access = datetime.now(timezone.utc)
+                        self.clients[client_id].last_data_time = datetime.now(timezone.utc)
+
+            finally:
+                # Remove this subscriber's queue
+                if stream_id in self._direct_broadcast_queues:
+                    self._direct_broadcast_queues[stream_id].pop(connection_id, None)
+                # Clean up connection and client
+                self.connection_cancel_events.pop(connection_id, None)
+                await self.cleanup_client(client_id, connection_id)
+
+        # Determine content type from stream URL
+        current_url = stream_info.current_url or stream_info.original_url
+        if current_url.endswith((".ts", "?profile=pass")) or "/live/" in current_url:
+            content_type = "video/mp2t"
+        elif current_url.endswith(".mp4"):
+            content_type = "video/mp4"
+        elif current_url.endswith(".mkv"):
+            content_type = "video/x-matroska"
+        else:
+            content_type = "application/octet-stream"
+
+        headers = {
+            "Content-Type": content_type,
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Expose-Headers": "*",
+            "Accept-Ranges": "none",
+            "Connection": "keep-alive",
+        }
+
+        return StreamingResponse(
+            subscriber_generate(),
+            status_code=200,
+            media_type=content_type,
+            headers=headers,
+        )
+
+    async def _promoted_primary_generate(
+        self,
+        stream_id: str,
+        client_id: str,
+        connection_id: str,
+        cancel_event: asyncio.Event,
+    ):
+        """Async generator for a subscriber that has been promoted to primary.
+
+        Opens a fresh upstream connection and streams chunks to the client
+        while broadcasting to any remaining subscribers.  This is a simplified
+        version of the full generate() inside stream_continuous_direct —
+        it handles the common case (upstream works, stream until client or
+        upstream disconnects) but does NOT include retry / failover logic.
+        If the upstream fails, the promoted primary exits and the media
+        player will reconnect normally.
+        """
+        if stream_id not in self.streams:
+            return
+
+        stream_info = self.streams[stream_id]
+
+        # Register as the new primary reader for this stream.
+        self._direct_broadcast_primary[stream_id] = connection_id
+        if stream_id not in self._direct_broadcast_queues:
+            self._direct_broadcast_queues[stream_id] = {}
+        # Remove our own subscriber queue so we don't broadcast to ourselves
+        self._direct_broadcast_queues[stream_id].pop(connection_id, None)
+
+        active_url = stream_info.current_url or stream_info.original_url
+        headers = {
+            "User-Agent": stream_info.user_agent,
+            "Referer": f"{urlparse(active_url).scheme}://{urlparse(active_url).netloc}/",
+            "Origin": f"{urlparse(active_url).scheme}://{urlparse(active_url).netloc}",
+            "Accept": "*/*",
+            "Connection": "keep-alive",
+        }
+        headers.update(stream_info.headers)
+
+        client_to_use = (
+            self.live_stream_client
+            if stream_info.is_live_continuous
+            else self.http_client
+        )
+
+        stream_context = None
+        try:
+            # Check for a handed-off upstream connection (stored by the
+            # primary's finally block when it exited due to client disconnect).
+            # This reuses the SAME TCP connection — no new connection, no gap.
+            handoff = self._handoff_upstream.pop(stream_id, None)
+            inherited_iterator = None
+            if handoff:
+                stream_context, response, inherited_iterator = handoff
+                logger.info(
+                    f"Promoted subscriber {client_id} inherited upstream "
+                    f"connection for stream {stream_id} (seamless handoff)"
+                )
+            else:
+                logger.info(
+                    f"Promoted subscriber {client_id} opening new upstream connection "
+                    f"for stream {stream_id} to {active_url}"
+                )
+
+                stream_context = client_to_use.stream(
+                    "GET", active_url, headers=headers, follow_redirects=True
+                )
+                if asyncio.iscoroutine(stream_context):
+                    stream_context = await stream_context
+                response = await stream_context.__aenter__()
+                response.raise_for_status()
+
+                logger.info(
+                    f"Promoted primary connected: {response.status_code} for stream {stream_id}"
+                )
+
+            chunk_timeout = (
+                settings.LIVE_CHUNK_TIMEOUT_SECONDS
+                if hasattr(settings, "LIVE_CHUNK_TIMEOUT_SECONDS")
+                else 5.0
+            )
+            # Reuse the inherited iterator if available — it continues from
+            # exactly where the old primary left off (same TCP connection,
+            # same byte position).  Otherwise create a fresh one.
+            stream_iterator = inherited_iterator or response.aiter_bytes(chunk_size=32768)
+
+            while True:
+                try:
+                    if chunk_timeout and chunk_timeout > 0:
+                        chunk = await asyncio.wait_for(
+                            stream_iterator.__anext__(), timeout=chunk_timeout
+                        )
+                    else:
+                        chunk = await stream_iterator.__anext__()
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        f"Promoted primary chunk timeout for stream {stream_id}, "
+                        f"client {client_id} — exiting"
+                    )
+                    break
+                except StopAsyncIteration:
+                    break
+
+                if cancel_event.is_set():
+                    break
+
+                yield chunk
+                self._broadcast_chunk_to_subscribers(stream_id, chunk)
+
+                # Update stats
+                if client_id in self.clients:
+                    self.clients[client_id].bytes_served += len(chunk)
+                    self.clients[client_id].last_access = datetime.now(timezone.utc)
+                    self.clients[client_id].last_data_time = datetime.now(timezone.utc)
+                if stream_id in self.streams:
+                    self.streams[stream_id].total_bytes_served += len(chunk)
+                    self.streams[stream_id].last_access = datetime.now(timezone.utc)
+
+        except Exception as e:
+            logger.error(
+                f"Error in promoted primary for stream {stream_id}: {e}"
+            )
+        finally:
+            if stream_context is not None:
+                try:
+                    await stream_context.__aexit__(None, None, None)
+                except Exception:
+                    pass
+            # Signal any remaining subscribers that this primary is also done.
+            self._signal_subscribers_end(stream_id)
+
     async def stream_continuous_direct(
         self, stream_id: str, client_id: str, range_header: Optional[str] = None
     ) -> StreamingResponse:
         """
         Direct byte-for-byte proxy for continuous streams (.ts, .mp4, .mkv).
-        Each client gets their own provider connection - NO shared buffer.
         Provider connection is truly ephemeral and only open while streaming.
+
+        For live (non-VOD) streams, the first client becomes the "primary" reader
+        that opens the upstream connection and broadcasts chunks to any subsequent
+        clients via asyncio queues. This prevents duplicate upstream connections
+        that would waste provider connection slots (and may cause the provider to
+        kill the original connection).
 
         When Strict Live TS Mode is enabled (globally via STRICT_LIVE_TS=true or per-stream):
         - Strips Range headers completely for live TS streams
@@ -804,6 +1149,26 @@ class StreamManager:
             logger.debug(
                 f"Client {client_id} now has active connection: {connection_id}"
             )
+
+        # --- Direct stream broadcasting (connection sharing) ---
+        # For live (non-VOD) streams, if another client is already reading from upstream
+        # for this stream_id, subscribe to its broadcast instead of opening a duplicate
+        # upstream connection. Duplicate connections waste provider connection slots and
+        # may cause the provider to kill the original connection after a few seconds.
+        # VOD is excluded because each client needs independent Range request support.
+        if (
+            not stream_info.is_vod
+            and stream_id in self._direct_broadcast_primary
+        ):
+            return await self._serve_subscriber_stream(
+                stream_id, client_id, connection_id, cancel_event
+            )
+
+        # This client becomes the primary reader for this stream.
+        # Register BEFORE entering generate() so that any client arriving between now
+        # and the first yielded chunk will see the primary and subscribe.
+        self._direct_broadcast_primary[stream_id] = connection_id
+        self._direct_broadcast_queues[stream_id] = {}
 
         # Determine if strict mode is enabled (global or per-stream)
         # NEVER apply strict mode to VOD/timeshift content - it needs more time to start
@@ -888,6 +1253,20 @@ class StreamManager:
             total_timeout_start = asyncio.get_event_loop().time()
             total_timeout = settings.STREAM_TOTAL_TIMEOUT
 
+            # Per-client monitoring state — MUST be local, not on the shared stream_info.
+            # Multiple clients each run their own generate() coroutine but share one
+            # StreamInfo object. If these lived on stream_info, concurrent generators
+            # would corrupt each other's byte windows / counters, producing false
+            # low-bitrate or silence detections and spurious failovers.
+            bitrate_check_start_time: Optional[float] = None
+            bitrate_bytes_window: int = 0
+            low_bitrate_count: int = 0
+            bitrate_monitoring_started: bool = False
+            silence_check_start_time: Optional[float] = None
+            silence_audio_buffer: bytes = b""
+            silence_count: int = 0
+            silence_monitoring_started: bool = False
+
             def _recover_sticky_origin_if_needed() -> bool:
                 """If sticky session is pinned to a redirected backend that failed, reset to entry URL."""
                 if not stream_info.use_sticky_session:
@@ -909,8 +1288,22 @@ class StreamManager:
 
                 return False
 
-            # Main streaming loop with automatic reconnection on failover
-            while failover_count <= max_failovers:
+            # Outer try/finally guarantees _signal_subscribers_end() runs
+            # even when the generator is GC'd without resuming (Starlette
+            # stops iterating after client disconnect, so post-loop code
+            # after the while is unreachable).  The call is idempotent.
+            try:
+              # Main streaming loop with automatic reconnection on failover
+              while failover_count <= max_failovers:
+                # Check cancel_event at the top of each iteration so we
+                # exit promptly when the ASGI disconnect monitor fires
+                # instead of starting another connection attempt.
+                if cancel_event.is_set():
+                    logger.info(
+                        f"Cancel event set before connection attempt for client {client_id}, exiting"
+                    )
+                    break
+
                 try:
                     # Get current URL (may have changed due to failover)
                     active_url = stream_info.current_url or stream_info.original_url
@@ -1060,6 +1453,7 @@ class StreamManager:
 
                                 # Yield immediately - no separate storage needed
                                 yield chunk
+                                self._broadcast_chunk_to_subscribers(stream_id, chunk)
                                 bytes_served += len(chunk)
                                 chunk_count += 1
                                 prebuffer_size += len(chunk)
@@ -1171,8 +1565,16 @@ class StreamManager:
                                         stream_context = None
                                         response = None
 
-                                        # Wait before retrying
-                                        await asyncio.sleep(current_delay)
+                                        # Wait before retrying (cancel-aware)
+                                        try:
+                                            await asyncio.wait_for(
+                                                cancel_event.wait(),
+                                                timeout=current_delay,
+                                            )
+                                            # cancel_event fired during wait
+                                            break
+                                        except asyncio.TimeoutError:
+                                            pass
 
                                         # Break to reconnect with same URL
                                         break
@@ -1275,8 +1677,10 @@ class StreamManager:
                                                     "no_failover": not has_failover,
                                                 },
                                             )
-                                            # Terminate streaming for this client
-                                            return
+                                            # Terminate streaming — break to
+                                            # post-loop cleanup so subscribers
+                                            # are signaled and client is cleaned up.
+                                            break
 
                             else:
                                 chunk = await stream_iterator.__anext__()
@@ -1290,7 +1694,7 @@ class StreamManager:
                             logger.info(
                                 f"Streaming cancelled for client {client_id} by external request"
                             )
-                            return
+                            break
 
                         # Check for failover event
                         if stream_info.failover_event.is_set():
@@ -1298,12 +1702,17 @@ class StreamManager:
                             logger.info(
                                 f"Failover detected for stream {stream_id}, reconnecting client {client_id}"
                             )
-                            # Reset silence detection buffer for new connection
+                            # Reset per-client monitoring state for new connection
                             if settings.ENABLE_SILENCE_DETECTION:
-                                stream_info.silence_audio_buffer = b""
-                                stream_info.silence_monitoring_started = False
-                                stream_info.silence_check_start_time = None
-                                stream_info.silence_count = 0
+                                silence_audio_buffer = b""
+                                silence_monitoring_started = False
+                                silence_check_start_time = None
+                                silence_count = 0
+                            if settings.ENABLE_BITRATE_MONITORING:
+                                bitrate_monitoring_started = False
+                                bitrate_check_start_time = None
+                                bitrate_bytes_window = 0
+                                low_bitrate_count = 0
                             # Close current connection
                             if stream_context is not None:
                                 try:
@@ -1317,54 +1726,57 @@ class StreamManager:
                             break
 
                         yield chunk
+                        self._broadcast_chunk_to_subscribers(stream_id, chunk)
                         bytes_served += len(chunk)
                         chunk_count += 1
 
                         # Bitrate monitoring - detect degraded streams
+                        # State is per-client (local vars) to avoid corruption when
+                        # multiple clients share the same StreamInfo.
                         if settings.ENABLE_BITRATE_MONITORING and stream_info:
                             current_time = asyncio.get_event_loop().time()
 
                             # Grace period - don't monitor during initial buffering
-                            if not stream_info.bitrate_monitoring_started:
-                                if stream_info.bitrate_check_start_time is None:
-                                    stream_info.bitrate_check_start_time = current_time
+                            if not bitrate_monitoring_started:
+                                if bitrate_check_start_time is None:
+                                    bitrate_check_start_time = current_time
                                 elif (
-                                    current_time - stream_info.bitrate_check_start_time
+                                    current_time - bitrate_check_start_time
                                     >= settings.BITRATE_MONITORING_GRACE_PERIOD
                                 ):
                                     # Grace period over, start real monitoring
-                                    stream_info.bitrate_monitoring_started = True
-                                    stream_info.bitrate_check_start_time = current_time
-                                    stream_info.bitrate_bytes_window = 0
+                                    bitrate_monitoring_started = True
+                                    bitrate_check_start_time = current_time
+                                    bitrate_bytes_window = 0
                             else:
                                 # Add bytes to current window
-                                stream_info.bitrate_bytes_window += len(chunk)
+                                bitrate_bytes_window += len(chunk)
 
                                 # Check if interval elapsed
                                 elapsed = current_time - (
-                                    stream_info.bitrate_check_start_time or current_time
+                                    bitrate_check_start_time or current_time
                                 )
                                 if elapsed >= settings.BITRATE_CHECK_INTERVAL:
                                     # Calculate bitrate in bytes/second
                                     bitrate = (
-                                        stream_info.bitrate_bytes_window / elapsed
+                                        bitrate_bytes_window / elapsed
                                         if elapsed > 0
                                         else 0
                                     )
 
                                     if bitrate < settings.MIN_BITRATE_THRESHOLD:
-                                        stream_info.low_bitrate_count += 1
+                                        low_bitrate_count += 1
                                         logger.warning(
                                             f"Low bitrate detected for stream {stream_id}: "
                                             f"{bitrate:.0f} B/s ({bitrate * 8 / 1000:.0f} Kbps), "
                                             f"threshold: {settings.MIN_BITRATE_THRESHOLD * 8 / 1000:.0f} Kbps, "
-                                            f"count: {stream_info.low_bitrate_count}/{settings.BITRATE_FAILOVER_THRESHOLD}"
+                                            f"count: {low_bitrate_count}/{settings.BITRATE_FAILOVER_THRESHOLD}"
                                         )
 
                                         # Trigger failover if threshold exceeded
                                         # Skip failover for VOD/timeshift since it's provider-specific
                                         if (
-                                            stream_info.low_bitrate_count
+                                            low_bitrate_count
                                             >= settings.BITRATE_FAILOVER_THRESHOLD
                                         ):
                                             has_failover = bool(
@@ -1384,12 +1796,12 @@ class StreamManager:
                                                     stream_id, "low_bitrate"
                                                 )
                                                 # Reset bitrate monitoring for new connection
-                                                stream_info.low_bitrate_count = 0
-                                                stream_info.bitrate_monitoring_started = False
-                                                stream_info.bitrate_check_start_time = (
+                                                low_bitrate_count = 0
+                                                bitrate_monitoring_started = False
+                                                bitrate_check_start_time = (
                                                     None
                                                 )
-                                                stream_info.bitrate_bytes_window = 0
+                                                bitrate_bytes_window = 0
                                                 failover_count += 1
                                                 # Close current connection
                                                 if stream_context is not None:
@@ -1404,19 +1816,21 @@ class StreamManager:
                                                 break  # Reconnect with new URL
                                     else:
                                         # Good bitrate - reset counter
-                                        if stream_info.low_bitrate_count > 0:
+                                        if low_bitrate_count > 0:
                                             logger.info(
                                                 f"Bitrate recovered for stream {stream_id}: "
                                                 f"{bitrate * 8 / 1000:.0f} Kbps, resetting low bitrate counter"
                                             )
-                                        stream_info.low_bitrate_count = 0
+                                        low_bitrate_count = 0
 
                                     # Reset window for next interval
-                                    stream_info.bitrate_check_start_time = current_time
-                                    stream_info.bitrate_bytes_window = 0
+                                    bitrate_check_start_time = current_time
+                                    bitrate_bytes_window = 0
 
                         # Silence detection - detect silent audio streams
                         # Per-stream setting takes precedence over global ENV var
+                        # State is per-client (local vars) to avoid corruption when
+                        # multiple clients share the same StreamInfo.
                         silence_enabled = (
                             stream_info.enable_silence_detection
                             if stream_info.enable_silence_detection is not None
@@ -1441,31 +1855,31 @@ class StreamManager:
                                 else settings.SILENCE_FAILOVER_THRESHOLD
                             )
 
-                            if not stream_info.silence_monitoring_started:
-                                if stream_info.silence_check_start_time is None:
-                                    stream_info.silence_check_start_time = current_time
+                            if not silence_monitoring_started:
+                                if silence_check_start_time is None:
+                                    silence_check_start_time = current_time
                                 elif (
-                                    current_time - stream_info.silence_check_start_time
+                                    current_time - silence_check_start_time
                                     >= eff_grace
                                 ):
-                                    stream_info.silence_monitoring_started = True
-                                    stream_info.silence_check_start_time = current_time
-                                    stream_info.silence_audio_buffer = b""
+                                    silence_monitoring_started = True
+                                    silence_check_start_time = current_time
+                                    silence_audio_buffer = b""
                             else:
                                 # Cap buffer at 5MB to bound memory usage on high-bitrate streams
                                 if (
-                                    len(stream_info.silence_audio_buffer)
+                                    len(silence_audio_buffer)
                                     < 5 * 1024 * 1024
                                 ):
-                                    stream_info.silence_audio_buffer += chunk
+                                    silence_audio_buffer += chunk
 
                                 elapsed = current_time - (
-                                    stream_info.silence_check_start_time or current_time
+                                    silence_check_start_time or current_time
                                 )
                                 if elapsed >= eff_interval:
-                                    audio_buffer = stream_info.silence_audio_buffer
-                                    stream_info.silence_audio_buffer = b""
-                                    stream_info.silence_check_start_time = current_time
+                                    audio_buffer = silence_audio_buffer
+                                    silence_audio_buffer = b""
+                                    silence_check_start_time = current_time
 
                                     is_silent = await self._analyze_audio_silence(
                                         audio_buffer,
@@ -1475,13 +1889,13 @@ class StreamManager:
                                     )
 
                                     if is_silent:
-                                        stream_info.silence_count += 1
+                                        silence_count += 1
                                         logger.warning(
                                             f"Silence detected for stream {stream_id}, "
-                                            f"count: {stream_info.silence_count}/{eff_threshold}"
+                                            f"count: {silence_count}/{eff_threshold}"
                                         )
 
-                                        if stream_info.silence_count >= eff_threshold:
+                                        if silence_count >= eff_threshold:
                                             has_failover = bool(
                                                 stream_info.failover_resolver_url
                                                 or stream_info.failover_urls
@@ -1497,12 +1911,12 @@ class StreamManager:
                                                 await self._try_update_failover_url(
                                                     stream_id, "silence_detected"
                                                 )
-                                                stream_info.silence_count = 0
-                                                stream_info.silence_monitoring_started = False
-                                                stream_info.silence_check_start_time = (
+                                                silence_count = 0
+                                                silence_monitoring_started = False
+                                                silence_check_start_time = (
                                                     None
                                                 )
-                                                stream_info.silence_audio_buffer = b""
+                                                silence_audio_buffer = b""
                                                 failover_count += 1
                                                 if stream_context is not None:
                                                     try:
@@ -1515,12 +1929,12 @@ class StreamManager:
                                                 response = None
                                                 break
                                     else:
-                                        if stream_info.silence_count > 0:
+                                        if silence_count > 0:
                                             logger.info(
                                                 f"Audio recovered for stream {stream_id}, "
                                                 f"resetting silence counter"
                                             )
-                                        stream_info.silence_count = 0
+                                        silence_count = 0
 
                         # Update idle tracking every chunk (important for idle detection accuracy)
                         # This ensures we accurately detect when data is flowing vs stuck
@@ -1564,6 +1978,12 @@ class StreamManager:
                             logger.info(
                                 f"Client {client_id}: {chunk_count} chunks, {bytes_served:,} bytes served"
                             )
+
+                    # If streaming was cancelled externally, skip failover and
+                    # go straight to post-loop cleanup so subscribers are
+                    # signaled and the client is cleaned up promptly.
+                    if cancel_event.is_set():
+                        break
 
                     # Check circuit breaker after loop exits (if strict mode enabled)
                     # Skip for VOD/timeshift since failover doesn't make sense for provider-specific content
@@ -1681,6 +2101,51 @@ class StreamManager:
                         break  # Exit the failover loop
                     # else: failover event was set, continue to next iteration
 
+                except GeneratorExit:
+                    # Client disconnected — Starlette throws GeneratorExit into the
+                    # async generator when the HTTP connection closes.  Without this
+                    # handler, GeneratorExit (a BaseException) propagates through the
+                    # inner finally and out of the while loop, so the post-loop
+                    # cleanup code (_signal_subscribers_end, cleanup_client) NEVER
+                    # executes.  This leaves subscribers stuck waiting for a sentinel
+                    # that never arrives and stale broadcast state that blocks
+                    # reconnection.
+                    logger.info(
+                        f"Client {client_id} disconnected (GeneratorExit), "
+                        f"signaling subscribers and cleaning up "
+                        f"(bytes_served: {bytes_served})"
+                    )
+                    # Signal subscribers so they can promote to primary
+                    self._signal_subscribers_end(stream_id)
+                    # Update final stats
+                    bytes_remaining = bytes_served - last_stats_update
+                    if bytes_remaining > 0:
+                        if client_id in self.clients:
+                            self.clients[client_id].bytes_served += bytes_remaining
+                            self.clients[client_id].last_access = datetime.now(
+                                timezone.utc
+                            )
+                        if stream_id in self.streams:
+                            self.streams[
+                                stream_id
+                            ].total_bytes_served += bytes_remaining
+                            self.streams[stream_id].last_access = datetime.now(
+                                timezone.utc
+                            )
+                        self._stats.total_bytes_served += bytes_remaining
+                    await self._emit_event(
+                        "CLIENT_DISCONNECTED",
+                        stream_id,
+                        {
+                            "client_id": client_id,
+                            "bytes_served": bytes_served,
+                            "chunks_served": chunk_count,
+                            "reason": "client_disconnected",
+                        },
+                    )
+                    await self.cleanup_client(client_id, connection_id)
+                    return  # Exit the generator cleanly
+
                 except httpx.ReadError as e:
                     # ReadError often means client disconnected or provider closed connection
                     # This is especially common with Range requests on live streams
@@ -1728,8 +2193,15 @@ class StreamManager:
                             stream_context = None
                             response = None
 
-                            # Wait before retrying
-                            await asyncio.sleep(current_delay)
+                            # Wait before retrying (cancel-aware)
+                            try:
+                                await asyncio.wait_for(
+                                    cancel_event.wait(), timeout=current_delay
+                                )
+                                # cancel_event fired — exit immediately
+                                break
+                            except asyncio.TimeoutError:
+                                pass
 
                             continue  # Retry with same URL
 
@@ -1879,8 +2351,15 @@ class StreamManager:
                         stream_context = None
                         response = None
 
-                        # Wait before retrying
-                        await asyncio.sleep(current_delay)
+                        # Wait before retrying (cancel-aware)
+                        try:
+                            await asyncio.wait_for(
+                                cancel_event.wait(), timeout=current_delay
+                            )
+                            # cancel_event fired — exit immediately
+                            break
+                        except asyncio.TimeoutError:
+                            pass
 
                         continue  # Retry with same URL
 
@@ -2044,8 +2523,15 @@ class StreamManager:
                             stream_context = None
                             response = None
 
-                            # Wait before retrying
-                            await asyncio.sleep(current_delay)
+                            # Wait before retrying (cancel-aware)
+                            try:
+                                await asyncio.wait_for(
+                                    cancel_event.wait(), timeout=current_delay
+                                )
+                                # cancel_event fired — exit immediately
+                                break
+                            except asyncio.TimeoutError:
+                                pass
 
                             continue  # Retry with same URL
 
@@ -2111,8 +2597,42 @@ class StreamManager:
                             break
 
                 finally:
-                    # Manually exit the context manager
-                    if stream_context is not None:
+                    # When the client disconnected (cancel_event set) and the
+                    # stream is live, hand off the upstream connection to the
+                    # promoted subscriber instead of closing it.  This avoids
+                    # opening a second connection (which could exceed provider
+                    # limits) and eliminates the ~250ms gap/skip.
+                    if (
+                        stream_context is not None
+                        and cancel_event.is_set()
+                        and not stream_info.is_vod
+                        and stream_id in self.stream_clients
+                        and len(self.stream_clients.get(stream_id, set()) - {client_id}) > 0
+                    ):
+                        self._handoff_upstream[stream_id] = (
+                            stream_context, response, stream_iterator
+                        )
+                        logger.info(
+                            f"Upstream connection handed off for stream {stream_id} "
+                            f"(client {client_id} disconnected, subscriber will inherit)"
+                        )
+                        # Auto-cleanup if nobody claims it within 5 seconds
+                        async def _cleanup_handoff(sid: str = stream_id) -> None:
+                            await asyncio.sleep(5)
+                            unclaimed = self._handoff_upstream.pop(sid, None)
+                            if unclaimed:
+                                ctx, _, _ = unclaimed
+                                try:
+                                    await ctx.__aexit__(None, None, None)
+                                except Exception:
+                                    pass
+                                logger.info(
+                                    f"Closed unclaimed handoff upstream for stream {sid}"
+                                )
+                        asyncio.ensure_future(_cleanup_handoff())
+                        # Prevent the outer finally from signaling again
+                        stream_context = None
+                    elif stream_context is not None:
                         try:
                             await stream_context.__aexit__(None, None, None)
                             logger.info(
@@ -2121,39 +2641,50 @@ class StreamManager:
                         except Exception as close_error:
                             logger.warning(f"Error closing response: {close_error}")
 
-            # Update final stats (add any remaining bytes not yet counted)
-            bytes_remaining = bytes_served - last_stats_update
-            if bytes_remaining > 0:
-                if client_id in self.clients:
-                    self.clients[client_id].bytes_served += bytes_remaining
-                    self.clients[client_id].last_access = datetime.now(timezone.utc)
+              # Primary reader is exiting — signal all subscribers to stop.
+              # They will get a None sentinel and their media player will reconnect,
+              # at which point one of them will become the new primary.
+              self._signal_subscribers_end(stream_id)
 
-                if stream_id in self.streams:
-                    self.streams[stream_id].total_bytes_served += bytes_remaining
-                    self.streams[stream_id].last_access = datetime.now(timezone.utc)
+              # Update final stats (add any remaining bytes not yet counted)
+              bytes_remaining = bytes_served - last_stats_update
+              if bytes_remaining > 0:
+                  if client_id in self.clients:
+                      self.clients[client_id].bytes_served += bytes_remaining
+                      self.clients[client_id].last_access = datetime.now(timezone.utc)
 
-                self._stats.total_bytes_served += bytes_remaining
+                  if stream_id in self.streams:
+                      self.streams[stream_id].total_bytes_served += bytes_remaining
+                      self.streams[stream_id].last_access = datetime.now(timezone.utc)
 
-            # For VOD ranges that ended naturally (upstream finished serving bytes),
-            # keep the client registered so subsequent seek requests from the same
-            # client (Kodi file-size probe → actual seek → etc.) can reuse it without
-            # re-registration gaps.  The periodic cleanup will remove truly idle clients.
-            # For all other exits (client disconnect, error, cancel), do a full cleanup.
-            if natural_vod_completion:
-                if connection_id in self.connection_cancel_events:
-                    del self.connection_cancel_events[connection_id]
-                if (
-                    client_id in self.clients
-                    and self.clients[client_id].active_connection_id == connection_id
-                ):
-                    self.clients[client_id].active_connection_id = None
-                logger.info(
-                    f"VOD range served naturally for client {client_id} (connection {connection_id}), "
-                    f"client kept registered for potential seek requests"
-                )
-            else:
-                # Cleanup client - pass connection_id to prevent race conditions
-                await self.cleanup_client(client_id, connection_id)
+                  self._stats.total_bytes_served += bytes_remaining
+
+              # For VOD ranges that ended naturally (upstream finished serving bytes),
+              # keep the client registered so subsequent seek requests from the same
+              # client (Kodi file-size probe → actual seek → etc.) can reuse it without
+              # re-registration gaps.  The periodic cleanup will remove truly idle clients.
+              # For all other exits (client disconnect, error, cancel), do a full cleanup.
+              if natural_vod_completion:
+                  if connection_id in self.connection_cancel_events:
+                      del self.connection_cancel_events[connection_id]
+                  if (
+                      client_id in self.clients
+                      and self.clients[client_id].active_connection_id == connection_id
+                  ):
+                      self.clients[client_id].active_connection_id = None
+                  logger.info(
+                      f"VOD range served naturally for client {client_id} (connection {connection_id}), "
+                      f"client kept registered for potential seek requests"
+                  )
+              else:
+                  # Cleanup client - pass connection_id to prevent race conditions
+                  await self.cleanup_client(client_id, connection_id)
+            finally:
+                # Safety net: signal subscribers no matter how the generator
+                # exits (GC, GeneratorExit, exception).  This is idempotent —
+                # if _signal_subscribers_end already ran via the post-loop code
+                # or the ASGI disconnect monitor, it's a no-op.
+                self._signal_subscribers_end(stream_id)
 
         # Determine content type
         # Add `or current_url.endswith('?profile=pass')` to handle TVHeadend passthrough URLs
@@ -3713,6 +4244,11 @@ class StreamManager:
                             "metadata": stream_info.metadata,
                         },
                     )
+
+                # Clean up broadcast state (may be stale if primary's
+                # finally block didn't run or _signal_subscribers_end missed).
+                self._direct_broadcast_primary.pop(stream_id, None)
+                self._direct_broadcast_queues.pop(stream_id, None)
 
                 del self.streams[stream_id]
                 if stream_id in self.stream_clients:
