@@ -10,12 +10,11 @@ Tests cover:
 - Configuration validation
 """
 
-from stream_manager import StreamManager, StreamInfo
+from stream_manager import StreamManager
 import pytest
 import pytest_asyncio
 import asyncio
 from unittest.mock import AsyncMock, patch, MagicMock
-from datetime import datetime, timezone
 import sys
 import os
 
@@ -246,5 +245,3 @@ class TestSilenceDetectionFailover:
             stream_id, "silence_detected"
         )
         assert result is False
-
-
