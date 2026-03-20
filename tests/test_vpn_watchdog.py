@@ -2,12 +2,11 @@
 Tests for the VPN Watchdog module.
 """
 
-import asyncio
 import sys
 import os
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
