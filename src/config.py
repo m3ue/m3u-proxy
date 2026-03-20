@@ -186,6 +186,33 @@ class Settings(BaseSettings):
     # Can be overridden per stream during creation.
     USE_STICKY_SESSION: bool = False
 
+    # VPN Watchdog Configuration
+    # Proactive VPN health monitoring via Gluetun Control API.
+    # When enabled, monitors VPN connectivity, correlates stream failures with VPN health,
+    # and triggers VPN rotation only when genuinely needed.
+    VPN_WATCHDOG_ENABLED: bool = False
+    # Gluetun Control API URL (typically http://127.0.0.1:8000 when sharing network_mode)
+    VPN_WATCHDOG_GLUETUN_URL: str = "http://127.0.0.1:8000"
+    # Gluetun API key (optional, recommended for v3.39.1+)
+    VPN_WATCHDOG_GLUETUN_API_KEY: str = ""
+    # Health check interval in seconds (adaptive: shorter when degraded)
+    VPN_WATCHDOG_CHECK_INTERVAL: int = 15
+    # Number of correlated failures in the window before considering rotation
+    VPN_WATCHDOG_FAILURE_THRESHOLD: int = 3
+    # Time window in seconds for counting correlated failures
+    VPN_WATCHDOG_FAILURE_WINDOW: int = 300
+    # Minimum seconds between VPN rotations
+    VPN_WATCHDOG_ROTATION_COOLDOWN: int = 600
+    # Seconds to wait between Gluetun stop and start during rotation
+    VPN_WATCHDOG_RECONNECT_DELAY: int = 5
+    # HTTP latency thresholds (ms) for state machine transitions
+    VPN_WATCHDOG_LATENCY_WARN_MS: int = 200
+    VPN_WATCHDOG_LATENCY_CRITICAL_MS: int = 500
+    # DNS test hostname for connectivity checks
+    VPN_WATCHDOG_DNS_TEST_HOST: str = "google.com"
+    # HTTP endpoint for latency measurement (should return 200 quickly)
+    VPN_WATCHDOG_HTTP_TEST_URL: str = "http://connectivitycheck.gstatic.com/generate_204"
+
     # Model configuration
     model_config = SettingsConfigDict(
         env_file=".env",

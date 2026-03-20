@@ -21,6 +21,7 @@ from transcoding import get_profile_manager
 from redis_config import get_redis_config, should_use_pooling
 from hwaccel import hw_accel
 from broadcast_manager import BroadcastManager, BroadcastConfig
+from vpn_watchdog import VPNWatchdog
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -358,6 +359,7 @@ enable_pooling = should_use_pooling()
 stream_manager = StreamManager(redis_url=redis_url, enable_pooling=enable_pooling)
 event_manager = EventManager()
 broadcast_manager = BroadcastManager()
+vpn_watchdog = VPNWatchdog()
 
 
 @asynccontextmanager
@@ -373,6 +375,13 @@ async def lifespan(app: FastAPI):
     await stream_manager.start()
     await broadcast_manager.start()
 
+    # Start VPN watchdog if enabled
+    if settings.VPN_WATCHDOG_ENABLED:
+        vpn_watchdog.set_event_manager(event_manager)
+        vpn_watchdog.set_stream_manager(stream_manager)
+        await vpn_watchdog.start()
+        logger.info("VPN Watchdog started")
+
     # Set up custom event handlers
     def log_event_handler(event: StreamEvent):
         """Simple event handler that logs all events"""
@@ -387,6 +396,8 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("m3u proxy shutting down...")
+    if settings.VPN_WATCHDOG_ENABLED:
+        await vpn_watchdog.stop()
     await broadcast_manager.shutdown()
     await stream_manager.stop()
     await event_manager.stop()
@@ -2541,6 +2552,38 @@ async def cleanup_broadcast(network_id: str) -> dict:
     except Exception as e:
         logger.error(f"Error cleaning up broadcast {network_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# VPN Watchdog Endpoints
+
+
+@app.get("/vpn/status", dependencies=[Depends(verify_token)])
+async def vpn_status():
+    """Get current VPN health status and metrics"""
+    if not settings.VPN_WATCHDOG_ENABLED:
+        raise HTTPException(status_code=404, detail="VPN Watchdog is not enabled")
+    return vpn_watchdog.get_status()
+
+
+@app.get("/vpn/history", dependencies=[Depends(verify_token)])
+async def vpn_history(
+    limit: int = Query(default=20, ge=1, le=100, description="Max events to return"),
+):
+    """Get VPN event history (state changes, rotations)"""
+    if not settings.VPN_WATCHDOG_ENABLED:
+        raise HTTPException(status_code=404, detail="VPN Watchdog is not enabled")
+    return {"events": vpn_watchdog.get_history(limit=limit)}
+
+
+@app.post("/vpn/rotate", dependencies=[Depends(verify_token)])
+async def vpn_rotate():
+    """Manually trigger a VPN rotation via Gluetun"""
+    if not settings.VPN_WATCHDOG_ENABLED:
+        raise HTTPException(status_code=404, detail="VPN Watchdog is not enabled")
+    result = await vpn_watchdog.rotate(reason="manual_api")
+    if not result["success"]:
+        raise HTTPException(status_code=500, detail=result.get("error", "Rotation failed"))
+    return result
 
 
 # Event Handler Examples

@@ -39,6 +39,10 @@ class EventType(str, Enum):
     CLIENT_CONNECTED = "client_connected"
     CLIENT_DISCONNECTED = "client_disconnected"
     FAILOVER_TRIGGERED = "failover_triggered"
+    VPN_HEALTH_CHANGED = "vpn_health_changed"
+    VPN_ROTATION_STARTED = "vpn_rotation_started"
+    VPN_ROTATION_COMPLETED = "vpn_rotation_completed"
+    VPN_ROTATION_FAILED = "vpn_rotation_failed"
 
 
 class StreamConfig(BaseModel):
