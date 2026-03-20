@@ -186,7 +186,7 @@ class M3U8Processor:
     def _rewrite_url(self, original_url: str, base_proxy_url: str) -> str:
         """Rewrites a URL to point to the proxy, encoding the original URL."""
         encoded_url = quote(original_url, safe="")
-        # Check the path only (ignoring query params like ?location=ZEOP01)
+        # Check the path only (ignoring query params like ?location=ABC123)
         if urlparse(original_url).path.endswith(".m3u8"):
             # For variant playlists, include parent stream ID
             parent_param = (
@@ -445,7 +445,7 @@ class StreamManager:
         url_lower = url.lower()
         path = urlparse(url).path.lower()
 
-        # HLS detection — check path only, not the full URL, to handle query params like ?location=ZEOP01
+        # HLS detection — check path only, not the full URL, to handle query params like ?location=ABC123
         if path.endswith(".m3u8"):
             return (True, False, False)
 
