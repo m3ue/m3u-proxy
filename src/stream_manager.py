@@ -517,12 +517,25 @@ class StreamManager:
         # previous session.  Delete it so we get a fresh StreamInfo below —
         # stale fields (failover state, error counts, circuit-breaker markers)
         # from the old session can prevent the new connection from succeeding.
+        # Preserve cumulative stats so the stream monitor shows accurate totals
+        # (variant streams always have 0 clients since clients register with
+        # the parent, so they get recycled on every playlist refresh).
+        was_recycled = False
+        recycled_bytes = 0
+        recycled_segments = 0
+        recycled_created_at = None
         if stream_id in self.streams:
             active_clients = len(self.stream_clients.get(stream_id, set()))
             if active_clients == 0:
+                old_stream = self.streams[stream_id]
+                was_recycled = True
+                recycled_bytes = old_stream.total_bytes_served
+                recycled_segments = old_stream.total_segments_served
+                recycled_created_at = old_stream.created_at
                 logger.info(
                     f"Recycling orphaned stream {stream_id} (0 clients) — "
-                    f"creating fresh state for new session"
+                    f"creating fresh state for new session "
+                    f"(preserving {recycled_bytes} bytes, {recycled_segments} segments)"
                 )
                 del self.streams[stream_id]
                 self.stream_clients.pop(stream_id, None)
@@ -579,6 +592,15 @@ class StreamManager:
                 silence_monitoring_grace_period=silence_monitoring_grace_period,
             )
             self.stream_clients[stream_id] = set()
+
+            # Restore cumulative stats from recycled stream
+            if was_recycled:
+                assert (
+                    recycled_created_at is not None
+                )  # always set when was_recycled is True
+                self.streams[stream_id].total_bytes_served = recycled_bytes
+                self.streams[stream_id].total_segments_served = recycled_segments
+                self.streams[stream_id].created_at = recycled_created_at
 
             # Only count non-variant streams in stats
             if not is_variant:

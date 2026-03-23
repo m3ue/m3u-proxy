@@ -153,6 +153,68 @@ class TestStreamManager:
 
         assert stream_id1 == stream_id2
 
+    @pytest.mark.asyncio
+    async def test_variant_stream_recycle_preserves_stats(self, stream_manager):
+        """Variant streams have 0 clients (clients register with parent), so they
+        are recycled on every HLS playlist refresh.  Cumulative byte/segment counters
+        and created_at must survive multiple recycle cycles."""
+        parent_url = "http://example.com/master.m3u8"
+        variant_url = "http://example.com/variant_720p.m3u8"
+
+        parent_id = await stream_manager.get_or_create_stream(parent_url)
+        variant_id = await stream_manager.get_or_create_stream(
+            variant_url, parent_stream_id=parent_id
+        )
+
+        # Simulate stats accumulated during the first session
+        stream_manager.streams[variant_id].total_bytes_served = 1_000_000
+        stream_manager.streams[variant_id].total_segments_served = 42
+        original_created_at = stream_manager.streams[variant_id].created_at
+
+        # Recycle once (no registered clients — mirrors real HLS variant behaviour)
+        variant_id2 = await stream_manager.get_or_create_stream(
+            variant_url, parent_stream_id=parent_id
+        )
+        assert variant_id2 == variant_id
+        assert stream_manager.streams[variant_id].total_bytes_served == 1_000_000
+        assert stream_manager.streams[variant_id].total_segments_served == 42
+        assert stream_manager.streams[variant_id].created_at == original_created_at
+
+        # Accumulate more stats and recycle a second time — counters must keep accumulating
+        stream_manager.streams[variant_id].total_bytes_served += 500_000
+        stream_manager.streams[variant_id].total_segments_served += 10
+
+        variant_id3 = await stream_manager.get_or_create_stream(
+            variant_url, parent_stream_id=parent_id
+        )
+        assert variant_id3 == variant_id
+        assert stream_manager.streams[variant_id].total_bytes_served == 1_500_000
+        assert stream_manager.streams[variant_id].total_segments_served == 52
+        assert stream_manager.streams[variant_id].created_at == original_created_at
+
+    @pytest.mark.asyncio
+    async def test_variant_stream_recycle_preserves_zero_byte_stats(
+        self, stream_manager
+    ):
+        """Counters must be preserved even when they are 0 at recycle time
+        (e.g. a brand-new variant recycled before serving any data)."""
+        parent_url = "http://example.com/master.m3u8"
+        variant_url = "http://example.com/variant_480p.m3u8"
+
+        parent_id = await stream_manager.get_or_create_stream(parent_url)
+        variant_id = await stream_manager.get_or_create_stream(
+            variant_url, parent_stream_id=parent_id
+        )
+        original_created_at = stream_manager.streams[variant_id].created_at
+
+        # Recycle immediately with zero stats — created_at must still be preserved
+        await stream_manager.get_or_create_stream(
+            variant_url, parent_stream_id=parent_id
+        )
+        assert stream_manager.streams[variant_id].total_bytes_served == 0
+        assert stream_manager.streams[variant_id].total_segments_served == 0
+        assert stream_manager.streams[variant_id].created_at == original_created_at
+
     def test_get_all_streams(self, stream_manager):
         stats = stream_manager.get_stats()
         proxy_stats = stats["proxy_stats"]
