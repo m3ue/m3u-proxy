@@ -179,12 +179,14 @@ class NetworkBroadcastProcess:
             cmd.extend(["-t", str(self.config.duration_seconds)])
 
         # Stream mapping - video + audio only (drop subtitles, data streams)
-        # Use -map 0:a:0? to make audio optional (some streams may be video-only)
-        cmd.extend(["-map", "0:v:0", "-map", "0:a:0?"])
+        # Both video and audio are optional to support audio-only streams (e.g. radio stations)
+        # and video-only streams. FFmpeg silently skips missing optional streams.
+        cmd.extend(["-map", "0:v:0?", "-map", "0:a:0?"])
 
         # Codec selection
         if self.config.transcode:
             # Video codec selection (allow explicit codec like libx264 or h264_nvenc)
+            # Only applied when a video stream is actually present (0:v:0? maps nothing for audio-only)
             video_codec = self.config.video_codec or "libx264"
             cmd.extend(["-c:v", video_codec])
 
