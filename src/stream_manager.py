@@ -3141,6 +3141,7 @@ class StreamManager:
                                 await self._try_update_failover_url(
                                     stream_id, "transcode_runtime_input_error"
                                 )
+                                is_failover = True  # Keep client connection alive during failover
                                 failover_count += 1
                                 break
                             else:
