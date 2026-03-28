@@ -146,6 +146,11 @@ class Settings(BaseSettings):
     # and trigger existing failover/reconnect logic instead of hanging.
     LIVE_CHUNK_TIMEOUT_SECONDS: float = 15.0
 
+    # Maximum failover attempts before giving up on a stream.
+    # Set to 0 to try all configured failover URLs (no limit).
+    # Default: 0 (try every failover URL before giving up)
+    MAX_FAILOVER_ATTEMPTS: int = 0
+
     # Stream Retry Configuration (similar to iptv-proxy)
     # These settings control retry behavior for temporary connection issues before
     # attempting failover or giving up entirely. Retries help handle brief network
