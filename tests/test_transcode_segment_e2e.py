@@ -57,7 +57,7 @@ segment1.ts
             return None
 
         async def get_or_create_shared_stream(
-            self, url, profile, ffmpeg_args, client_id, user_agent=None, headers=None
+            self, url, profile, ffmpeg_args, client_id, user_agent=None, headers=None, **kwargs
         ):
             return ("fake-stream-key", fake_shared)
 

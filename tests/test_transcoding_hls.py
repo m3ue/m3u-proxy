@@ -105,6 +105,7 @@ async def test_stream_manager_get_playlist_from_pooled_hls(monkeypatch):
             headers=None,
             stream_id=None,
             reuse_stream_key=None,
+            **kwargs,
         ):
             return await fake_get_or_create_shared_stream(
                 url,
@@ -172,7 +173,7 @@ async def test_stream_transcoded_content_type_detection(monkeypatch):
 
     class FakePooled2:
         async def get_or_create_shared_stream(
-            self, url, profile, ffmpeg_args, client_id, user_agent=None, headers=None
+            self, url, profile, ffmpeg_args, client_id, user_agent=None, headers=None, **kwargs
         ):
             return await fake_get_or_create_shared_stream(
                 url, profile, ffmpeg_args, client_id, user_agent, headers
@@ -232,7 +233,7 @@ async def test_stream_transcoded_content_type_detection_matroska(monkeypatch):
 
     class FakePooled3:
         async def get_or_create_shared_stream(
-            self, url, profile, ffmpeg_args, client_id, user_agent=None, headers=None
+            self, url, profile, ffmpeg_args, client_id, user_agent=None, headers=None, **kwargs
         ):
             return await fake_get_or_create_shared_stream(
                 url, profile, ffmpeg_args, client_id, user_agent, headers

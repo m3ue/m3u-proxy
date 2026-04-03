@@ -72,6 +72,7 @@ segment2.ts
             headers=None,
             stream_id=None,
             reuse_stream_key=None,
+            **kwargs,
         ):
             # Return a dummy stream key and our fake shared process
             return ("fake-stream-key", fake_shared)
