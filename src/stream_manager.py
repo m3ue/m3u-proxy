@@ -466,6 +466,34 @@ class StreamManager:
         # Default: treat as live continuous
         return (False, False, True)
 
+    @staticmethod
+    def _detect_output_mode(
+        ffmpeg_args: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Detect whether FFmpeg will produce HLS, file, or direct (stdout) output.
+
+        Used to differentiate stream IDs and pooling keys so that two
+        transcoded streams for the same source URL but different output
+        formats (e.g. MPEGTS pipe vs HLS segments) never collide.
+        """
+        transcode_delivery = ""
+        if metadata:
+            transcode_delivery = str(metadata.get("transcode_delivery", "")).lower()
+
+        if transcode_delivery == "file_vod":
+            return "file"
+        if transcode_delivery == "hls_vod":
+            return "hls"
+
+        # Detect from FFmpeg args when transcode_delivery is not set
+        if ffmpeg_args:
+            joined = " ".join(str(a).lower() for a in ffmpeg_args)
+            if "-hls_time" in joined or "-hls_list_size" in joined or "-f hls" in joined:
+                return "hls"
+
+        return "direct"
+
     async def get_or_create_stream(
         self,
         stream_url: str,
@@ -511,7 +539,18 @@ class StreamManager:
         """
         import hashlib
 
-        stream_id = hashlib.md5(stream_url.encode()).hexdigest()
+        # Include transcoding info in the stream ID so that a direct stream and
+        # a transcoded stream (or two differently-transcoded streams) for the
+        # same source URL get distinct IDs.  Without this, the second request
+        # silently reuses the first StreamInfo — which has wrong is_transcoded /
+        # transcode_profile / transcode_ffmpeg_args — causing the client to
+        # receive the wrong output format.
+        if is_transcoded:
+            output_mode = self._detect_output_mode(transcode_ffmpeg_args, metadata)
+            key_data = f"{stream_url}|transcoded|{transcode_profile or 'default'}|{output_mode}"
+            stream_id = hashlib.md5(key_data.encode()).hexdigest()
+        else:
+            stream_id = hashlib.md5(stream_url.encode()).hexdigest()
 
         # If the stream exists but has no active clients, it's orphaned from a
         # previous session.  Delete it so we get a fresh StreamInfo below —
@@ -2847,6 +2886,204 @@ class StreamManager:
             headers=headers,
         )
 
+    async def _wait_for_transcoded_file_ready(
+        self,
+        stream_info: StreamInfo,
+        timeout: float = 10.0,
+        min_size: int = 1024,
+        stable_window: float = 0.75,
+    ) -> str:
+        artifact_path = stream_info.metadata.get("artifact_path")
+        if not artifact_path:
+            raise HTTPException(
+                status_code=503, detail="Transcoded file artifact path not available"
+            )
+
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            if os.path.exists(artifact_path):
+                try:
+                    size = os.path.getsize(artifact_path)
+                    stream_info.metadata["artifact_size"] = str(size)
+                    if size <= 0:
+                        await asyncio.sleep(0.2)
+                        continue
+
+                    if self._is_transcoded_file_complete(stream_info):
+                        return artifact_path
+
+                    stable_for = self._get_transcoded_file_stable_for(stream_info)
+                    if size >= min_size and stable_for >= stable_window:
+                        return artifact_path
+                except OSError:
+                    pass
+            await asyncio.sleep(0.2)
+
+        raise HTTPException(
+            status_code=503, detail="Transcoded file artifact is not ready"
+        )
+
+    def _get_transcoded_file_stable_for(self, stream_info: StreamInfo) -> float:
+        raw = stream_info.metadata.get("artifact_stable_for")
+        if raw is None:
+            return 0.0
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _is_transcoded_file_complete(self, stream_info: StreamInfo) -> bool:
+        return str(stream_info.metadata.get("artifact_complete", "")).lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+
+    def _get_transcoded_file_size(self, stream_info: StreamInfo, artifact_path: str) -> int:
+        try:
+            size = os.path.getsize(artifact_path)
+            stream_info.metadata["artifact_size"] = str(size)
+            return size
+        except OSError as exc:
+            raise HTTPException(status_code=503, detail="Transcoded file artifact unavailable") from exc
+
+    def _parse_file_range(
+        self, range_header: Optional[str], file_size: int
+    ) -> tuple[int, int, int, bool]:
+        if not range_header or not range_header.startswith("bytes="):
+            return 0, max(file_size - 1, 0), file_size, False
+
+        range_spec = range_header.split("=", 1)[1].strip()
+        if "," in range_spec:
+            raise HTTPException(status_code=416, detail="Multiple ranges not supported")
+
+        start_str, end_str = (range_spec.split("-", 1) + [""])[:2]
+
+        if start_str == "":
+            suffix_length = int(end_str)
+            if suffix_length <= 0:
+                raise HTTPException(status_code=416, detail="Invalid range")
+            start = max(file_size - suffix_length, 0)
+            end = max(file_size - 1, 0)
+        else:
+            start = int(start_str)
+            end = int(end_str) if end_str else max(file_size - 1, 0)
+
+        if file_size <= 0 or start >= file_size or start < 0 or end < start:
+            raise HTTPException(status_code=416, detail="Requested range not satisfiable")
+
+        end = min(end, file_size - 1)
+        content_length = end - start + 1
+        return start, end, content_length, True
+
+    def _get_file_content_type(self, stream_info: StreamInfo, artifact_path: str) -> str:
+        output_format = str(
+            stream_info.metadata.get("transcode_output_format", "")
+        ).lower()
+        if output_format in {"mp4", "mov"}:
+            return "video/mp4"
+        if output_format == "webm":
+            return "video/webm"
+        if output_format == "mkv":
+            return "video/x-matroska"
+        if output_format == "avi":
+            return "video/x-msvideo"
+
+        extension = os.path.splitext(artifact_path)[1].lower()
+        if extension in {".mp4", ".m4v", ".mov"}:
+            return "video/mp4"
+        if extension == ".webm":
+            return "video/webm"
+        if extension == ".mkv":
+            return "video/x-matroska"
+        if extension == ".avi":
+            return "video/x-msvideo"
+        return "application/octet-stream"
+
+    async def head_transcoded_file(
+        self, stream_id: str, range_header: Optional[str] = None
+    ) -> Dict[str, str]:
+        if stream_id not in self.streams:
+            raise HTTPException(status_code=404, detail="Stream not found")
+
+        stream_info = self.streams[stream_id]
+        artifact_path = await self._wait_for_transcoded_file_ready(stream_info)
+        file_size = self._get_transcoded_file_size(stream_info, artifact_path)
+        content_type = self._get_file_content_type(stream_info, artifact_path)
+
+        headers = {
+            "Content-Type": content_type,
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Expose-Headers": "*",
+            "Content-Length": str(file_size),
+        }
+
+        if range_header:
+            start, end, content_length, is_partial = self._parse_file_range(
+                range_header, file_size
+            )
+            if is_partial:
+                headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+                headers["Content-Length"] = str(content_length)
+
+        return headers
+
+    async def stream_transcoded_file(
+        self, stream_id: str, client_id: str, range_header: Optional[str] = None
+    ) -> StreamingResponse:
+        if stream_id not in self.streams:
+            raise HTTPException(status_code=404, detail="Stream not found")
+
+        stream_info = self.streams[stream_id]
+        artifact_path = await self._wait_for_transcoded_file_ready(stream_info)
+        file_size = self._get_transcoded_file_size(stream_info, artifact_path)
+        content_type = self._get_file_content_type(stream_info, artifact_path)
+
+        start, end, content_length, is_partial = self._parse_file_range(
+            range_header, file_size
+        )
+
+        headers = {
+            "Content-Type": content_type,
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "no-cache, no-store, must-revalidate",
+            "Pragma": "no-cache",
+            "Expires": "0",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Expose-Headers": "*",
+            "Content-Length": str(content_length),
+        }
+
+        if is_partial:
+            headers["Content-Range"] = f"bytes {start}-{end}/{file_size}"
+
+        async def generate():
+            chunk_size = 1024 * 1024
+            with open(artifact_path, "rb") as handle:
+                handle.seek(start)
+                remaining = content_length
+                while remaining > 0:
+                    chunk = handle.read(min(chunk_size, remaining))
+                    if not chunk:
+                        break
+                    remaining -= len(chunk)
+                    yield chunk
+
+        return StreamingResponse(
+            generate(),
+            status_code=206 if is_partial else 200,
+            media_type=content_type,
+            headers=headers,
+        )
+
     async def stream_transcoded(
         self, stream_id: str, client_id: str, range_header: Optional[str] = None
     ) -> StreamingResponse:
@@ -2932,6 +3169,7 @@ class StreamManager:
                         client_id=client_id,
                         user_agent=stream_info.user_agent,
                         headers=stream_info.headers,
+                        metadata=stream_info.metadata,
                         stream_id=stream_id,
                         # Reuse existing key if available
                         reuse_stream_key=stream_info.transcode_stream_key,
@@ -3527,6 +3765,7 @@ class StreamManager:
                     client_id=client_id,
                     user_agent=stream_info.user_agent,
                     headers=stream_info.headers,
+                    metadata=stream_info.metadata,
                     stream_id=stream_id,
                     # Reuse existing key if available
                     reuse_stream_key=stream_info.transcode_stream_key,
@@ -3926,14 +4165,37 @@ class StreamManager:
                                 yield chunk
                                 bytes_served += len(chunk)
                     else:
+                        logger.info(
+                            "HLS segment upstream request: "
+                            f"stream={stream_id} client={client_id} url={segment_url} "
+                            f"range={range_header or 'none'} headers={headers}"
+                        )
+
                         async with self.http_client.stream(
                             "GET", segment_url, headers=headers, follow_redirects=True
                         ) as response:
+                            logger.info(
+                                "HLS segment upstream response: "
+                                f"stream={stream_id} client={client_id} url={segment_url} "
+                                f"status={response.status_code} "
+                                f"content_type={response.headers.get('content-type')} "
+                                f"content_length={response.headers.get('content-length')} "
+                                f"content_range={response.headers.get('content-range')} "
+                                f"accept_ranges={response.headers.get('accept-ranges')} "
+                                f"final_url={response.url}"
+                            )
+
                             response.raise_for_status()
 
                             async for chunk in response.aiter_bytes(chunk_size=32768):
                                 yield chunk
                                 bytes_served += len(chunk)
+
+                        logger.info(
+                            "HLS segment proxy response complete: "
+                            f"stream={stream_id} client={client_id} url={segment_url} "
+                            f"bytes_served={bytes_served} proxy_content_type=video/MP2T"
+                        )
 
                     # Success - update stats and exit
                     if client_id in self.clients:
