@@ -478,7 +478,11 @@ class StreamManager:
         """
         if ffmpeg_args:
             joined = " ".join(str(a).lower() for a in ffmpeg_args)
-            if "-hls_time" in joined or "-hls_list_size" in joined or "-f hls" in joined:
+            if (
+                "-hls_time" in joined
+                or "-hls_list_size" in joined
+                or "-f hls" in joined
+            ):
                 return "hls"
 
         return "direct"
@@ -3956,37 +3960,14 @@ class StreamManager:
                                 yield chunk
                                 bytes_served += len(chunk)
                     else:
-                        logger.info(
-                            "HLS segment upstream request: "
-                            f"stream={stream_id} client={client_id} url={segment_url} "
-                            f"range={range_header or 'none'} headers={headers}"
-                        )
-
                         async with self.http_client.stream(
                             "GET", segment_url, headers=headers, follow_redirects=True
                         ) as response:
-                            logger.info(
-                                "HLS segment upstream response: "
-                                f"stream={stream_id} client={client_id} url={segment_url} "
-                                f"status={response.status_code} "
-                                f"content_type={response.headers.get('content-type')} "
-                                f"content_length={response.headers.get('content-length')} "
-                                f"content_range={response.headers.get('content-range')} "
-                                f"accept_ranges={response.headers.get('accept-ranges')} "
-                                f"final_url={response.url}"
-                            )
-
                             response.raise_for_status()
 
                             async for chunk in response.aiter_bytes(chunk_size=32768):
                                 yield chunk
                                 bytes_served += len(chunk)
-
-                        logger.info(
-                            "HLS segment proxy response complete: "
-                            f"stream={stream_id} client={client_id} url={segment_url} "
-                            f"bytes_served={bytes_served} proxy_content_type=video/MP2T"
-                        )
 
                     # Success - update stats and exit
                     if client_id in self.clients:
