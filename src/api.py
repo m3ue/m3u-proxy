@@ -63,110 +63,6 @@ def get_content_type(url: str) -> str:
         return "application/octet-stream"
 
 
-def force_hls_vod_output(ffmpeg_args: List[str]) -> List[str]:
-    """Force FFmpeg args to produce a file-based HLS VOD output."""
-    forced_args: List[str] = []
-    saw_format = False
-    i = 0
-
-    while i < len(ffmpeg_args):
-        arg = str(ffmpeg_args[i])
-        lower_arg = arg.lower()
-
-        if arg == "-f":
-            forced_args.extend(["-f", "hls"])
-            saw_format = True
-            i += 2
-            continue
-
-        if lower_arg.startswith("pipe:") or arg == "-":
-            i += 1
-            continue
-
-        if lower_arg.endswith(".m3u8"):
-            previous = ffmpeg_args[i - 1] if i > 0 else None
-            if previous == "-i":
-                forced_args.append(arg)
-            i += 1
-            continue
-
-        forced_args.append(arg)
-        i += 1
-
-    normalized = [str(a).lower() for a in forced_args]
-
-    def has_flag(flag: str) -> bool:
-        return flag in normalized
-
-    if not saw_format:
-        forced_args.extend(["-f", "hls"])
-    if not has_flag("-hls_time"):
-        forced_args.extend(["-hls_time", "6"])
-    if not has_flag("-hls_playlist_type"):
-        forced_args.extend(["-hls_playlist_type", "vod"])
-    if not has_flag("-hls_list_size"):
-        forced_args.extend(["-hls_list_size", "0"])
-    if not has_flag("-hls_segment_filename"):
-        forced_args.extend(["-hls_segment_filename", "segment_%06d.ts"])
-    if not has_flag("-hls_flags"):
-        forced_args.extend(["-hls_flags", "independent_segments"])
-
-    forced_args.append("index.m3u8")
-
-    return forced_args
-
-
-def force_file_vod_output(
-    ffmpeg_args: List[str], output_format: str = "mp4"
-) -> List[str]:
-    """Force FFmpeg args to produce a seekable file-based VOD output."""
-    forced_args: List[str] = []
-    normalized_format = (output_format or "mp4").lower()
-    saw_format = False
-    saw_movflags = False
-    i = 0
-
-    while i < len(ffmpeg_args):
-        arg = str(ffmpeg_args[i])
-        lower_arg = arg.lower()
-
-        if arg == "-f":
-            forced_args.extend(["-f", normalized_format])
-            saw_format = True
-            i += 2
-            continue
-
-        if arg == "-movflags":
-            saw_movflags = True
-            forced_args.extend([arg, str(ffmpeg_args[i + 1])])
-            i += 2
-            continue
-
-        if lower_arg.startswith("pipe:") or arg == "-":
-            i += 1
-            continue
-
-        if lower_arg.endswith((".mp4", ".mkv", ".webm", ".avi", ".mov")):
-            previous = ffmpeg_args[i - 1] if i > 0 else None
-            if previous == "-i":
-                forced_args.append(arg)
-            i += 1
-            continue
-
-        forced_args.append(arg)
-        i += 1
-
-    if not saw_format:
-        forced_args.extend(["-f", normalized_format])
-
-    if normalized_format in {"mp4", "mov"} and not saw_movflags:
-        forced_args.extend(
-            ["-movflags", "+frag_keyframe+empty_moov+default_base_moof"]
-        )
-
-    return forced_args
-
-
 def is_direct_stream(url: str) -> bool:
     """Check if URL is a direct stream (not HLS playlist)"""
     # Split off query string before checking extension
@@ -412,7 +308,6 @@ class TranscodeCreateRequest(BaseModel):
     profile: Optional[str] = None  # Profile name or custom template
     profile_variables: Optional[Dict[str, str]] = None
     output_format: Optional[str] = None  # mp4, mkv, ts, etc.
-    transcode_delivery: Optional[str] = None  # direct or hls_vod
 
     @field_validator("url")
     @classmethod
@@ -925,9 +820,6 @@ async def create_transcode_stream(request: TranscodeCreateRequest):
                 )
 
         # Prepare template variables by merging required vars with user's custom variables
-        transcode_delivery = (request.transcode_delivery or "direct").lower()
-        file_vod_output_format = (request.output_format or "mp4").lower()
-
         template_vars = {
             "input_url": request.url,
             "output_args": "pipe:1",  # Output to stdout for streaming
@@ -938,24 +830,8 @@ async def create_transcode_stream(request: TranscodeCreateRequest):
         if request.profile_variables:
             template_vars.update(request.profile_variables)
 
-        if transcode_delivery == "hls_vod":
-            template_vars["format"] = "hls"
-            template_vars["output_args"] = (
-                "-hls_time 6 -hls_playlist_type vod -hls_list_size 0 "
-                "-hls_flags independent_segments "
-                "-hls_segment_filename segment_%06d.ts index.m3u8"
-            )
-        elif transcode_delivery == "file_vod":
-            template_vars["format"] = file_vod_output_format
-            template_vars["output_args"] = "output.file"
-
         # Generate FFmpeg args from profile and variables
         ffmpeg_args = profile.render(template_vars)
-
-        if transcode_delivery == "hls_vod":
-            ffmpeg_args = force_hls_vod_output(ffmpeg_args)
-        elif transcode_delivery == "file_vod":
-            ffmpeg_args = force_file_vod_output(ffmpeg_args, file_vod_output_format)
 
         # Prepare comprehensive metadata including transcoding info
         transcoding_metadata = {
@@ -963,8 +839,6 @@ async def create_transcode_stream(request: TranscodeCreateRequest):
             "profile": profile_name,
             "profile_variables": str(request.profile_variables or {}),
             "ffmpeg_args": " ".join(ffmpeg_args),
-            "transcode_delivery": transcode_delivery,
-            "transcode_output_format": file_vod_output_format,
         }
         if request.metadata:
             transcoding_metadata.update(request.metadata)
@@ -1001,7 +875,6 @@ async def create_transcode_stream(request: TranscodeCreateRequest):
                 "profile": profile_name,
                 "profile_variables": request.profile_variables or {},
                 "ffmpeg_args": ffmpeg_args,
-                "transcode_delivery": transcode_delivery,
                 "metadata": request.metadata or {},
             },
         )
@@ -1028,7 +901,6 @@ async def create_transcode_stream(request: TranscodeCreateRequest):
             return False
 
         is_hls_output = _detect_hls_from_args(ffmpeg_args)
-        is_file_vod_output = transcode_delivery == "file_vod"
 
         # Choose endpoint based on output type
         if is_hls_output:
@@ -1039,16 +911,8 @@ async def create_transcode_stream(request: TranscodeCreateRequest):
         else:
             stream_endpoint = f"/stream/{stream_id}"
             direct_url = stream_endpoint
-            out_format = (
-                file_vod_output_format
-                if is_file_vod_output
-                else template_vars.get("format", "mpegts")
-            )
-            message = (
-                "Transcoded stream created successfully (seekable file output)"
-                if is_file_vod_output
-                else "Transcoded stream created successfully (direct MPEGTS pipe)"
-            )
+            out_format = template_vars.get("format", "mpegts")
+            message = "Transcoded stream created successfully (direct MPEGTS pipe)"
 
         response = {
             "stream_id": stream_id,
@@ -1061,7 +925,6 @@ async def create_transcode_stream(request: TranscodeCreateRequest):
             "playlist_url": stream_endpoint if is_hls_output else None,
             "direct_url": direct_url,
             "format": out_format,
-            "transcode_delivery": transcode_delivery,
             "profile": profile.name,
             "profile_variables": template_vars,  # Show the actual variables used
             "ffmpeg_args": ffmpeg_args,
@@ -1497,14 +1360,6 @@ async def get_direct_stream(
                 f"Using transcoded stream for {stream_id} with profile: {stream_info.transcode_profile}"
             )
 
-            transcode_delivery = str(
-                stream_info.metadata.get("transcode_delivery", "")
-            ).lower()
-            if transcode_delivery == "file_vod":
-                return await stream_manager.stream_transcoded_file(
-                    stream_id, client_id, range_header=range_header
-                )
-
             # For transcoded streams outputting to pipe:1 or other non-HLS formats,
             # use streamed transcoding path
             return await stream_manager.stream_transcoded(
@@ -1554,19 +1409,6 @@ async def head_direct_stream(
 
         # Check for Range header
         range_header = request.headers.get("range")
-
-        if stream_info.is_transcoded:
-            transcode_delivery = str(
-                stream_info.metadata.get("transcode_delivery", "")
-            ).lower()
-            if transcode_delivery == "file_vod":
-                response_headers = await stream_manager.head_transcoded_file(
-                    stream_id, range_header=range_header
-                )
-                status_code = 206 if range_header and "Content-Range" in response_headers else 200
-                return Response(
-                    content=None, status_code=status_code, headers=response_headers
-                )
 
         # Determine if strict mode is enabled (global or per-stream)
         strict_mode_enabled = settings.STRICT_LIVE_TS or stream_info.strict_live_ts

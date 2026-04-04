@@ -66,25 +66,16 @@ class SharedTranscodingProcess:
         # Detect output mode (stdout stream vs HLS files)
         self.mode = "stdout"
         self.hls_dir: Optional[str] = None
-        self.output_dir: Optional[str] = None
-        self.output_file_path: Optional[str] = None
-        self.output_format = str(
-            self.metadata.get("transcode_output_format", "mp4")
-        ).lower()
         # If ffmpeg_args suggest HLS output, switch to hls mode
         joined_args = " ".join(self.ffmpeg_args).lower()
-        transcode_delivery = str(self.metadata.get("transcode_delivery", "")).lower()
-        if transcode_delivery == "file_vod":
-            self.mode = "file"
-        elif (
-            transcode_delivery == "hls_vod"
-            or "-hls_time" in joined_args
+        if (
+            "-hls_time" in joined_args
             or "-hls_list_size" in joined_args
             or "-f hls" in joined_args
         ):
             self.mode = "hls"
 
-        if self.mode in {"hls", "file"}:
+        if self.mode == "hls":
             # Determine base dir for file-based outputs
             base_dir = None
             if self.hls_base_dir:
@@ -131,35 +122,6 @@ class SharedTranscodingProcess:
 
             logger.info(
                 f"SharedTranscodingProcess {self.stream_id} will run in HLS mode, hls_dir={self.hls_dir}"
-            )
-        elif self.mode == "file":
-            try:
-                self.output_dir = tempfile.mkdtemp(
-                    prefix=f"m3u_proxy_file_{self.stream_id}_", dir=base_dir
-                )
-            except Exception as e:
-                logger.warning(
-                    f"Failed to create file output dir in {base_dir}: {e}, falling back to system tempdir"
-                )
-                self.output_dir = tempfile.mkdtemp(
-                    prefix=f"m3u_proxy_file_{self.stream_id}_"
-                )
-
-            try:
-                os.chmod(self.output_dir, 0o755)
-            except Exception:
-                pass
-
-            extension = self.output_format or "mp4"
-            self.output_file_path = os.path.join(self.output_dir, f"output.{extension}")
-            self.metadata["artifact_path"] = self.output_file_path
-            self.metadata["artifact_dir"] = self.output_dir
-            self.metadata["artifact_content_type"] = self.output_format
-            self.metadata["artifact_complete"] = "false"
-            self.metadata["artifact_size"] = "0"
-
-            logger.info(
-                f"SharedTranscodingProcess {self.stream_id} will run in file mode, output={self.output_file_path}"
             )
 
     async def start_process(self):
@@ -293,35 +255,6 @@ class SharedTranscodingProcess:
                     # Append absolute playlist path as the intended HLS output
                     ffmpeg_cmd.append(playlist_path)
 
-            elif self.mode == "file":
-                output_path = self.output_file_path or os.path.join(
-                    tempfile.gettempdir(), f"{self.stream_id}.{self.output_format or 'mp4'}"
-                )
-                replaced = False
-                for i, token in enumerate(ffmpeg_cmd):
-                    try:
-                        if not isinstance(token, str):
-                            continue
-                        t_lower = token.lower()
-                        prev = ffmpeg_cmd[i - 1] if i > 0 else None
-                        if isinstance(prev, str) and prev == "-i":
-                            continue
-                        if token == "output.file" or t_lower.startswith("pipe:") or token == "-":
-                            ffmpeg_cmd[i] = output_path
-                            replaced = True
-                    except Exception:
-                        continue
-
-                if not replaced:
-                    ffmpeg_cmd = [
-                        t
-                        for t in ffmpeg_cmd
-                        if not (
-                            isinstance(t, str)
-                            and (t.startswith("pipe:") or t == "-")
-                        )
-                    ]
-                    ffmpeg_cmd.append(output_path)
             else:
                 # Ensure we're outputting to stdout in MPEGTS format only if no -f specified
                 if "-f" not in [a.lower() for a in ffmpeg_cmd]:
@@ -352,8 +285,8 @@ class SharedTranscodingProcess:
             if self.mode == "stdout":
                 self._broadcaster_task = asyncio.create_task(self._broadcast_loop())
             else:
-                # In HLS/file mode, watch file outputs to update last_chunk_time
-                self._broadcaster_task = asyncio.create_task(self._file_output_watch_loop())
+                # In HLS mode, watch for new segments to update last_chunk_time
+                self._broadcaster_task = asyncio.create_task(self._hls_watch_loop())
 
             return True
 
@@ -449,54 +382,6 @@ class SharedTranscodingProcess:
                 await asyncio.sleep(0.5)
         except Exception as e:
             logger.debug(f"HLS watch loop ended for {self.stream_id}: {e}")
-
-    async def _file_output_watch_loop(self):
-        """Watch HLS or file outputs and update last_chunk_time when they grow."""
-        if self.mode == "hls":
-            await self._hls_watch_loop()
-            return
-
-        if self.mode != "file" or not self.output_file_path:
-            return
-
-        try:
-            last_size = -1
-            stable_since = None
-            while self.process and self.process.returncode is None:
-                try:
-                    if os.path.exists(self.output_file_path):
-                        current_size = os.path.getsize(self.output_file_path)
-                        if current_size != last_size:
-                            self.last_chunk_time = time.time()
-                            self.metadata["artifact_size"] = str(current_size)
-                            self.metadata["artifact_last_growth_at"] = str(
-                                self.last_chunk_time
-                            )
-                            stable_since = time.time()
-                            last_size = current_size
-                        elif current_size > 0 and stable_since is not None:
-                            self.metadata["artifact_stable_for"] = str(
-                                max(0.0, time.time() - stable_since)
-                            )
-                except OSError:
-                    pass
-                await asyncio.sleep(0.5)
-        except Exception as e:
-            logger.debug(f"File watch loop ended for {self.stream_id}: {e}")
-        finally:
-            if (
-                self.mode == "file"
-                and self.output_file_path
-                and os.path.exists(self.output_file_path)
-            ):
-                try:
-                    self.metadata["artifact_size"] = str(
-                        os.path.getsize(self.output_file_path)
-                    )
-                except OSError:
-                    pass
-                if self.process and self.process.returncode == 0:
-                    self.metadata["artifact_complete"] = "true"
 
     async def _log_stderr(self):
         """Log FFmpeg stderr output and monitor for write errors and input failures"""
@@ -703,9 +588,8 @@ class SharedTranscodingProcess:
             self.status = "stopped"
             self.clients.clear()
         finally:
-            # Always attempt artifact cleanup in finally block to ensure it runs
+            # Always attempt HLS cleanup in finally block to ensure it runs even if FFmpeg cleanup fails
             await self._cleanup_hls_directory()
-            await self._cleanup_file_output_directory()
 
     async def _cleanup_hls_directory(self):
         """Clean up HLS directory and all segments"""
@@ -747,43 +631,6 @@ class SharedTranscodingProcess:
 
         except Exception as e:
             logger.error(f"Error cleaning up HLS directory for {self.stream_id}: {e}")
-
-    async def _cleanup_file_output_directory(self):
-        """Clean up file_vod output artifact and directory."""
-        if not self.output_dir or not os.path.isdir(self.output_dir):
-            return
-
-        try:
-            files = os.listdir(self.output_dir)
-            file_count = len(files)
-            removed_count = 0
-            failed_count = 0
-
-            for fname in files:
-                try:
-                    os.remove(os.path.join(self.output_dir, fname))
-                    removed_count += 1
-                except Exception as e:
-                    failed_count += 1
-                    logger.warning(f"Failed to remove file_vod artifact {fname}: {e}")
-
-            try:
-                os.rmdir(self.output_dir)
-                logger.info(
-                    f"Cleaned up file_vod directory for {self.stream_id}: removed {removed_count}/{file_count} files"
-                )
-            except OSError as e:
-                logger.warning(
-                    f"Failed to remove file_vod directory {self.output_dir}: {e} ({failed_count} files failed to delete)"
-                )
-            except Exception as e:
-                logger.error(
-                    f"Unexpected error removing file_vod directory {self.output_dir}: {e}"
-                )
-        except Exception as e:
-            logger.error(
-                f"Error cleaning up file_vod directory for {self.stream_id}: {e}"
-            )
 
 
 class PooledStreamManager:
@@ -1189,7 +1036,7 @@ class PooledStreamManager:
         """
         from stream_manager import StreamManager
 
-        output_mode = StreamManager._detect_output_mode(ffmpeg_args, metadata)
+        output_mode = StreamManager._detect_output_mode(ffmpeg_args)
         data = f"{url}|{profile}|{output_mode}"
         return hashlib.sha256(data.encode()).hexdigest()[:16]
 
