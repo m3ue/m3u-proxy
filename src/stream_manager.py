@@ -93,6 +93,9 @@ class StreamInfo:
     transcode_process: Optional[asyncio.subprocess.Process] = None
     # Key used by the pooled manager to identify shared transcoding processes
     transcode_stream_key: Optional[str] = None
+    # Resolver backend (streamlink / ytdlp) - when set, bypasses FFmpeg
+    resolver_type: Optional[str] = None
+    resolver_args: Optional[str] = None
     # Strict Live TS Mode - improved handling for live MPEG-TS streams
     strict_live_ts: bool = False
     # Circuit breaker - track bad upstream endpoints temporarily
@@ -499,6 +502,8 @@ class StreamManager:
         is_transcoded: bool = False,
         transcode_profile: Optional[str] = None,
         transcode_ffmpeg_args: Optional[List[str]] = None,
+        resolver_type: Optional[str] = None,
+        resolver_args: Optional[str] = None,
         strict_live_ts: Optional[bool] = None,
         use_sticky_session: Optional[bool] = None,
         enable_silence_detection: Optional[bool] = None,
@@ -539,8 +544,13 @@ class StreamManager:
         # transcode_profile / transcode_ffmpeg_args — causing the client to
         # receive the wrong output format.
         if is_transcoded:
-            output_mode = self._detect_output_mode(transcode_ffmpeg_args)
-            key_data = f"{stream_url}|transcoded|{transcode_profile or 'default'}|{output_mode}"
+            if resolver_type:
+                key_data = (
+                    f"{stream_url}|resolver|{resolver_type}|{resolver_args or ''}"
+                )
+            else:
+                output_mode = self._detect_output_mode(transcode_ffmpeg_args)
+                key_data = f"{stream_url}|transcoded|{transcode_profile or 'default'}|{output_mode}"
             stream_id = hashlib.md5(key_data.encode()).hexdigest()
         else:
             stream_id = hashlib.md5(stream_url.encode()).hexdigest()
@@ -614,6 +624,8 @@ class StreamManager:
                 is_transcoded=is_transcoded,
                 transcode_profile=transcode_profile,
                 transcode_ffmpeg_args=transcode_ffmpeg_args or [],
+                resolver_type=resolver_type,
+                resolver_args=resolver_args,
                 strict_live_ts=strict_live_ts or False,
                 use_sticky_session=effective_use_sticky_session,
                 enable_silence_detection=enable_silence_detection,
@@ -2968,6 +2980,8 @@ class StreamManager:
                         stream_id=stream_id,
                         # Reuse existing key if available
                         reuse_stream_key=stream_info.transcode_stream_key,
+                        resolver_type=stream_info.resolver_type,
+                        resolver_args=stream_info.resolver_args,
                     )
 
                     # Update the tracked stream key so future failovers can stop the correct process

@@ -8,7 +8,7 @@ import hashlib
 import subprocess
 import uuid
 from urllib.parse import unquote, urlparse
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Literal
 from pydantic import BaseModel, field_validator
 from datetime import datetime, timezone
 import os
@@ -40,6 +40,19 @@ def get_ffmpeg_version() -> Optional[str]:
         return None
     except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
         logger.warning(f"Failed to get ffmpeg version: {e}")
+        return None
+
+
+def get_resolver_version(binary: str) -> Optional[str]:
+    """Get the version string for a resolver binary (streamlink or yt-dlp)"""
+    try:
+        result = subprocess.run(
+            [binary, "--version"], capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            return result.stdout.strip().split("\n")[0]
+        return None
+    except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
         return None
 
 
@@ -308,6 +321,11 @@ class TranscodeCreateRequest(BaseModel):
     profile: Optional[str] = None  # Profile name or custom template
     profile_variables: Optional[Dict[str, str]] = None
     output_format: Optional[str] = None  # mp4, mkv, ts, etc.
+    # Stream resolver backend - when set, bypasses FFmpeg and uses the specified tool
+    resolver: Optional[Literal["streamlink", "ytdlp"]] = None
+    resolver_args: Optional[str] = (
+        None  # Quality/format + optional flags (e.g. "best", "bestvideo+bestaudio")
+    )
 
     @field_validator("url")
     @classmethod
@@ -636,6 +654,12 @@ async def get_info():
     info = {
         "version": VERSION,
         "ffmpeg_version": get_ffmpeg_version(),
+        "streamlink_version": get_resolver_version("streamlink")
+        if settings.STREAMLINK_ENABLED
+        else None,
+        "ytdlp_version": get_resolver_version("yt-dlp")
+        if settings.YTDLP_ENABLED
+        else None,
         "hardware_acceleration": {
             "enabled": hw_accel.is_available(),
             "type": hw_accel.get_type(),
@@ -791,6 +815,90 @@ async def create_stream(request: StreamCreateRequest):
 async def create_transcode_stream(request: TranscodeCreateRequest):
     """Create a new transcoded stream with optional failover URLs and custom profile"""
     try:
+        # --- Resolver path (streamlink / yt-dlp) ---
+        if request.resolver:
+            resolver_name = request.resolver  # "streamlink" or "ytdlp"
+            resolver_binary = "yt-dlp" if resolver_name == "ytdlp" else "streamlink"
+
+            # Check that the resolver is enabled in config
+            if resolver_name == "streamlink" and not settings.STREAMLINK_ENABLED:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Streamlink resolver is disabled (STREAMLINK_ENABLED=false)",
+                )
+            if resolver_name == "ytdlp" and not settings.YTDLP_ENABLED:
+                raise HTTPException(
+                    status_code=400,
+                    detail="yt-dlp resolver is disabled (YTDLP_ENABLED=false)",
+                )
+
+            # Verify the binary is available
+            if not get_resolver_version(resolver_binary):
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"{resolver_binary} is not installed or not accessible",
+                )
+
+            resolver_args = request.resolver_args or (
+                "best" if resolver_name == "streamlink" else "bestvideo+bestaudio/best"
+            )
+
+            transcoding_metadata = {
+                "transcoding": "true",
+                "resolver": resolver_name,
+                "resolver_args": resolver_args,
+            }
+            if request.metadata:
+                transcoding_metadata.update(request.metadata)
+
+            stream_id = await stream_manager.get_or_create_stream(
+                request.url,
+                request.failover_urls,
+                request.failover_resolver_url,
+                request.user_agent,
+                metadata=transcoding_metadata,
+                is_transcoded=True,
+                transcode_profile=resolver_name,
+                transcode_ffmpeg_args=[],
+                resolver_type=resolver_name,
+                resolver_args=resolver_args,
+                strict_live_ts=request.strict_live_ts,
+                use_sticky_session=request.use_sticky_session,
+            )
+
+            stream_endpoint = f"/stream/{stream_id}"
+            event = StreamEvent(
+                event_type=EventType.STREAM_STARTED,
+                stream_id=stream_id,
+                data={
+                    "primary_url": request.url,
+                    "failover_urls": request.failover_urls or [],
+                    "stream_type": "resolver",
+                    "resolver": resolver_name,
+                    "resolver_args": resolver_args,
+                    "metadata": request.metadata or {},
+                },
+            )
+            await event_manager.emit_event(event)
+
+            response = {
+                "stream_id": stream_id,
+                "primary_url": request.url,
+                "failover_urls": request.failover_urls or [],
+                "stream_type": "resolver",
+                "stream_endpoint": stream_endpoint,
+                "playlist_url": None,
+                "direct_url": stream_endpoint,
+                "format": "mpegts",
+                "resolver": resolver_name,
+                "resolver_args": resolver_args,
+                "message": f"Resolver stream created successfully ({resolver_binary})",
+            }
+            if request.metadata:
+                response["metadata"] = request.metadata
+            return response
+
+        # --- FFmpeg transcoding path ---
         profile_manager = get_profile_manager()
 
         # Determine if profile is a predefined name or custom template

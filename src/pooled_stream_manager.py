@@ -26,7 +26,7 @@ except ImportError:
 
 
 class SharedTranscodingProcess:
-    """Represents a shared FFmpeg transcoding process with broadcasting to multiple clients"""
+    """Represents a shared transcoding process (FFmpeg, streamlink, or yt-dlp) with broadcasting to multiple clients"""
 
     def __init__(
         self,
@@ -38,6 +38,8 @@ class SharedTranscodingProcess:
         headers: Optional[Dict[str, str]] = None,
         metadata: Optional[Dict[str, Any]] = None,
         hls_base_dir: Optional[str] = None,
+        resolver_type: Optional[str] = None,
+        resolver_args: Optional[str] = None,
     ):
         self.stream_id = stream_id
         self.url = url
@@ -46,6 +48,8 @@ class SharedTranscodingProcess:
         self.user_agent = user_agent
         self.headers = headers or {}
         self.metadata = metadata or {}
+        self.resolver_type = resolver_type  # "streamlink" or "ytdlp"
+        self.resolver_args = resolver_args  # quality/format string + optional flags
         # Base directory to create HLS per-stream directories in. If None,
         # the process will fall back to the system tempdir.
         self.hls_base_dir = hls_base_dir
@@ -124,9 +128,58 @@ class SharedTranscodingProcess:
                 f"SharedTranscodingProcess {self.stream_id} will run in HLS mode, hls_dir={self.hls_dir}"
             )
 
-    async def start_process(self):
-        """Start the FFmpeg process"""
+    async def _start_resolver_process(self) -> bool:
+        """Start a streamlink or yt-dlp subprocess and pipe its stdout to clients"""
+        import shlex
+
+        resolver_binary = "yt-dlp" if self.resolver_type == "ytdlp" else "streamlink"
+        args_str = self.resolver_args or (
+            "best" if self.resolver_type == "streamlink" else "bestvideo+bestaudio/best"
+        )
+
         try:
+            extra = shlex.split(args_str)
+        except ValueError:
+            extra = [args_str]
+
+        if self.resolver_type == "streamlink":
+            # streamlink URL QUALITY [OPTIONS] -O
+            # First token of extra is the quality selector; remainder are flags
+            cmd = ["streamlink", self.url] + extra + ["-O"]
+        else:
+            # yt-dlp URL [-f FORMAT] [OPTIONS] -o -
+            # If the first token doesn't start with '-', treat it as a format selector
+            if extra and not extra[0].startswith("-"):
+                cmd = ["yt-dlp", self.url, "-f", extra[0]] + extra[1:] + ["-o", "-"]
+            else:
+                cmd = ["yt-dlp", self.url] + extra + ["-o", "-"]
+
+        logger.info(
+            f"Starting {resolver_binary} process for stream {self.stream_id}: {' '.join(cmd)}"
+        )
+
+        self.process = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        self.status = "running"
+        logger.info(f"{resolver_binary} process started with PID: {self.process.pid}")
+
+        # Start broadcaster and stderr logger (same as FFmpeg path)
+        self._broadcaster_task = asyncio.create_task(self._broadcast_loop())
+        asyncio.create_task(self._log_stderr())
+
+        return True
+
+    async def start_process(self):
+        """Start the transcoding/resolver process"""
+        try:
+            # --- Resolver path (streamlink / yt-dlp) ---
+            if self.resolver_type:
+                return await self._start_resolver_process()
+
             logger.info(f"Starting shared FFmpeg process for stream {self.stream_id}")
 
             # Build FFmpeg command - ensure output to stdout
@@ -1025,6 +1078,8 @@ class PooledStreamManager:
         profile: str,
         ffmpeg_args: Optional[List[str]] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        resolver_type: Optional[str] = None,
+        resolver_args: Optional[str] = None,
     ) -> str:
         """Generate a consistent key for stream sharing.
 
@@ -1033,11 +1088,17 @@ class PooledStreamManager:
         different delivery formats (e.g. MPEGTS pipe vs HLS segments) are
         never incorrectly pooled together.  This matters when both profiles
         resolve to the same name (e.g. "custom" for user-provided templates).
-        """
-        from stream_manager import StreamManager
 
-        output_mode = StreamManager._detect_output_mode(ffmpeg_args)
-        data = f"{url}|{profile}|{output_mode}"
+        For resolver-based streams, the key includes the resolver type and args
+        instead of the FFmpeg output mode.
+        """
+        if resolver_type:
+            data = f"{url}|resolver|{resolver_type}|{resolver_args or ''}"
+        else:
+            from stream_manager import StreamManager
+
+            output_mode = StreamManager._detect_output_mode(ffmpeg_args)
+            data = f"{url}|{profile}|{output_mode}"
         return hashlib.sha256(data.encode()).hexdigest()[:16]
 
     async def get_or_create_shared_stream(
@@ -1051,6 +1112,8 @@ class PooledStreamManager:
         metadata: Optional[Dict[str, Any]] = None,
         stream_id: Optional[str] = None,
         reuse_stream_key: Optional[str] = None,
+        resolver_type: Optional[str] = None,
+        resolver_args: Optional[str] = None,
     ) -> Tuple[str, SharedTranscodingProcess]:
         """Get existing shared stream or create new one
 
@@ -1061,7 +1124,12 @@ class PooledStreamManager:
         """
 
         stream_key = reuse_stream_key or self._generate_stream_key(
-            url, profile, ffmpeg_args=ffmpeg_args, metadata=metadata
+            url,
+            profile,
+            ffmpeg_args=ffmpeg_args,
+            metadata=metadata,
+            resolver_type=resolver_type,
+            resolver_args=resolver_args,
         )
 
         # Track the stream_id -> stream_key mapping for event emission
@@ -1121,6 +1189,8 @@ class PooledStreamManager:
             headers=headers,
             metadata=metadata,
             hls_base_dir=self.hls_base_dir,
+            resolver_type=resolver_type,
+            resolver_args=resolver_args,
         )
 
         if await process.start_process():

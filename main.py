@@ -48,6 +48,7 @@ def main():
 
     logger.info("✅ Connection pooling enabled (HLS, Transcoded, and live Direct/TS streams)")
     logger.info("✅ Transcoding support via FFmpeg")
+    logger.info("✅ Streamlink and yt-dlp resolver support")
     logger.info("✅ Seamless failover support")
 
     if settings.RELOAD:

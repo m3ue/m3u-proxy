@@ -184,6 +184,12 @@ class Settings(BaseSettings):
     # Allows for initial buffering and audio decoder startup
     SILENCE_MONITORING_GRACE_PERIOD: float = 15.0
 
+    # Stream Resolver Configuration
+    # Enable streamlink as a stream backend (requires streamlink to be installed)
+    STREAMLINK_ENABLED: bool = True
+    # Enable yt-dlp as a stream backend (requires yt-dlp to be installed)
+    YTDLP_ENABLED: bool = True
+
     # Sticky Session Handler Configuration
     # Enable sticky session handling by default to lock clients to specific backend origins
     # after redirects. This prevents playback loops caused by load balancers bouncing
