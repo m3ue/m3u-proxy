@@ -11,7 +11,6 @@ import hashlib
 from typing import Dict, List, Optional, Tuple, Any
 import logging
 from config import settings
-import atexit
 import os
 import tempfile
 
@@ -53,6 +52,9 @@ class SharedTranscodingProcess:
         self.resolver_type = resolver_type  # "streamlink" or "ytdlp"
         self.resolver_args = resolver_args  # quality/format string + optional flags
         self.resolver_cookies = resolver_cookies  # Netscape-format cookies.txt content
+        self._cookies_path: Optional[str] = (
+            None  # temp file path, cleaned up in cleanup()
+        )
         # Base directory to create HLS per-stream directories in. If None,
         # the process will fall back to the system tempdir.
         self.hls_base_dir = hls_base_dir
@@ -159,6 +161,7 @@ class SharedTranscodingProcess:
 
         # Write cookies to a temp file if provided — both yt-dlp and streamlink
         # accept --cookies <path> for Netscape-format cookie files.
+        # Path stored on self so cleanup() can remove it when the stream ends.
         if self.resolver_cookies and self.resolver_cookies.strip():
             try:
                 tmp = tempfile.NamedTemporaryFile(
@@ -170,11 +173,8 @@ class SharedTranscodingProcess:
                 tmp.write(self.resolver_cookies.strip() + "\n")
                 tmp.flush()
                 tmp.close()
-                cookies_path = tmp.name
-                atexit.register(
-                    lambda p: os.path.exists(p) and os.unlink(p), cookies_path
-                )
-                cmd.extend(["--cookies", cookies_path])
+                self._cookies_path = tmp.name
+                cmd.extend(["--cookies", self._cookies_path])
                 logger.info(
                     f"Using cookies file for {resolver_binary} stream {self.stream_id}"
                 )
@@ -672,6 +672,7 @@ class SharedTranscodingProcess:
         finally:
             # Always attempt HLS cleanup in finally block to ensure it runs even if FFmpeg cleanup fails
             await self._cleanup_hls_directory()
+            self._cleanup_cookies_file()
 
     async def _cleanup_hls_directory(self):
         """Clean up HLS directory and all segments"""
@@ -713,6 +714,16 @@ class SharedTranscodingProcess:
 
         except Exception as e:
             logger.error(f"Error cleaning up HLS directory for {self.stream_id}: {e}")
+
+    def _cleanup_cookies_file(self) -> None:
+        """Remove the temporary cookies file created for this resolver stream."""
+        if self._cookies_path:
+            try:
+                os.unlink(self._cookies_path)
+            except OSError:
+                pass
+            finally:
+                self._cookies_path = None
 
 
 class PooledStreamManager:
