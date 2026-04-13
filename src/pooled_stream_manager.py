@@ -11,6 +11,7 @@ import hashlib
 from typing import Dict, List, Optional, Tuple, Any
 import logging
 from config import settings
+import atexit
 import os
 import tempfile
 
@@ -40,6 +41,7 @@ class SharedTranscodingProcess:
         hls_base_dir: Optional[str] = None,
         resolver_type: Optional[str] = None,
         resolver_args: Optional[str] = None,
+        resolver_cookies: Optional[str] = None,
     ):
         self.stream_id = stream_id
         self.url = url
@@ -50,6 +52,7 @@ class SharedTranscodingProcess:
         self.metadata = metadata or {}
         self.resolver_type = resolver_type  # "streamlink" or "ytdlp"
         self.resolver_args = resolver_args  # quality/format string + optional flags
+        self.resolver_cookies = resolver_cookies  # Netscape-format cookies.txt content
         # Base directory to create HLS per-stream directories in. If None,
         # the process will fall back to the system tempdir.
         self.hls_base_dir = hls_base_dir
@@ -153,6 +156,32 @@ class SharedTranscodingProcess:
                 cmd = ["yt-dlp", self.url, "-f", extra[0]] + extra[1:] + ["-o", "-"]
             else:
                 cmd = ["yt-dlp", self.url] + extra + ["-o", "-"]
+
+        # Write cookies to a temp file if provided — both yt-dlp and streamlink
+        # accept --cookies <path> for Netscape-format cookie files.
+        if self.resolver_cookies and self.resolver_cookies.strip():
+            try:
+                tmp = tempfile.NamedTemporaryFile(
+                    mode="w",
+                    suffix=".txt",
+                    delete=False,
+                    prefix="m3uproxy_cookies_",
+                )
+                tmp.write(self.resolver_cookies.strip() + "\n")
+                tmp.flush()
+                tmp.close()
+                cookies_path = tmp.name
+                atexit.register(
+                    lambda p: os.path.exists(p) and os.unlink(p), cookies_path
+                )
+                cmd.extend(["--cookies", cookies_path])
+                logger.info(
+                    f"Using cookies file for {resolver_binary} stream {self.stream_id}"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to write cookies temp file for stream {self.stream_id}: {e}"
+                )
 
         logger.info(
             f"Starting {resolver_binary} process for stream {self.stream_id}: {' '.join(cmd)}"
@@ -1114,6 +1143,7 @@ class PooledStreamManager:
         reuse_stream_key: Optional[str] = None,
         resolver_type: Optional[str] = None,
         resolver_args: Optional[str] = None,
+        resolver_cookies: Optional[str] = None,
     ) -> Tuple[str, SharedTranscodingProcess]:
         """Get existing shared stream or create new one
 
@@ -1191,6 +1221,7 @@ class PooledStreamManager:
             hls_base_dir=self.hls_base_dir,
             resolver_type=resolver_type,
             resolver_args=resolver_args,
+            resolver_cookies=resolver_cookies,
         )
 
         if await process.start_process():

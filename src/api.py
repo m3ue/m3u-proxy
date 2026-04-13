@@ -326,6 +326,9 @@ class TranscodeCreateRequest(BaseModel):
     resolver_args: Optional[str] = (
         None  # Quality/format + optional flags (e.g. "best", "bestvideo+bestaudio")
     )
+    cookies: Optional[str] = (
+        None  # Netscape-format cookies.txt content for authenticated streams
+    )
 
     @field_validator("url")
     @classmethod
@@ -862,6 +865,7 @@ async def create_transcode_stream(request: TranscodeCreateRequest):
                 transcode_ffmpeg_args=[],
                 resolver_type=resolver_name,
                 resolver_args=resolver_args,
+                resolver_cookies=request.cookies,
                 strict_live_ts=request.strict_live_ts,
                 use_sticky_session=request.use_sticky_session,
             )

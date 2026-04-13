@@ -96,6 +96,7 @@ class StreamInfo:
     # Resolver backend (streamlink / ytdlp) - when set, bypasses FFmpeg
     resolver_type: Optional[str] = None
     resolver_args: Optional[str] = None
+    resolver_cookies: Optional[str] = None  # Netscape-format cookies.txt content
     # Strict Live TS Mode - improved handling for live MPEG-TS streams
     strict_live_ts: bool = False
     # Circuit breaker - track bad upstream endpoints temporarily
@@ -504,6 +505,7 @@ class StreamManager:
         transcode_ffmpeg_args: Optional[List[str]] = None,
         resolver_type: Optional[str] = None,
         resolver_args: Optional[str] = None,
+        resolver_cookies: Optional[str] = None,
         strict_live_ts: Optional[bool] = None,
         use_sticky_session: Optional[bool] = None,
         enable_silence_detection: Optional[bool] = None,
@@ -626,6 +628,7 @@ class StreamManager:
                 transcode_ffmpeg_args=transcode_ffmpeg_args or [],
                 resolver_type=resolver_type,
                 resolver_args=resolver_args,
+                resolver_cookies=resolver_cookies,
                 strict_live_ts=strict_live_ts or False,
                 use_sticky_session=effective_use_sticky_session,
                 enable_silence_detection=enable_silence_detection,
@@ -2982,6 +2985,7 @@ class StreamManager:
                         reuse_stream_key=stream_info.transcode_stream_key,
                         resolver_type=stream_info.resolver_type,
                         resolver_args=stream_info.resolver_args,
+                        resolver_cookies=stream_info.resolver_cookies,
                     )
 
                     # Update the tracked stream key so future failovers can stop the correct process
