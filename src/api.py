@@ -2030,6 +2030,20 @@ async def delete_streams_by_metadata(
     exclude_channel_id: Optional[str] = Query(
         None, description="Channel ID to exclude from deletion (keep this stream)"
     ),
+    force: bool = Query(
+        True,
+        description="Force stop even if clients are still connected. "
+        "Set to false to skip streams that still have active clients (e.g. when "
+        "closing an in-app player that may be shared with external clients). "
+        "Defaults to true for backwards compatibility.",
+    ),
+    client_id: Optional[str] = Query(
+        None,
+        description="ID of the client that is disconnecting. When force=False, "
+        "this client is removed from stream_clients immediately before evaluating "
+        "whether other clients remain, so the stream is stopped only when the "
+        "requesting client was the last viewer.",
+    ),
 ):
     """
     Delete all streams matching a specific metadata field/value.
@@ -2058,6 +2072,35 @@ async def delete_streams_by_metadata(
                         {"stream_id": stream_id, "reason": "excluded_by_channel_id"}
                     )
                     continue
+
+                # When force=False, the requesting client should be removed
+                # immediately and the stream stopped only if no other clients remain.
+                if not force:
+                    # Pre-emptively remove the disconnecting client so the remaining
+                    # count reflects reality before we decide whether to stop the stream.
+                    if client_id:
+                        if stream_id in stream_manager.stream_clients:
+                            stream_manager.stream_clients[stream_id].discard(client_id)
+                        if stream_id in stream_manager.streams:
+                            stream_manager.streams[stream_id].connected_clients.discard(
+                                client_id
+                            )
+
+                    remaining_clients = len(
+                        stream_manager.stream_clients.get(stream_id, set())
+                    )
+                    if remaining_clients > 0:
+                        skipped_streams.append(
+                            {
+                                "stream_id": stream_id,
+                                "reason": "has_active_clients",
+                                "active_clients": remaining_clients,
+                            }
+                        )
+                        logger.info(
+                            f"Skipping stream {stream_id} deletion: {remaining_clients} active client(s) still connected (force=False)"
+                        )
+                        continue
 
                 # Delete this stream
                 logger.info(f"Deleting stream {stream_id} matching {field}={value}")
