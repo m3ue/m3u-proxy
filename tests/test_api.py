@@ -531,5 +531,178 @@ class TestStreamValidation:
             assert response.status_code in [422, 500], f"Should reject URL: {url}"
 
 
+class TestDeleteStreamsByMetadata:
+    """Tests for DELETE /streams/by-metadata with force and client_id parameters."""
+
+    @pytest.fixture
+    def client(self):
+        return TestClient(app)
+
+    def _make_stream(self, is_transcoded=False, stream_stopped_emitted=False):
+        stream = Mock()
+        stream.is_transcoded = is_transcoded
+        stream.stream_stopped_emitted = stream_stopped_emitted
+        stream.metadata = {"playlist_uuid": "test-uuid-123"}
+        stream.connected_clients = set()
+        return stream
+
+    def test_force_true_stops_stream_with_remaining_clients(self, client):
+        """force=True (default) always stops the stream regardless of other clients."""
+        stream_id = "stream-abc"
+        stream = self._make_stream()
+        stream.connected_clients = {"other-client"}
+
+        with patch("api.stream_manager") as mock_sm:
+            mock_sm.streams = {stream_id: stream}
+            mock_sm.stream_clients = {stream_id: {"other-client"}}
+            mock_sm.pooled_manager = None
+            mock_sm.cleanup_client = AsyncMock()
+            mock_sm._emit_event = AsyncMock()
+
+            response = client.delete(
+                "/streams/by-metadata",
+                params={
+                    "field": "playlist_uuid",
+                    "value": "test-uuid-123",
+                    "force": "true",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["deleted_count"] == 1
+        assert len(data["skipped_streams"]) == 0
+
+    def test_force_false_skips_stream_when_other_clients_remain(self, client):
+        """force=False skips the stream when the requesting client is not the last viewer."""
+        stream_id = "stream-abc"
+        stream = self._make_stream()
+        stream.connected_clients = {"requesting-client", "other-client"}
+
+        with patch("api.stream_manager") as mock_sm:
+            mock_sm.streams = {stream_id: stream}
+            mock_sm.stream_clients = {stream_id: {"requesting-client", "other-client"}}
+            mock_sm.pooled_manager = None
+            mock_sm.cleanup_client = AsyncMock()
+            mock_sm._emit_event = AsyncMock()
+
+            response = client.delete(
+                "/streams/by-metadata",
+                params={
+                    "field": "playlist_uuid",
+                    "value": "test-uuid-123",
+                    "force": "false",
+                    "client_id": "requesting-client",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["deleted_count"] == 0
+        assert len(data["skipped_streams"]) == 1
+        assert data["skipped_streams"][0]["reason"] == "has_active_clients"
+        assert data["skipped_streams"][0]["active_clients"] == 1
+
+    def test_force_false_stops_stream_when_requesting_client_is_last(self, client):
+        """force=False stops the stream when the requesting client is the last viewer."""
+        stream_id = "stream-abc"
+        stream = self._make_stream()
+        stream.connected_clients = {"sole-client"}
+
+        with patch("api.stream_manager") as mock_sm:
+            mock_sm.streams = {stream_id: stream}
+            mock_sm.stream_clients = {stream_id: {"sole-client"}}
+            mock_sm.pooled_manager = None
+            mock_sm.cleanup_client = AsyncMock()
+            mock_sm._emit_event = AsyncMock()
+
+            response = client.delete(
+                "/streams/by-metadata",
+                params={
+                    "field": "playlist_uuid",
+                    "value": "test-uuid-123",
+                    "force": "false",
+                    "client_id": "sole-client",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["deleted_count"] == 1
+        assert len(data["skipped_streams"]) == 0
+
+    def test_force_false_without_client_id_skips_stream_with_active_clients(
+        self, client
+    ):
+        """force=False with no client_id still checks remaining clients before stopping."""
+        stream_id = "stream-abc"
+        stream = self._make_stream()
+        stream.connected_clients = {"some-client"}
+
+        with patch("api.stream_manager") as mock_sm:
+            mock_sm.streams = {stream_id: stream}
+            mock_sm.stream_clients = {stream_id: {"some-client"}}
+            mock_sm.pooled_manager = None
+            mock_sm.cleanup_client = AsyncMock()
+            mock_sm._emit_event = AsyncMock()
+
+            response = client.delete(
+                "/streams/by-metadata",
+                params={
+                    "field": "playlist_uuid",
+                    "value": "test-uuid-123",
+                    "force": "false",
+                },
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["deleted_count"] == 0
+        assert len(data["skipped_streams"]) == 1
+
+    def test_client_id_max_length_validation(self, client):
+        """client_id longer than 128 characters is rejected with 422."""
+        with patch("api.stream_manager") as mock_sm:
+            mock_sm.streams = {}
+            mock_sm.stream_clients = {}
+
+            response = client.delete(
+                "/streams/by-metadata",
+                params={
+                    "field": "playlist_uuid",
+                    "value": "test-uuid-123",
+                    "client_id": "x" * 129,
+                },
+            )
+
+        assert response.status_code == 422
+
+    def test_discard_updates_both_data_structures(self, client):
+        """Verifies that connected_clients and stream_clients are both updated on discard."""
+        stream_id = "stream-abc"
+        stream = self._make_stream()
+        stream.connected_clients = {"sole-client"}
+
+        with patch("api.stream_manager") as mock_sm:
+            mock_sm.streams = {stream_id: stream}
+            mock_sm.stream_clients = {stream_id: {"sole-client"}}
+            mock_sm.pooled_manager = None
+            mock_sm.cleanup_client = AsyncMock()
+            mock_sm._emit_event = AsyncMock()
+
+            client.delete(
+                "/streams/by-metadata",
+                params={
+                    "field": "playlist_uuid",
+                    "value": "test-uuid-123",
+                    "force": "false",
+                    "client_id": "sole-client",
+                },
+            )
+
+        # Both data structures must have had the client removed before the stop decision.
+        assert "sole-client" not in stream.connected_clients
+
+
 if __name__ == "__main__":
     pytest.main([__file__])

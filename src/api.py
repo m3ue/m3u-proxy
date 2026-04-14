@@ -2039,6 +2039,7 @@ async def delete_streams_by_metadata(
     ),
     client_id: Optional[str] = Query(
         None,
+        max_length=128,
         description="ID of the client that is disconnecting. When force=False, "
         "this client is removed from stream_clients immediately before evaluating "
         "whether other clients remain, so the stream is stopped only when the "
@@ -2078,13 +2079,17 @@ async def delete_streams_by_metadata(
                 if not force:
                     # Pre-emptively remove the disconnecting client so the remaining
                     # count reflects reality before we decide whether to stop the stream.
+                    # Update connected_clients first so any concurrent reader of that
+                    # field sees the client gone before stream_clients (the authoritative
+                    # count) is updated. No await between the two discards, so this is
+                    # atomic within the asyncio event loop.
                     if client_id:
-                        if stream_id in stream_manager.stream_clients:
-                            stream_manager.stream_clients[stream_id].discard(client_id)
                         if stream_id in stream_manager.streams:
                             stream_manager.streams[stream_id].connected_clients.discard(
                                 client_id
                             )
+                        if stream_id in stream_manager.stream_clients:
+                            stream_manager.stream_clients[stream_id].discard(client_id)
 
                     remaining_clients = len(
                         stream_manager.stream_clients.get(stream_id, set())
