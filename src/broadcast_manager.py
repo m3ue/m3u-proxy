@@ -447,11 +447,9 @@ class NetworkBroadcastProcess:
         try:
             await self.process.wait()
 
-            # For DVR broadcasts: always send a callback so the editor can trigger
-            # post-processing, even when we initiated the stop ourselves.
-            # For non-DVR broadcasts: skip callback on intentional stop (network broadcasts
-            # don't need post-processing and the editor already knows it was stopped).
-            if self._stopping and not self.config.dvr_mode:
+            # Skip callback on intentional stop — the editor initiated it and handles
+            # post-processing directly without waiting for a proxy callback.
+            if self._stopping:
                 return
 
             # Determine final segment number
@@ -466,10 +464,7 @@ class NetworkBroadcastProcess:
                 ).total_seconds()
 
             exit_code = self.process.returncode
-            # An intentional stop (self._stopping) kills FFmpeg with a signal, so exit_code
-            # is non-zero. Treat it as a clean stop for DVR so post-processing starts.
-            clean_exit = exit_code == 0 or (self._stopping and self.config.dvr_mode)
-            if clean_exit:
+            if exit_code == 0:
                 # Normal completion (duration limit reached) or intentional DVR stop
                 self.status = "stopped"
                 await self._send_callback(
