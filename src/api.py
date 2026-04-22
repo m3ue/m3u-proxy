@@ -2531,6 +2531,7 @@ class BroadcastStatusResponse(BaseModel):
     current_segment_number: int
     started_at: Optional[str]
     stream_url: str
+    hls_dir: Optional[str] = None
     ffmpeg_pid: Optional[int] = None
     error_message: Optional[str] = None
 
@@ -2675,6 +2676,7 @@ async def get_broadcast_status(network_id: str) -> BroadcastStatusResponse:
         current_segment_number=status.current_segment_number,
         started_at=status.started_at,
         stream_url=status.stream_url,
+        hls_dir=status.hls_dir,
         ffmpeg_pid=status.ffmpeg_pid,
         error_message=status.error_message,
     )

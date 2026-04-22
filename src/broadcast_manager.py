@@ -63,6 +63,7 @@ class BroadcastStatus:
     current_segment_number: int
     started_at: Optional[str]
     stream_url: str
+    hls_dir: Optional[str] = None
     ffmpeg_pid: Optional[int] = None
     error_message: Optional[str] = None
     metadata: Optional[Dict] = None
@@ -636,6 +637,7 @@ class NetworkBroadcastProcess:
             current_segment_number=self._get_final_segment_number(),
             started_at=self.started_at.isoformat() if self.started_at else None,
             stream_url=self.config.stream_url,
+            hls_dir=self.hls_dir,
             ffmpeg_pid=self.process.pid if self.process else None,
             error_message=self.error_message,
             metadata=self.config.metadata,
