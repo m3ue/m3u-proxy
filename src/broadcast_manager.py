@@ -51,6 +51,7 @@ class BroadcastConfig:
     headers: Optional[Dict[str, str]] = None
     # DVR mode: preserve all HLS segments (no rolling deletion) for post-processing
     dvr_mode: bool = False
+    metadata: Optional[Dict] = None
 
 
 @dataclass
@@ -64,6 +65,7 @@ class BroadcastStatus:
     stream_url: str
     ffmpeg_pid: Optional[int] = None
     error_message: Optional[str] = None
+    metadata: Optional[Dict] = None
 
 
 class NetworkBroadcastProcess:
@@ -636,6 +638,7 @@ class NetworkBroadcastProcess:
             stream_url=self.config.stream_url,
             ffmpeg_pid=self.process.pid if self.process else None,
             error_message=self.error_message,
+            metadata=self.config.metadata,
         )
 
     def get_playlist_path(self) -> Optional[str]:

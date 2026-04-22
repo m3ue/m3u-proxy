@@ -2489,6 +2489,7 @@ class BroadcastStartRequest(BaseModel):
     headers: Optional[Dict[str, str]] = None
     # DVR mode: preserve all HLS segments for post-processing concat
     dvr_mode: bool = False
+    metadata: Optional[dict] = None
 
     @field_validator("stream_url")
     @classmethod
@@ -2569,6 +2570,7 @@ async def start_broadcast(
             callback_url=request.callback_url,
             headers=request.headers,
             dvr_mode=request.dvr_mode,
+            metadata=request.metadata,
         )
         status = await broadcast_manager.start_broadcast(config)
         return BroadcastStatusResponse(
@@ -2693,6 +2695,7 @@ async def list_broadcasts() -> dict:
                 "started_at": status.started_at,
                 "stream_url": status.stream_url,
                 "ffmpeg_pid": status.ffmpeg_pid,
+                "metadata": status.metadata or {},
             }
             for status in statuses.values()
         ],
