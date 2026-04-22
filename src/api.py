@@ -2487,6 +2487,8 @@ class BroadcastStartRequest(BaseModel):
     hwaccel: Optional[str] = None
     callback_url: Optional[str] = None
     headers: Optional[Dict[str, str]] = None
+    # DVR mode: preserve all HLS segments for post-processing concat
+    dvr_mode: bool = False
 
     @field_validator("stream_url")
     @classmethod
@@ -2566,6 +2568,7 @@ async def start_broadcast(
             hwaccel=request.hwaccel,
             callback_url=request.callback_url,
             headers=request.headers,
+            dvr_mode=request.dvr_mode,
         )
         status = await broadcast_manager.start_broadcast(config)
         return BroadcastStatusResponse(

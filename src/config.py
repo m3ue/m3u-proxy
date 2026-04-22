@@ -99,6 +99,9 @@ class Settings(BaseSettings):
     # Network Broadcast Configuration
     # Base directory for broadcast HLS output. Each network gets a subdirectory.
     HLS_BROADCAST_DIR: str = "/tmp/m3u-proxy-broadcasts"
+    # Base directory for DVR recording HLS output (separate from live broadcasts).
+    # Set to a path shared with the m3u-editor container so post-processing can read segments.
+    DVR_RECORDING_DIR: str = "/tmp/m3u-proxy-dvr"
     # Enable GC for orphaned broadcast directories. Uses HLS_GC_INTERVAL and
     # HLS_GC_AGE_THRESHOLD for scan interval and age threshold respectively.
     BROADCAST_GC_ENABLED: bool = True

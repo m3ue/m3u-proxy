@@ -49,6 +49,8 @@ class BroadcastConfig:
     callback_url: Optional[str] = None
     # Optional custom headers to include when FFmpeg fetches the input URL
     headers: Optional[Dict[str, str]] = None
+    # DVR mode: preserve all HLS segments (no rolling deletion) for post-processing
+    dvr_mode: bool = False
 
 
 @dataclass
@@ -214,16 +216,20 @@ class NetworkBroadcastProcess:
         # HLS output configuration
         cmd.extend(["-f", "hls"])
         cmd.extend(["-hls_time", str(self.config.segment_duration)])
-        cmd.extend(["-hls_list_size", str(self.config.hls_list_size)])
+        # DVR mode: hls_list_size=0 keeps all segments in the manifest for concat
+        hls_list_size = 0 if self.config.dvr_mode else self.config.hls_list_size
+        cmd.extend(["-hls_list_size", str(hls_list_size)])
         cmd.extend(["-start_number", str(self.config.segment_start_number)])
 
-        # HLS flags
+        # HLS flags — DVR mode keeps all segments for post-processing concat
         hls_flags = [
-            "delete_segments",
             "program_date_time",
             "omit_endlist",
             "independent_segments",
         ]
+        if not self.config.dvr_mode:
+            # Rolling-window live broadcasts delete old segments to save space
+            hls_flags.insert(0, "delete_segments")
         if self.config.add_discontinuity:
             hls_flags.append("discont_start")
         cmd.extend(["-hls_flags", "+".join(hls_flags)])
@@ -496,6 +502,8 @@ class NetworkBroadcastProcess:
             "network_id": self.network_id,
             "event": event,
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "dvr_mode": self.config.dvr_mode,
+            "hls_dir": self.hls_dir if self.config.dvr_mode else None,
             "data": data,
         }
 
@@ -721,7 +729,13 @@ class BroadcastManager:
                 del self.broadcasts[network_id]
 
             # Create and start new process
-            process = NetworkBroadcastProcess(config, self.hls_base_dir)
+            # DVR recordings use a dedicated directory separate from live broadcasts
+            base_dir = (
+                getattr(settings, "DVR_RECORDING_DIR", "/tmp/m3u-proxy-dvr")
+                if config.dvr_mode
+                else self.hls_base_dir
+            )
+            process = NetworkBroadcastProcess(config, base_dir)
 
             # Check start retry policy
             now = time.time()
