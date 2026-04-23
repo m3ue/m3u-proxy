@@ -67,6 +67,7 @@ class BroadcastStatus:
     ffmpeg_pid: Optional[int] = None
     error_message: Optional[str] = None
     metadata: Optional[Dict] = None
+    bytes_written: int = 0
 
 
 class NetworkBroadcastProcess:
@@ -111,7 +112,10 @@ class NetworkBroadcastProcess:
         self.error_message: Optional[str] = None
         self._monitor_task: Optional[asyncio.Task] = None
         self._stderr_task: Optional[asyncio.Task] = None
+        self._poll_task: Optional[asyncio.Task] = None
         self._stopping = False
+        self._bytes_written: int = 0  # Cumulative bytes across all segments ever seen
+        self._seen_segments: Set[str] = set()  # Segment filenames already counted
 
     def _build_ffmpeg_command(self) -> List[str]:
         """Build the FFmpeg command for HLS broadcast output."""
@@ -297,6 +301,7 @@ class NetworkBroadcastProcess:
             # Start monitoring tasks
             self._stderr_task = asyncio.create_task(self._log_stderr())
             self._monitor_task = asyncio.create_task(self._monitor_process())
+            self._poll_task = asyncio.create_task(self._poll_bytes())
 
             logger.info(
                 f"Broadcast {self.network_id} started with PID {self.process.pid}"
@@ -341,7 +346,7 @@ class NetworkBroadcastProcess:
                 pass  # Process already dead
 
         # Cancel monitoring tasks
-        for task in [self._monitor_task, self._stderr_task]:
+        for task in [self._monitor_task, self._stderr_task, self._poll_task]:
             if task and not task.done():
                 task.cancel()
                 try:
@@ -366,7 +371,7 @@ class NetworkBroadcastProcess:
         "time=",  # Time stats
         "bitrate=",  # Bitrate stats
         "speed=",  # Speed stats
-        "size=",  # Size stats
+        "size=",  # Size stats (N/A for HLS stream-copy; tracked via segment polling)
         "resumed reading",  # Reconnection noise
         "opening",  # File opening messages (lowercase)
         "muxing overhead",  # Summary stats
@@ -533,6 +538,47 @@ class NetworkBroadcastProcess:
         except Exception as e:
             logger.error(f"Error sending callback for broadcast {self.network_id}: {e}")
 
+    async def _poll_bytes(self, interval: float = 1.0) -> None:
+        """
+        Track cumulative bytes by watching for new .ts segment files.
+
+        FFmpeg's progress output reports ``size=N/A`` for HLS stream-copy output,
+        so we can't use stderr parsing. Instead, we scan the HLS directory every
+        ``interval`` seconds. Each new segment file we haven't seen before is
+        measured and added to ``_bytes_written``.
+
+        For DVR broadcasts the files are never deleted, so every segment is counted
+        exactly once. For non-DVR broadcasts FFmpeg deletes old segments via its
+        ``delete_segments`` flag, but the rolling window keeps several segments on
+        disk at any time (hls_list_size × hls_time seconds), giving us a comfortable
+        window to measure each file before it disappears.
+        """
+        try:
+            while not self._stopping:
+                try:
+                    if os.path.exists(self.hls_dir):
+                        for filename in os.listdir(self.hls_dir):
+                            if (
+                                filename.endswith(".ts")
+                                and filename not in self._seen_segments
+                            ):
+                                self._seen_segments.add(filename)
+                                try:
+                                    self._bytes_written += os.path.getsize(
+                                        os.path.join(self.hls_dir, filename)
+                                    )
+                                except OSError:
+                                    pass
+                except Exception:
+                    pass
+                await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            pass
+
+    def _get_bytes_written(self) -> int:
+        """Return cumulative bytes written across all segments ever seen."""
+        return self._bytes_written
+
     def _get_final_segment_number(self) -> int:
         """Get the highest segment number from existing files."""
         try:
@@ -636,6 +682,7 @@ class NetworkBroadcastProcess:
             ffmpeg_pid=self.process.pid if self.process else None,
             error_message=self.error_message,
             metadata=self.config.metadata,
+            bytes_written=self._get_bytes_written(),
         )
 
     def get_playlist_path(self) -> Optional[str]:

@@ -2534,6 +2534,7 @@ class BroadcastStatusResponse(BaseModel):
     hls_dir: Optional[str] = None
     ffmpeg_pid: Optional[int] = None
     error_message: Optional[str] = None
+    bytes_written: int = 0
 
 
 @app.post("/broadcast/{network_id}/start", dependencies=[Depends(verify_token)])
@@ -2698,6 +2699,7 @@ async def list_broadcasts() -> dict:
                 "stream_url": status.stream_url,
                 "ffmpeg_pid": status.ffmpeg_pid,
                 "metadata": status.metadata or {},
+                "bytes_written": status.bytes_written,
             }
             for status in statuses.values()
         ],
