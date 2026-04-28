@@ -2793,6 +2793,10 @@ class StreamManager:
                         == connection_id
                     ):
                         self.clients[client_id].active_connection_id = None
+                        # Mark as not connected so capacity checks don't count this
+                        # stale client as active. If the player seeks, the next request
+                        # will set is_connected = True again via register_client().
+                        self.clients[client_id].is_connected = False
                     logger.info(
                         f"VOD range served naturally for client {client_id} (connection {connection_id}), "
                         f"client kept registered for potential seek requests"
