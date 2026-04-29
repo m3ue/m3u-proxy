@@ -167,38 +167,76 @@ class M3U8Processor:
                             media.absolute_uri, base_proxy_url
                         )
             else:
+                # Track init_section objects we've already rewritten — the same
+                # Initialization object is shared across all segments that follow
+                # an EXT-X-MAP declaration, so we must rewrite each one only once.
+                seen_init_sections = set()
                 for segment in playlist.segments:
                     segment.uri = self._rewrite_url(
                         segment.absolute_uri, base_proxy_url
                     )
-                # Handle initialization section if present
-                for seg_map in (
+                    init_section = getattr(segment, "init_section", None)
+                    if (
+                        init_section
+                        and getattr(init_section, "uri", None)
+                        and id(init_section) not in seen_init_sections
+                    ):
+                        init_section.uri = self._rewrite_url(
+                            init_section.absolute_uri, base_proxy_url
+                        )
+                        seen_init_sections.add(id(init_section))
+
+                # Handle playlist-level segment_map (some m3u8 lib versions expose
+                # the EXT-X-MAP entries here as a list). Skip objects already
+                # visited via segment.init_section above.
+                segment_maps = (
                     playlist.segment_map
                     if isinstance(playlist.segment_map, list)
-                    else []
-                ):
-                    if hasattr(seg_map, "uri") and seg_map.uri:
+                    else ([playlist.segment_map] if playlist.segment_map else [])
+                )
+                for seg_map in segment_maps:
+                    if (
+                        getattr(seg_map, "uri", None)
+                        and id(seg_map) not in seen_init_sections
+                    ):
                         seg_map.uri = self._rewrite_url(
                             seg_map.absolute_uri, base_proxy_url
                         )
+                        seen_init_sections.add(id(seg_map))
 
             return playlist.dumps()
         except Exception as e:
             logger.error(f"Error processing M3U8 playlist: {e}")
             return content
 
+    @staticmethod
+    def _segment_kind(url: str) -> str:
+        """Classify an HLS segment URL by its file extension.
+
+        Returns the routing extension used in proxy URLs ("ts", "m4s", or "mp4").
+        Defaults to "ts" for unknown extensions to preserve existing behavior.
+        """
+        path = url.split("?", 1)[0].lower()
+        if path.endswith((".m4s", ".cmfv", ".cmfa", ".cmft")):
+            return "m4s"
+        if path.endswith(".mp4"):
+            return "mp4"
+        return "ts"
+
     def _rewrite_url(self, original_url: str, base_proxy_url: str) -> str:
         """Rewrites a URL to point to the proxy, encoding the original URL."""
         encoded_url = quote(original_url, safe="")
         # Check path only — strip query params to handle URLs like *.m3u8?location=ABC123
-        if original_url.split("?")[0].endswith(".m3u8"):
+        path = original_url.split("?", 1)[0].lower()
+        if path.endswith(".m3u8"):
             # For variant playlists, include parent stream ID
             parent_param = (
                 f"&parent={self.parent_stream_id}" if self.parent_stream_id else ""
             )
             return f"{base_proxy_url}/playlist.m3u8?url={encoded_url}&client_id={self.client_id}{parent_param}"
-        else:
-            return f"{base_proxy_url}/segment.ts?url={encoded_url}&client_id={self.client_id}"
+
+        kind = self._segment_kind(original_url)
+        return f"{base_proxy_url}/segment.{kind}?url={encoded_url}&client_id={self.client_id}"
 
 
 class StreamManager:
@@ -3937,6 +3975,25 @@ class StreamManager:
                     )
                     return None
 
+    @staticmethod
+    def _segment_content_type(segment_url: str) -> str:
+        """Infer the response Content-Type for an HLS segment from its URL.
+
+        Defaults to MPEG-TS so existing .ts pass-through stays bit-exact.
+        fMP4/CMAF segments need their own MIME so strict players (e.g. Apple
+        AVKit on tvOS) can decode HEVC content carried in fragmented MP4.
+        """
+        path = segment_url.split("?", 1)[0].lower()
+        if path.endswith((".m4s", ".cmfv", ".cmfa", ".cmft")):
+            return "video/iso.segment"
+        if path.endswith(".mp4"):
+            return "video/mp4"
+        if path.endswith(".aac"):
+            return "audio/aac"
+        if path.endswith(".vtt"):
+            return "text/vtt"
+        return "video/mp2t"
+
     async def proxy_hls_segment(
         self,
         stream_id: str,
@@ -4050,9 +4107,10 @@ class StreamManager:
                     logger.error(f"Unexpected error streaming HLS segment: {e}")
                     raise
 
+        media_type = self._segment_content_type(segment_url)
         return StreamingResponse(
             segment_generator(),
-            media_type="video/MP2T",
+            media_type=media_type,
             headers={
                 "Cache-Control": "no-cache",
                 "Access-Control-Allow-Origin": "*",

@@ -94,6 +94,178 @@ http://original.com/segment2.ts"""
         )
         assert expected_url2 in result
 
+    def test_segment_kind_classifier(self):
+        """Each known HLS segment extension routes to its dedicated proxy path."""
+        kind = M3U8Processor._segment_kind
+        assert kind("http://x/y/seg.ts") == "ts"
+        assert kind("http://x/y/seg.ts?token=abc") == "ts"
+        assert kind("http://x/y/seg.m4s") == "m4s"
+        assert kind("http://x/y/seg.m4s?Policy=signed&Signature=xyz") == "m4s"
+        assert kind("http://x/y/seg.cmfv") == "m4s"
+        assert kind("http://x/y/seg.cmfa") == "m4s"
+        assert kind("http://x/y/init.mp4") == "mp4"
+        assert kind("http://x/y/SEG.M4S") == "m4s"
+        assert kind("http://x/y/seg.unknown") == "ts"
+
+    def test_rewrite_fmp4_manifest_with_init_segment(self):
+        """fMP4 manifests must rewrite EXT-X-MAP and .m4s segments through the
+        kind-aware proxy routes so strict players (Apple AVKit on tvOS) see
+        the correct extensions and content types."""
+        from urllib.parse import quote
+
+        processor = M3U8Processor("http://original.com/", "stream123")
+
+        playlist = """#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-TARGETDURATION:6
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-MAP:URI="init.mp4"
+#EXTINF:6.0,
+seg00001.m4s
+#EXTINF:6.0,
+seg00002.m4s
+#EXT-X-ENDLIST"""
+
+        proxy_base_url = "http://proxy.com/hls/stream123"
+        result = processor.process_playlist(
+            playlist, proxy_base_url, "http://original.com/"
+        )
+
+        encoded_init = quote("http://original.com/init.mp4", safe="")
+        assert (
+            f"{proxy_base_url}/segment.mp4?url={encoded_init}&client_id=stream123"
+            in result
+        )
+
+        encoded_seg1 = quote("http://original.com/seg00001.m4s", safe="")
+        assert (
+            f"{proxy_base_url}/segment.m4s?url={encoded_seg1}&client_id=stream123"
+            in result
+        )
+
+        encoded_seg2 = quote("http://original.com/seg00002.m4s", safe="")
+        assert (
+            f"{proxy_base_url}/segment.m4s?url={encoded_seg2}&client_id=stream123"
+            in result
+        )
+
+        assert "EXT-X-MAP" in result
+
+    def test_init_section_rewritten_only_once(self):
+        """A single EXT-X-MAP applies to all subsequent segments — its URI must
+        be rewritten exactly once. Re-rewriting would double-encode the proxy
+        URL into itself and break the init segment fetch."""
+        from urllib.parse import quote
+
+        processor = M3U8Processor("http://original.com/", "stream123")
+
+        playlist = """#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-TARGETDURATION:6
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-MAP:URI="init.mp4"
+#EXTINF:6.0,
+seg1.m4s
+#EXTINF:6.0,
+seg2.m4s
+#EXTINF:6.0,
+seg3.m4s
+#EXT-X-ENDLIST"""
+
+        proxy_base_url = "http://proxy.com/hls/stream123"
+        result = processor.process_playlist(
+            playlist, proxy_base_url, "http://original.com/"
+        )
+
+        map_lines = [line for line in result.splitlines() if "EXT-X-MAP" in line]
+        assert len(map_lines) == 1
+        # Double-encoding would leave a percent-encoded "http%3A%2F%2Fproxy.com"
+        # nested inside the URL — that would mean we rewrote our own rewrite.
+        assert "http%3A%2F%2Fproxy.com" not in map_lines[0]
+        encoded_init = quote("http://original.com/init.mp4", safe="")
+        assert encoded_init in map_lines[0]
+
+    def test_ts_passthrough_uses_segment_ts_route(self):
+        """Regression: vanilla .ts manifests still route through /segment.ts so
+        existing players keep working unchanged."""
+        from urllib.parse import quote
+
+        processor = M3U8Processor("http://original.com/", "stream123")
+
+        playlist = """#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:10
+#EXTINF:10.0,
+http://original.com/seg1.ts
+#EXTINF:10.0,
+http://original.com/seg2.ts"""
+
+        proxy_base_url = "http://proxy.com/hls/stream123"
+        result = processor.process_playlist(
+            playlist, proxy_base_url, "http://original.com/"
+        )
+
+        encoded_seg1 = quote("http://original.com/seg1.ts", safe="")
+        assert (
+            f"{proxy_base_url}/segment.ts?url={encoded_seg1}&client_id=stream123"
+            in result
+        )
+        assert "/segment.m4s?" not in result
+        assert "/segment.mp4?" not in result
+
+
+class TestSegmentContentType:
+    """Test StreamManager._segment_content_type — used to set the response
+    Content-Type when proxying HLS segment bytes."""
+
+    def test_ts_returns_mpeg_ts(self):
+        assert StreamManager._segment_content_type("http://x/y/seg.ts") == "video/mp2t"
+        assert (
+            StreamManager._segment_content_type("http://x/y/seg.ts?token=abc")
+            == "video/mp2t"
+        )
+
+    def test_m4s_returns_iso_segment(self):
+        assert (
+            StreamManager._segment_content_type("http://x/y/seg.m4s")
+            == "video/iso.segment"
+        )
+        assert (
+            StreamManager._segment_content_type("http://x/y/seg.cmfv")
+            == "video/iso.segment"
+        )
+        assert (
+            StreamManager._segment_content_type("http://x/y/seg.cmfa")
+            == "video/iso.segment"
+        )
+
+    def test_mp4_returns_video_mp4(self):
+        assert (
+            StreamManager._segment_content_type("http://x/y/init.mp4") == "video/mp4"
+        )
+
+    def test_aac_returns_audio_aac(self):
+        assert (
+            StreamManager._segment_content_type("http://x/y/audio.aac") == "audio/aac"
+        )
+
+    def test_vtt_returns_text_vtt(self):
+        assert (
+            StreamManager._segment_content_type("http://x/y/captions.vtt") == "text/vtt"
+        )
+
+    def test_unknown_defaults_to_mpeg_ts(self):
+        assert (
+            StreamManager._segment_content_type("http://x/y/seg.xyz") == "video/mp2t"
+        )
+        assert StreamManager._segment_content_type("http://x/y/seg") == "video/mp2t"
+
+    def test_case_insensitive(self):
+        assert (
+            StreamManager._segment_content_type("http://x/y/SEG.M4S")
+            == "video/iso.segment"
+        )
+
 
 class TestStreamManager:
     """Test StreamManager functionality"""
