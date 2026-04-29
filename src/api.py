@@ -1321,6 +1321,28 @@ async def get_hls_segment_ts(
     return await get_hls_segment(stream_id, request, client_id, url)
 
 
+@app.get("/hls/{stream_id}/segment.m4s")
+async def get_hls_segment_m4s(
+    stream_id: str,
+    request: Request,
+    client_id: str = Query(..., description="Client ID"),
+    url: str = Query(..., description="The segment URL to proxy"),
+):
+    """Proxy fMP4/CMAF HLS segment (used for HEVC and Apple AVKit playback)."""
+    return await get_hls_segment(stream_id, request, client_id, url)
+
+
+@app.get("/hls/{stream_id}/segment.mp4")
+async def get_hls_segment_mp4(
+    stream_id: str,
+    request: Request,
+    client_id: str = Query(..., description="Client ID"),
+    url: str = Query(..., description="The segment URL to proxy"),
+):
+    """Proxy fMP4 HLS init segment (EXT-X-MAP) or .mp4 segment file."""
+    return await get_hls_segment(stream_id, request, client_id, url)
+
+
 def _start_disconnect_monitor(
     request: Request, client_id: str, sm: StreamManager
 ) -> None:
