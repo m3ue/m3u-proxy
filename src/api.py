@@ -2940,6 +2940,9 @@ class BroadcastStartRequest(BaseModel):
     video_bitrate: Optional[str] = None
     audio_bitrate: int = 192
     video_resolution: Optional[str] = None
+    # Deinterlace (yadif) before encoding. Only applies when transcode=True;
+    # needed for interlaced MPEG-2 sources such as ATSC OTA / HDHomeRun.
+    deinterlace: bool = False
     # Optional codec/preset/hwaccel to pass to the broadcast process
     video_codec: Optional[str] = None
     audio_codec: Optional[str] = None
@@ -3050,6 +3053,7 @@ async def start_broadcast(
             video_bitrate=request.video_bitrate,
             audio_bitrate=request.audio_bitrate,
             video_resolution=request.video_resolution,
+            deinterlace=request.deinterlace,
             video_codec=request.video_codec,
             audio_codec=request.audio_codec,
             preset=request.preset,

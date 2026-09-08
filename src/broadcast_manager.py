@@ -41,6 +41,10 @@ class BroadcastConfig:
     video_bitrate: Optional[str] = None
     audio_bitrate: int = 192
     video_resolution: Optional[str] = None
+    # Deinterlace (yadif) the source before encoding. Only applies when
+    # transcode=True (a stream copy cannot deinterlace). Needed for interlaced
+    # MPEG-2 sources such as ATSC OTA / HDHomeRun.
+    deinterlace: bool = False
     # Optional explicit codec/preset/hwaccel options (populated from Network transcode config)
     video_codec: Optional[str] = None
     audio_codec: Optional[str] = None
@@ -345,8 +349,17 @@ class NetworkBroadcastProcess:
 
             if self.config.video_bitrate:
                 cmd.extend(["-b:v", f"{self.config.video_bitrate}k"])
+
+            # Build a single -vf chain: FFmpeg only honours the last -vf, so
+            # deinterlace (yadif) and scale must be combined rather than passed
+            # as two separate flags.
+            video_filters = []
+            if getattr(self.config, "deinterlace", False):
+                video_filters.append("yadif")
             if self.config.video_resolution:
-                cmd.extend(["-vf", f"scale={self.config.video_resolution}"])
+                video_filters.append(f"scale={self.config.video_resolution}")
+            if video_filters:
+                cmd.extend(["-vf", ",".join(video_filters)])
 
             # Audio codec and bitrate
             audio_codec = self.config.audio_codec or "aac"
