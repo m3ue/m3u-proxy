@@ -1141,7 +1141,7 @@ async def get_hls_playlist(
         if not client_id:
             client_info_data = get_client_info(request)
             username_part = client_info_data.get("username") or ""
-            client_hash = hashlib.md5(
+            client_hash = hashlib.sha256(
                 f"{client_info_data['ip_address']}-{client_info_data['user_agent']}-{stream_id}-{username_part}".encode()
             ).hexdigest()[:16]
             client_id = f"client_{client_hash}"
@@ -1399,7 +1399,7 @@ async def get_dash_manifest(
         if not client_id:
             client_info_data = get_client_info(request)
             username_part = client_info_data.get("username") or ""
-            client_hash = hashlib.md5(
+            client_hash = hashlib.sha256(
                 f"{client_info_data['ip_address']}-{client_info_data['user_agent']}-{stream_id}-{username_part}".encode()
             ).hexdigest()[:16]
             client_id = f"client_{client_hash}"
@@ -1665,7 +1665,7 @@ async def get_direct_stream(
         if not client_id:
             client_info_data = get_client_info(request)
             username_part = client_info_data.get("username") or ""
-            client_hash = hashlib.md5(
+            client_hash = hashlib.sha256(
                 f"{client_info_data['ip_address']}-{client_info_data['user_agent']}-{stream_id}-{username_part}".encode()
             ).hexdigest()[:16]
             client_id = f"client_{client_hash}"
