@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Query, Response, Request, Depends, Header
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import asyncio
@@ -1125,6 +1125,7 @@ async def list_transcode_profiles():
 async def get_hls_playlist(
     request: Request,
     stream_id: str = Depends(resolve_stream_id),
+    auto: bool = Query(False, description="Detect HLS or video from the upstream body"),
     client_id: Optional[str] = Query(
         None, description="Client ID (auto-generated if not provided)"
     ),
@@ -1220,7 +1221,11 @@ async def get_hls_playlist(
 
         # Get processed playlist content (works for both direct HLS and transcoded HLS)
         content = await stream_manager.get_playlist_content(
-            stream_id, client_id, base_proxy_url
+            stream_id,
+            client_id,
+            base_proxy_url,
+            allow_direct=auto,
+            range_header=request.headers.get("range"),
         )
 
         if content is None:
@@ -1238,7 +1243,11 @@ async def get_hls_playlist(
             f"Serving {stream_type} playlist to client {client_id} for stream {stream_id}"
         )
 
-        response = Response(content=content, media_type="application/vnd.apple.mpegurl")
+        response = (
+            content
+            if isinstance(content, StreamingResponse)
+            else Response(content=content, media_type="application/vnd.apple.mpegurl")
+        )
         # Add client ID to response headers for tracking
         response.headers["X-Client-ID"] = client_id
         response.headers["X-Stream-ID"] = stream_id

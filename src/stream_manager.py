@@ -19,6 +19,7 @@ from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
+from starlette.background import BackgroundTask
 
 from config import settings
 
@@ -167,12 +168,12 @@ class M3U8Processor:
             if playlist.is_variant:
                 for variant in playlist.playlists:
                     variant.uri = self._rewrite_url(
-                        variant.absolute_uri, base_proxy_url
+                        variant.absolute_uri, base_proxy_url, playlist=True
                     )
                 for media in playlist.media:
                     if media.uri:
                         media.uri = self._rewrite_url(
-                            media.absolute_uri, base_proxy_url
+                            media.absolute_uri, base_proxy_url, playlist=True
                         )
             else:
                 # Track init_section objects we've already rewritten — the same
@@ -212,10 +213,18 @@ class M3U8Processor:
                         )
                         seen_init_sections.add(id(seg_map))
 
+            for variant in playlist.iframe_playlists:
+                variant.uri = self._rewrite_url(
+                    variant.absolute_uri, base_proxy_url, playlist=True
+                )
+            for key in [*playlist.keys, *playlist.session_keys]:
+                if key and key.uri and not key.uri.startswith("data:"):
+                    key.uri = self._rewrite_url(key.absolute_uri, base_proxy_url)
+
             return playlist.dumps()
         except Exception as e:
             logger.error(f"Error processing M3U8 playlist: {e}")
-            return content
+            raise ValueError("Invalid HLS playlist") from e
 
     @staticmethod
     def _segment_kind(url: str) -> str:
@@ -231,12 +240,14 @@ class M3U8Processor:
             return "mp4"
         return "ts"
 
-    def _rewrite_url(self, original_url: str, base_proxy_url: str) -> str:
+    def _rewrite_url(
+        self, original_url: str, base_proxy_url: str, playlist: bool = False
+    ) -> str:
         """Rewrites a URL to point to the proxy, encoding the original URL."""
         encoded_url = quote(original_url, safe="")
         # Check path only — strip query params to handle URLs like *.m3u8?location=ABC123
         path = original_url.split("?", 1)[0].lower()
-        if path.endswith(".m3u8"):
+        if playlist or path.endswith(".m3u8"):
             # For variant playlists, include parent stream ID
             parent_param = (
                 f"&parent={self.parent_stream_id}" if self.parent_stream_id else ""
@@ -764,6 +775,7 @@ class StreamManager:
             is_variant = parent_stream_id is not None
             if is_variant and parent_stream_id in self.streams:
                 user_agent = self.streams[parent_stream_id].user_agent
+                headers = {**self.streams[parent_stream_id].headers, **(headers or {})}
 
             # Determine use_sticky_session: use parameter if provided, otherwise use global config
             effective_use_sticky_session = (
@@ -3908,8 +3920,13 @@ class StreamManager:
     # ============================================================================
 
     async def get_playlist_content(
-        self, stream_id: str, client_id: str, base_proxy_url: str
-    ) -> Optional[str]:
+        self,
+        stream_id: str,
+        client_id: str,
+        base_proxy_url: str,
+        allow_direct: bool = False,
+        range_header: Optional[str] = None,
+    ) -> Optional[str | StreamingResponse]:
         """Get and process playlist content for HLS streams"""
         if stream_id not in self.streams:
             return None
@@ -4194,10 +4211,85 @@ class StreamManager:
                 )
                 headers = {"User-Agent": stream_info.user_agent}
                 headers.update(stream_info.headers)
-                response = await self.http_client.get(current_url, headers=headers)
-                response.raise_for_status()
+                if allow_direct:
+                    headers["Accept-Encoding"] = "identity"
+                    if range_header:
+                        headers["Range"] = range_header
+                    request = self.http_client.build_request(
+                        "GET", current_url, headers=headers
+                    )
+                    response = await self.http_client.send(request, stream=True)
+                    try:
+                        if response.status_code != 416:
+                            response.raise_for_status()
+                        chunks = response.aiter_bytes()
+                        prefix = b""
+                        while len(prefix) < 10:
+                            chunk = await anext(chunks, b"")
+                            if not chunk:
+                                break
+                            prefix += chunk
+                        is_hls = prefix.startswith(b"#EXTM3U") or prefix.startswith(
+                            b"\xef\xbb\xbf#EXTM3U"
+                        )
+                        if not is_hls:
+                            stream_info.is_hls = False
+                            stream_info.is_vod = True
+                            stream_info.is_live_continuous = False
 
-                content = response.text
+                            async def direct_body():
+                                try:
+                                    yield prefix
+                                    async for chunk in chunks:
+                                        now = datetime.now(timezone.utc)
+                                        stream_info.last_access = now
+                                        if client_id in self.clients:
+                                            self.clients[client_id].last_access = now
+                                            self.clients[client_id].last_data_time = now
+                                            self.clients[client_id].bytes_served += len(
+                                                chunk
+                                            )
+                                        stream_info.total_bytes_served += len(chunk)
+                                        yield chunk
+                                finally:
+                                    await response.aclose()
+
+                            response_headers = {
+                                key: response.headers[key]
+                                for key in (
+                                    "content-type",
+                                    "content-length",
+                                    "content-range",
+                                    "accept-ranges",
+                                    "etag",
+                                    "last-modified",
+                                )
+                                if key in response.headers
+                            }
+                            if (
+                                "mpegurl"
+                                in response_headers.get("content-type", "").lower()
+                            ):
+                                response_headers["content-type"] = (
+                                    "application/octet-stream"
+                                )
+                            return StreamingResponse(
+                                direct_body(),
+                                status_code=response.status_code,
+                                headers=response_headers,
+                                background=BackgroundTask(response.aclose),
+                            )
+                        content = prefix + b"".join([chunk async for chunk in chunks])
+                        content = content.decode("utf-8-sig")
+                        stream_info.is_hls = True
+                    except BaseException:
+                        await response.aclose()
+                        raise
+                    await response.aclose()
+                else:
+                    response = await self.http_client.get(current_url, headers=headers)
+                    response.raise_for_status()
+                    content = response.text
                 final_url = str(response.url)
                 stream_info.final_playlist_url = final_url
 
