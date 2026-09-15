@@ -62,6 +62,23 @@ class TestHelperFunctions:
         assert is_direct_stream("http://p.example.com/series/u/p/12345") is True
         assert is_direct_stream("http://p.example.com/timeshift/u/p/1/2/12345") is True
 
+    def test_is_direct_stream_vod_mpd_routes_to_dash_not_direct(self):
+        """A VOD .mpd URL must still be excluded from direct-stream handling
+        (DASH manifests always go through their own handler) even though its
+        path also matches the movie/series/timeshift VOD marker - the .mpd
+        guard has to run before that marker check, not after it."""
+        assert is_direct_stream("http://p.example.com/movie/u/p/12345.mpd") is False
+        assert is_direct_stream("http://p.example.com/series/u/p/12345.mpd") is False
+
+    def test_is_direct_stream_ignores_live_in_query_string(self):
+        """A genuine VOD URL with '/live/' appearing only in its query string
+        must not be misrouted as a live direct stream because of a bare
+        substring match against the full URL instead of just its path."""
+        assert (
+            is_direct_stream("http://p.example.com/movie/u/p/1.mp4?ref=/live/foo")
+            is True
+        )
+
 
 class TestAPI:
     """Test FastAPI endpoints"""
@@ -395,6 +412,66 @@ class TestAPI:
             assert response.content == b"raw-video-bytes"
             assert stream_info.is_hls is False
             assert stream_info.is_vod is True
+            assert stream_info.content_type_verified is True
+        finally:
+            asyncio.run(manager.http_client.aclose())
+            asyncio.run(manager.live_stream_client.aclose())
+
+    def test_direct_stream_endpoint_reuses_probe_connection_for_playback(
+        self, monkeypatch
+    ):
+        """A confirmed-raw VOD stream's very first request must serve
+        playback bytes from the same upstream connection the content-type
+        probe already opened, not open a second one. Some providers issue
+        single-use or session-bound VOD URLs that reject a second request to
+        the same URL outright - opening two connections for one client
+        request breaks playback entirely for those providers."""
+        manager = StreamManager()
+        vod_url = "http://provider.example.com/movie/1234.m3u8"
+        stream_id = asyncio.run(manager.get_or_create_stream(vod_url))
+        stream_info = manager.streams[stream_id]
+
+        connection_count = 0
+        body = b"\x00\x00\x00\x18ftypmp42" + b"restofthevideobytes" * 100
+
+        class _FakeResponse:
+            status_code = 200
+            headers = {}
+
+            def raise_for_status(self):
+                pass
+
+            async def aiter_bytes(self, chunk_size=None):
+                yield body
+
+            async def aclose(self):
+                pass
+
+        async def fake_send(request, stream=True, **kwargs):
+            nonlocal connection_count
+            connection_count += 1
+            return _FakeResponse()
+
+        monkeypatch.setattr(manager.http_client, "send", fake_send)
+
+        def fake_stream(method, url, **kwargs):
+            raise AssertionError(
+                "playback must reuse the probe's connection, not open a "
+                "second one via client.stream()"
+            )
+
+        monkeypatch.setattr(manager.http_client, "stream", fake_stream)
+
+        try:
+            with patch("api.stream_manager", manager):
+                client = TestClient(app)
+                response = client.get(f"/stream/{stream_id}")
+
+            assert response.status_code == 200
+            assert response.content == body
+            assert connection_count == 1
+            assert stream_info.is_vod is True
+            assert stream_info.is_hls is False
             assert stream_info.content_type_verified is True
         finally:
             asyncio.run(manager.http_client.aclose())

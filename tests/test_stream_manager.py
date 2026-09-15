@@ -327,6 +327,20 @@ class TestStreamManager:
         assert is_vod_path_marker("http://p.example.com/live/movie/u/p/1.m3u8") is False
         assert is_vod_path_marker("http://p.example.com/live/u/p/1.ts") is False
 
+    def test_is_vod_path_marker_ignores_live_in_query_string(self):
+        """The /live/ override must only apply to the path, not the whole URL
+        - a genuine VOD URL with /live/ appearing in its query string (e.g.
+        a referrer/category param) must still be classified as VOD, not
+        flipped to live just because that substring shows up after the '?'."""
+        assert (
+            is_vod_path_marker("http://p.example.com/movie/u/p/1.mp4?ref=/live/foo")
+            is True
+        )
+        assert (
+            is_vod_path_marker("http://p.example.com/series/u/p/1?from=/live/tv")
+            is True
+        )
+
     def test_get_stream_info_nonexistent(self, stream_manager):
         # Current API doesn't have get_stream_info method
         # Instead, check that stream doesn't exist in streams dict
