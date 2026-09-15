@@ -46,9 +46,14 @@ class TestAPI:
     def mock_stream_manager(self):
         with patch("api.stream_manager") as mock:
             # Mock the streams dict to include test_stream_123
-            mock.streams = {"test_stream_123": Mock()}
+            mock.streams = {
+                "test_stream_123": Mock(
+                    is_vod=False, is_hls=False, content_type_verified=True
+                )
+            }
 
             mock.get_or_create_stream = AsyncMock(return_value="test_stream_123")
+            mock.resolve_vod_content_type = AsyncMock(return_value=None)
             mock.get_stream_info = Mock(
                 return_value=Mock(
                     stream_id="test_stream_123",
@@ -269,6 +274,149 @@ class TestAPI:
 
         response = client.get("/stream/test_stream_123")
         assert response.status_code == 200
+
+    def test_direct_stream_endpoint_redirects_genuine_hls_vod(self, monkeypatch):
+        """A VOD URL that looks raw but whose response is genuinely HLS should
+        redirect to the HLS endpoint instead of streaming the master playlist
+        as raw bytes (the private-backend-URL leak this probe exists to fix)."""
+        manager = StreamManager()
+        vod_url = "http://provider.example.com/movie/1234.m3u8"
+
+        stream_id = asyncio.run(manager.get_or_create_stream(vod_url))
+        stream_info = manager.streams[stream_id]
+        assert stream_info.is_vod is True
+
+        class _FakeResponse:
+            status_code = 200
+            headers = {}
+
+            def raise_for_status(self):
+                pass
+
+            async def aiter_bytes(self):
+                yield b"#EXTM3U\n#EXT-X-STREAM-INF\nvariant.m3u8"
+
+            async def aclose(self):
+                pass
+
+        async def fake_send(request, stream=True):
+            return _FakeResponse()
+
+        monkeypatch.setattr(manager.http_client, "send", fake_send)
+
+        try:
+            with patch("api.stream_manager", manager):
+                client = TestClient(app)
+                response = client.get(f"/stream/{stream_id}", follow_redirects=False)
+
+            assert response.status_code == 302
+            assert response.headers["location"].endswith(
+                f"/hls/{stream_id}/playlist.m3u8"
+            )
+            assert stream_info.is_hls is True
+            assert stream_info.is_vod is False
+            assert stream_info.content_type_verified is True
+        finally:
+            asyncio.run(manager.http_client.aclose())
+            asyncio.run(manager.live_stream_client.aclose())
+
+    def test_direct_stream_endpoint_keeps_raw_vod_unredirected(self, monkeypatch):
+        """A VOD URL that is genuinely raw media must not be redirected, and
+        should fall through to the normal direct-stream path unchanged."""
+        manager = StreamManager()
+        vod_url = "http://provider.example.com/movie/1234.m3u8"
+
+        stream_id = asyncio.run(manager.get_or_create_stream(vod_url))
+        stream_info = manager.streams[stream_id]
+
+        class _FakeResponse:
+            status_code = 200
+            headers = {}
+
+            def raise_for_status(self):
+                pass
+
+            async def aiter_bytes(self):
+                yield b"\x00\x00\x00\x18ftypmp42"
+
+            async def aclose(self):
+                pass
+
+        async def fake_probe_send(request, stream=True):
+            return _FakeResponse()
+
+        monkeypatch.setattr(manager.http_client, "send", fake_probe_send)
+
+        from fastapi.responses import StreamingResponse
+
+        async def mock_stream_generator():
+            yield b"raw-video-bytes"
+
+        manager.stream_continuous_direct = AsyncMock(
+            return_value=StreamingResponse(
+                mock_stream_generator(), media_type="video/mp4"
+            )
+        )
+
+        try:
+            with patch("api.stream_manager", manager):
+                client = TestClient(app)
+                response = client.get(f"/stream/{stream_id}")
+
+            assert response.status_code == 200
+            assert response.content == b"raw-video-bytes"
+            assert stream_info.is_hls is False
+            assert stream_info.is_vod is True
+            assert stream_info.content_type_verified is True
+        finally:
+            asyncio.run(manager.http_client.aclose())
+            asyncio.run(manager.live_stream_client.aclose())
+
+    def test_transcoded_vod_stream_is_never_probed_or_redirected(self, monkeypatch):
+        """A transcoded VOD stream must not be probed or redirected to the HLS
+        endpoint - the served content is FFmpeg's output, not the source URL,
+        so the source's real content type is irrelevant here."""
+        manager = StreamManager()
+        vod_url = "http://provider.example.com/movie/1234.m3u8"
+
+        stream_id = asyncio.run(
+            manager.get_or_create_stream(vod_url, is_transcoded=True)
+        )
+        stream_info = manager.streams[stream_id]
+        assert stream_info.is_vod is True
+
+        probe_called = False
+
+        async def fake_probe_send(request, stream=True):
+            nonlocal probe_called
+            probe_called = True
+            raise AssertionError("should not probe a transcoded stream's source")
+
+        monkeypatch.setattr(manager.http_client, "send", fake_probe_send)
+
+        from fastapi.responses import StreamingResponse
+
+        async def mock_transcoded_generator():
+            yield b"transcoded-bytes"
+
+        manager.stream_transcoded = AsyncMock(
+            return_value=StreamingResponse(
+                mock_transcoded_generator(), media_type="video/mp2t"
+            )
+        )
+
+        try:
+            with patch("api.stream_manager", manager):
+                client = TestClient(app)
+                response = client.get(f"/stream/{stream_id}")
+
+            assert response.status_code == 200
+            assert response.content == b"transcoded-bytes"
+            assert probe_called is False
+            assert stream_info.content_type_verified is False
+        finally:
+            asyncio.run(manager.http_client.aclose())
+            asyncio.run(manager.live_stream_client.aclose())
 
     def test_direct_stream_endpoint_recovers_from_redirect_502(self, monkeypatch):
         """API regression: /stream recovers when sticky redirected upstream returns 502 on reconnect."""

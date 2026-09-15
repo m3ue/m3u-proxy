@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Query, Response, Request, Depends, Header
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import asyncio
@@ -1653,6 +1653,27 @@ async def get_direct_stream(
     try:
         # The stream_id is now validated by the resolve_stream_id dependency
         stream_info = stream_manager.streams[stream_id]
+
+        # Provider VOD/movie/series URLs are sometimes routed here despite
+        # actually being genuine HLS (the URL extension alone isn't reliable
+        # for this content class). Probe once and hand off to the HLS
+        # endpoint if so, instead of streaming a master playlist as raw bytes.
+        # Transcoded streams are exempt - their served content is FFmpeg's
+        # output, not the source URL, so the source's content type is moot.
+        if (
+            not stream_info.is_transcoded
+            and stream_info.is_vod
+            and not stream_info.content_type_verified
+        ):
+            await stream_manager.resolve_vod_content_type(stream_id)
+        if not stream_info.is_transcoded and stream_info.is_hls:
+            root_path = getattr(settings, "ROOT_PATH", "")
+            redirect_url = f"{root_path}/hls/{stream_id}/playlist.m3u8"
+            username = request.query_params.get("username")
+            if username:
+                redirect_url += f"?username={username}"
+            return RedirectResponse(url=redirect_url, status_code=302)
+
         stream_url = stream_info.current_url or stream_info.original_url
 
         # Generate or reuse client ID based on request characteristics.
@@ -1821,6 +1842,17 @@ async def head_direct_stream(
     try:
         # The stream_id is now validated by the resolve_stream_id dependency
         stream_info = stream_manager.streams[stream_id]
+
+        # If a prior GET already confirmed this VOD stream is genuine HLS,
+        # keep HEAD consistent with it rather than HEAD-ing the raw URL.
+        if stream_info.is_hls and stream_info.content_type_verified:
+            root_path = getattr(settings, "ROOT_PATH", "")
+            redirect_url = f"{root_path}/hls/{stream_id}/playlist.m3u8"
+            username = request.query_params.get("username")
+            if username:
+                redirect_url += f"?username={username}"
+            return RedirectResponse(url=redirect_url, status_code=302)
+
         stream_url = stream_info.current_url or stream_info.original_url
 
         # Determine content type

@@ -83,6 +83,10 @@ class StreamInfo:
     is_dash: bool = False
     is_vod: bool = False
     is_live_continuous: bool = False
+    # Set once a VOD stream's real content type has been confirmed by probing
+    # the actual playback response (see StreamManager.resolve_vod_content_type),
+    # so we only ever probe a given stream once.
+    content_type_verified: bool = False
     # DASH DRM detection - set once the manifest has been fetched and parsed;
     # used to refuse FFmpeg transcoding of DRM-protected DASH content
     is_encrypted: bool = False
@@ -615,11 +619,12 @@ class StreamManager:
         # Strip query string before checking extension
         path = url.split("?")[0].lower()
 
-        # HLS detection — check path only, not the full URL, to handle query params like ?location=ABC123
-        if path.endswith(".m3u8"):
-            return (True, False, False)
-
-        # VOD/Timeshift detection - these should NOT use strict mode
+        # VOD/Timeshift detection - these should NOT use strict mode.
+        # Checked before the .m3u8 extension check below: provider movie/series
+        # URLs sometimes end in .m3u8 without being genuine HLS (and vice
+        # versa) - path context wins over the extension guess here, and
+        # get_direct_stream()/resolve_vod_content_type() confirm the real
+        # content type from the actual response before serving VOD content.
         if (
             path.endswith((".mp4", ".mkv", ".webm", ".avi"))
             or "/timeshift/" in url_lower
@@ -627,6 +632,10 @@ class StreamManager:
             or "/series/" in url_lower
         ):
             return (False, True, False)
+
+        # HLS detection — check path only, not the full URL, to handle query params like ?location=ABC123
+        if path.endswith(".m3u8"):
+            return (True, False, False)
 
         # Live continuous stream (.ts or live path)
         if path.endswith(".ts") or "/live/" in url_lower:
@@ -1385,6 +1394,63 @@ class StreamManager:
                     pass
             # Signal any remaining subscribers that this primary is also done.
             self._signal_subscribers_end(stream_id)
+
+    async def resolve_vod_content_type(self, stream_id: str) -> None:
+        """Probe a VOD stream's actual playback response to confirm whether it's
+        genuinely HLS. Provider VOD/movie/series URLs sometimes end in .m3u8
+        without being a real HLS playlist (and vice versa), so the URL-based
+        guess in _detect_stream_type() isn't reliable for this content class.
+
+        Runs at most once per stream (content_type_verified). A plain GET with
+        no Range header is used so the sniffed prefix is unambiguously the true
+        start of the body, unlike a Range-based read.
+        """
+        stream_info = self.streams.get(stream_id)
+        if (
+            not stream_info
+            or stream_info.is_transcoded
+            or not stream_info.is_vod
+            or stream_info.content_type_verified
+        ):
+            return
+
+        url = stream_info.current_url or stream_info.original_url
+        headers = {"User-Agent": stream_info.user_agent, "Accept-Encoding": "identity"}
+        headers.update(stream_info.headers)
+
+        response = None
+        try:
+            request = self.http_client.build_request("GET", url, headers=headers)
+            response = await self.http_client.send(request, stream=True)
+            response.raise_for_status()
+
+            prefix = b""
+            async for chunk in response.aiter_bytes():
+                prefix += chunk
+                if len(prefix) >= 10:
+                    break
+
+            is_hls = prefix.startswith(b"#EXTM3U") or prefix.startswith(
+                b"\xef\xbb\xbf#EXTM3U"
+            )
+            stream_info.is_hls = is_hls
+            stream_info.is_vod = not is_hls
+            stream_info.is_live_continuous = False
+            stream_info.content_type_verified = True
+            logger.info(
+                f"VOD content-type probe for stream {stream_id}: "
+                f"{'genuine HLS' if is_hls else 'direct media'}"
+            )
+        except Exception as e:
+            # Leave content_type_verified unset so a later request can retry -
+            # a transient probe failure shouldn't permanently lock in a guess.
+            logger.warning(
+                f"VOD content-type probe failed for stream {stream_id}, "
+                f"keeping default classification: {e}"
+            )
+        finally:
+            if response is not None:
+                await response.aclose()
 
     async def stream_continuous_direct(
         self, stream_id: str, client_id: str, range_header: Optional[str] = None
