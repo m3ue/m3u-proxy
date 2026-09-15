@@ -1,9 +1,11 @@
 # Add src to path first
 from stream_manager import StreamManager
 from api import app, get_content_type, is_direct_stream
+from config import settings
 import httpx
 import asyncio
 import pytest
+from datetime import datetime, timezone, timedelta
 from fastapi.testclient import TestClient
 from unittest.mock import Mock, AsyncMock, patch
 import sys
@@ -44,6 +46,12 @@ class TestHelperFunctions:
         # Live .m3u8 URLs are unaffected - still routed to the HLS endpoint.
         assert is_direct_stream("http://p.example.com/live/u/p/123.m3u8") is False
         assert is_direct_stream("http://p.example.com/hls/stream.m3u8") is False
+        # A live URL that genuinely contains the /movie/ or /series/ path
+        # segment (e.g. an EPG category) must agree with
+        # StreamManager._detect_stream_type()'s /live/ precedence, or the two
+        # classifiers route the same URL inconsistently across entry points.
+        assert is_direct_stream("http://p.example.com/live/movie/u/p/1.m3u8") is False
+        assert is_direct_stream("http://p.example.com/live/series/u/p/1.m3u8") is False
 
 
 class TestAPI:
@@ -475,6 +483,82 @@ class TestAPI:
 
             asyncio.run(run_concurrent())
 
+            assert probe_count == 1
+            assert stream_info.is_hls is True
+            assert stream_info.content_type_verified is True
+        finally:
+            asyncio.run(manager.http_client.aclose())
+            asyncio.run(manager.live_stream_client.aclose())
+
+    def test_probe_failure_does_not_permanently_lock_in_classification(
+        self, monkeypatch
+    ):
+        """A network error during the probe must not mark content_type_verified
+        - otherwise one transient blip on a genuinely-HLS stream would lock it
+        into being served raw forever, the exact bug this probe exists to fix."""
+        manager = StreamManager()
+        vod_url = "http://provider.example.com/movie/1234.m3u8"
+        stream_id = asyncio.run(manager.get_or_create_stream(vod_url))
+        stream_info = manager.streams[stream_id]
+
+        async def fake_send_error(request, stream=True, **kwargs):
+            raise httpx.ConnectTimeout("simulated network blip")
+
+        monkeypatch.setattr(manager.http_client, "send", fake_send_error)
+
+        try:
+            asyncio.run(manager.resolve_vod_content_type(stream_id))
+
+            assert stream_info.content_type_verified is False
+            assert stream_info.content_type_probe_failed_at is not None
+        finally:
+            asyncio.run(manager.http_client.aclose())
+            asyncio.run(manager.live_stream_client.aclose())
+
+    def test_probe_skips_retry_within_cooldown_then_retries_after(self, monkeypatch):
+        """After a failed probe, requests within the cooldown window must not
+        re-probe (avoids hammering a flaky upstream), but a request after the
+        cooldown expires must get a real, fresh answer."""
+        manager = StreamManager()
+        vod_url = "http://provider.example.com/movie/1234.m3u8"
+        stream_id = asyncio.run(manager.get_or_create_stream(vod_url))
+        stream_info = manager.streams[stream_id]
+
+        probe_count = 0
+
+        async def fake_send_success(request, stream=True, **kwargs):
+            nonlocal probe_count
+            probe_count += 1
+
+            class _FakeResponse:
+                status_code = 200
+                headers = {}
+
+                def raise_for_status(self):
+                    pass
+
+                async def aiter_bytes(self):
+                    yield b"#EXTM3U\nrest"
+
+                async def aclose(self):
+                    pass
+
+            return _FakeResponse()
+
+        monkeypatch.setattr(manager.http_client, "send", fake_send_success)
+
+        try:
+            # Simulate a failure that just happened - well within the cooldown.
+            stream_info.content_type_probe_failed_at = datetime.now(timezone.utc)
+            asyncio.run(manager.resolve_vod_content_type(stream_id))
+            assert probe_count == 0
+            assert stream_info.content_type_verified is False
+
+            # Simulate the cooldown having fully elapsed.
+            stream_info.content_type_probe_failed_at = datetime.now(
+                timezone.utc
+            ) - timedelta(seconds=settings.VOD_PROBE_RETRY_COOLDOWN + 1)
+            asyncio.run(manager.resolve_vod_content_type(stream_id))
             assert probe_count == 1
             assert stream_info.is_hls is True
             assert stream_info.content_type_verified is True

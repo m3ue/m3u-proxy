@@ -58,6 +58,13 @@ class Settings(BaseSettings):
     # runs, so a slow-starting upstream must fail fast rather than hang the
     # player for the full VOD stall-tolerance window.
     VOD_PROBE_TIMEOUT: float = 8.0
+    # Cooldown before retrying a VOD content-type probe that errored out
+    # (as opposed to one that succeeded and found non-HLS content). Long
+    # enough that a flaky upstream isn't hammered on every request in a
+    # playback session, short enough that a transient blip on a genuinely-HLS
+    # stream self-heals rather than being served raw for the stream's whole
+    # lifetime.
+    VOD_PROBE_RETRY_COOLDOWN: float = 30.0
 
     # Connection Idle Monitoring - detect and alert on long-held connections that may be resource leaks
     # Alert threshold for connections held idle (warning log when exceeded)

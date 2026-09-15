@@ -85,8 +85,13 @@ class StreamInfo:
     is_live_continuous: bool = False
     # Set once a VOD stream's real content type has been confirmed by probing
     # the actual playback response (see StreamManager.resolve_vod_content_type),
-    # so we only ever probe a given stream once.
+    # so we only ever probe a given stream once it succeeds.
     content_type_verified: bool = False
+    # Set when a probe attempt errors out (as opposed to succeeding and
+    # finding non-HLS content) - gates a cooldown before retrying, so a
+    # flaky upstream isn't reprobed on every request, but the stream also
+    # isn't permanently locked into a wrong guess from one bad attempt.
+    content_type_probe_failed_at: Optional[datetime] = None
     # DASH DRM detection - set once the manifest has been fetched and parsed;
     # used to refuse FFmpeg transcoding of DRM-protected DASH content
     is_encrypted: bool = False
@@ -639,7 +644,9 @@ class StreamManager:
         # this is actually a live channel whose URL happens to also contain
         # "movie"/"series"/"timeshift" (e.g. an EPG category segment).
         if (
-            "/timeshift/" in url_lower or "/movie/" in url_lower or "/series/" in url_lower
+            "/timeshift/" in url_lower
+            or "/movie/" in url_lower
+            or "/series/" in url_lower
         ) and "/live/" not in url_lower:
             return (False, True, False)
 
@@ -673,6 +680,7 @@ class StreamManager:
         stream_info.is_vod = is_vod
         stream_info.is_live_continuous = is_live_continuous
         stream_info.content_type_verified = False
+        stream_info.content_type_probe_failed_at = None
 
     @staticmethod
     def _detect_output_mode(
@@ -1437,13 +1445,16 @@ class StreamManager:
         start of the body, unlike a Range-based read.
         """
         stream_info = self.streams.get(stream_id)
-        if (
-            not stream_info
-            or stream_info.is_transcoded
-            or not stream_info.is_vod
-            or stream_info.content_type_verified
-        ):
+        if not stream_info or stream_info.is_transcoded or not stream_info.is_vod:
             return
+        if stream_info.content_type_verified:
+            return
+        if stream_info.content_type_probe_failed_at is not None:
+            elapsed = (
+                datetime.now(timezone.utc) - stream_info.content_type_probe_failed_at
+            ).total_seconds()
+            if elapsed < settings.VOD_PROBE_RETRY_COOLDOWN:
+                return
 
         # Serialize per stream: VOD playback is normally many concurrent/
         # sequential range requests from the same player, and providers often
@@ -1453,9 +1464,17 @@ class StreamManager:
         lock = self._vod_probe_locks.setdefault(stream_id, asyncio.Lock())
         async with lock:
             # Re-check now that we hold the lock: another request may have
-            # already completed the probe while we were waiting for it.
+            # already completed the probe (or started its own cooldown) while
+            # we were waiting for it.
             if stream_info.content_type_verified:
                 return
+            if stream_info.content_type_probe_failed_at is not None:
+                elapsed = (
+                    datetime.now(timezone.utc)
+                    - stream_info.content_type_probe_failed_at
+                ).total_seconds()
+                if elapsed < settings.VOD_PROBE_RETRY_COOLDOWN:
+                    return
 
             url = stream_info.current_url or stream_info.original_url
             headers = {
@@ -1496,26 +1515,28 @@ class StreamManager:
                 stream_info.is_hls = is_hls
                 stream_info.is_vod = not is_hls
                 stream_info.is_live_continuous = False
+                stream_info.content_type_verified = True
+                stream_info.content_type_probe_failed_at = None
                 logger.info(
                     f"VOD content-type probe for stream {stream_id}: "
                     f"{'genuine HLS' if is_hls else 'direct media'}"
                 )
             except Exception as e:
-                # VOD playback is normally many sequential range requests from
-                # the same player - if we retried on every one of them after a
-                # failed probe, one transient hiccup would multiply into an
-                # extra upstream connection (and this probe's own latency) on
-                # every subsequent request. Keep the current best-guess
-                # classification and move on; this is no worse than the
-                # pre-probe behavior for this stream.
+                # An error here means we don't actually know the real content
+                # type - do NOT set content_type_verified, or one transient
+                # network blip on a genuinely-HLS stream would lock it into
+                # being served raw forever (the exact bug this probe exists to
+                # fix). Instead, start a cooldown so a flaky upstream isn't
+                # reprobed on every request in the meantime, but the stream
+                # still gets a real answer once it recovers.
+                stream_info.content_type_probe_failed_at = datetime.now(timezone.utc)
                 logger.warning(
                     f"VOD content-type probe failed for stream {stream_id}, "
-                    f"keeping default classification: {e}"
+                    f"will retry after {settings.VOD_PROBE_RETRY_COOLDOWN}s: {e}"
                 )
             finally:
                 if response is not None:
                     await response.aclose()
-                stream_info.content_type_verified = True
 
     async def stream_continuous_direct(
         self, stream_id: str, client_id: str, range_header: Optional[str] = None

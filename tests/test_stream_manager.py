@@ -293,18 +293,23 @@ class TestStreamManager:
             "http://p.example.com/series/u/p/123.m3u8"
         ) == (False, True, False)
 
-    def test_detect_stream_type_live_wins_over_movie_series_path(
-        self, stream_manager
-    ):
-        """A live channel URL that merely contains /movie/ or /series/ (e.g.
-        an EPG category segment) must stay live-classified, not fall into the
-        VOD bucket and lose shared-broadcast-connection handling."""
+    def test_detect_stream_type_live_wins_over_movie_series_path(self, stream_manager):
+        """A live channel URL that genuinely contains the /movie/ or /series/
+        path segment (e.g. an EPG category segment) must stay
+        live-classified, not fall into the VOD bucket and lose
+        shared-broadcast-connection handling."""
         assert stream_manager._detect_stream_type(
-            "http://p.example.com/live/movie_channel/u/p/1.m3u8"
+            "http://p.example.com/live/movie/u/p/1.m3u8"
         ) == (True, False, False)
         assert stream_manager._detect_stream_type(
-            "http://p.example.com/live/u/p/1.m3u8"
+            "http://p.example.com/live/series/u/p/1.m3u8"
         ) == (True, False, False)
+        # Sanity check: without the guard, this URL would go through the
+        # VOD-path branch on its own merits - confirms the assertions above
+        # are actually exercising the /live/ precedence, not a no-op.
+        assert stream_manager._detect_stream_type(
+            "http://p.example.com/movie/u/p/1.m3u8"
+        ) == (False, True, False)
 
     def test_get_stream_info_nonexistent(self, stream_manager):
         # Current API doesn't have get_stream_info method

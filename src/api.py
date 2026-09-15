@@ -95,9 +95,17 @@ def is_direct_stream(url: str) -> bool:
     # genuine HLS (and vice versa) - route these through /stream/ like other
     # VOD content, mirroring StreamManager._detect_stream_type(). The runtime
     # content-type probe (StreamManager.resolve_vod_content_type) corrects
-    # this and hands off to /hls/ if the actual response is real HLS.
-    if path.endswith(".m3u8") and (
-        "/movie/" in url_lower or "/series/" in url_lower or "/timeshift/" in url_lower
+    # this and hands off to /hls/ if the actual response is real HLS. An
+    # explicit /live/ marker wins over this, exactly as in
+    # _detect_stream_type() - keep both classifiers in agreement.
+    if (
+        path.endswith(".m3u8")
+        and (
+            "/movie/" in url_lower
+            or "/series/" in url_lower
+            or "/timeshift/" in url_lower
+        )
+        and "/live/" not in url_lower
     ):
         return True
 
@@ -121,10 +129,9 @@ def _hls_redirect_url(
     root_path = getattr(settings, "ROOT_PATH", "")
     redirect_url = f"{root_path}/hls/{stream_id}/playlist.m3u8"
     params = {}
-    # get_client_info() accepts username under any of these aliases - forward
-    # whichever one the caller actually used so it isn't silently dropped.
-    qp = request.query_params
-    username = qp.get("username") or qp.get("user") or qp.get("u")
+    # Reuse get_client_info()'s own alias/header resolution instead of
+    # duplicating it here, so this stays in sync with what it actually accepts.
+    username = get_client_info(request).get("username")
     if username:
         params["username"] = username
     if client_id:
@@ -2389,6 +2396,7 @@ async def delete_oldest_stream_by_metadata(
             del stream_manager.streams[oldest_stream_id]
         if oldest_stream_id in stream_manager.stream_clients:
             del stream_manager.stream_clients[oldest_stream_id]
+        stream_manager._vod_probe_locks.pop(oldest_stream_id, None)
 
         stream_manager._stats.active_streams -= 1
 
@@ -2539,6 +2547,7 @@ async def delete_streams_by_metadata(
                     del stream_manager.streams[stream_id]
                 if stream_id in stream_manager.stream_clients:
                     del stream_manager.stream_clients[stream_id]
+                stream_manager._vod_probe_locks.pop(stream_id, None)
 
                 stream_manager._stats.active_streams -= 1
                 deleted_streams.append(stream_id)
@@ -2602,6 +2611,7 @@ async def delete_stream(stream_id: str):
             del stream_manager.streams[stream_id]
         if stream_id in stream_manager.stream_clients:
             del stream_manager.stream_clients[stream_id]
+        stream_manager._vod_probe_locks.pop(stream_id, None)
 
         stream_manager._stats.active_streams -= 1
 
