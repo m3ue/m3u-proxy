@@ -370,6 +370,24 @@ class DashProcessor:
             return content
 
 
+def is_vod_path_marker(url: str) -> bool:
+    """True if the URL's path signals on-demand movie/series/timeshift
+    content, unless an explicit /live/ marker overrides it (a stronger,
+    more specific signal that this is actually a live channel whose URL
+    happens to also contain one of those words, e.g. an EPG category
+    segment). Shared by StreamManager._detect_stream_type() and
+    api.is_direct_stream() so the two classifiers can't drift out of
+    agreement on this specific check - as they did twice before this was
+    factored out (once when the /live/ exception was added to only one of
+    them, once when the .m3u8-only extension gating was added to only one
+    of them).
+    """
+    url_lower = url.lower()
+    return (
+        "/movie/" in url_lower or "/series/" in url_lower or "/timeshift/" in url_lower
+    ) and "/live/" not in url_lower
+
+
 class StreamManager:
     # Extensions that unambiguously identify raw video regardless of path -
     # shared between _detect_stream_type() and resolve_vod_content_type() so
@@ -644,15 +662,8 @@ class StreamManager:
         # being genuine HLS (and vice versa), so this path context is checked
         # before the .m3u8 extension check below - get_direct_stream()/
         # resolve_vod_content_type() confirm the real content type from the
-        # actual response before serving VOD content. An explicit /live/
-        # marker wins over this: it's a stronger, more specific signal that
-        # this is actually a live channel whose URL happens to also contain
-        # "movie"/"series"/"timeshift" (e.g. an EPG category segment).
-        if (
-            "/timeshift/" in url_lower
-            or "/movie/" in url_lower
-            or "/series/" in url_lower
-        ) and "/live/" not in url_lower:
+        # actual response before serving VOD content.
+        if is_vod_path_marker(url):
             return (False, True, False)
 
         # HLS detection - check path only, not the full URL, to handle query params like ?location=ABC123
@@ -669,18 +680,45 @@ class StreamManager:
     def _reset_content_type_for_new_url(
         self, stream_info: "StreamInfo", new_url: str
     ) -> None:
-        """Re-derive a stream's type guess for a failover URL and clear
-        content_type_verified so resolve_vod_content_type() re-confirms it
-        for real on the next request. A failover URL can be a different
-        provider/backend entirely - keeping the old URL's verified
-        classification would let a genuinely-HLS backup keep being served raw
-        (or vice versa), reproducing the exact bug this probe exists to fix.
-        Transcoded streams are exempt - they're never probed in the first
-        place, since their served content is FFmpeg's output.
+        """Handle a stream's URL changing (failover, or sticky-session
+        recovery reverting to the entry point) by clearing any stale
+        content-type verification for the old URL, so resolve_vod_content_type()
+        re-confirms it for real on the next request. Centralizes every write
+        to is_hls/is_vod/is_live_continuous/content_type_verified triggered by
+        a URL change - callers must never set these fields directly, or the
+        invariants enforced here (see below) get bypassed.
+
+        The new URL can be a different provider/backend entirely - keeping
+        the old URL's verified classification would let a genuinely-HLS
+        backup keep being served raw (or vice versa), reproducing the exact
+        bug this probe exists to fix.
+
+        Only ever reclassifies a stream that's already in the "VOD" category
+        (is_vod=True) - a stream that started out live/continuous keeps that
+        category for its whole lifetime, regardless of what a failover URL's
+        shape suggests. This is deliberate, not an oversight: live streams
+        are never probed in the first place (resolve_vod_content_type() only
+        ever runs for is_vod=True streams), and flipping a live stream's
+        category mid-lifetime would silently orphan its existing
+        broadcast-sharing subscribers (stream_continuous_direct() gates
+        connection sharing on is_vod) and pick the wrong httpx client/timeout
+        profile for it (chosen from is_live_continuous elsewhere). VOD
+        streams have no such live infrastructure to disrupt, so re-deriving
+        their finer-grained is_hls/is_vod split from the new URL is safe.
+
+        Transcoded streams are exempt entirely - they're never probed, since
+        their served content is FFmpeg's output, not the source URL's.
         """
-        if stream_info.is_transcoded:
+        if stream_info.is_transcoded or not stream_info.is_vod:
             return
         is_hls, is_vod, is_live_continuous = self._detect_stream_type(new_url)
+        if not is_vod:
+            # The new URL doesn't even look VOD-shaped by heuristic (e.g. it
+            # matches /live/) - this stream's category is locked to VOD (see
+            # above), so treat it as an unverified VOD source rather than
+            # silently reclassifying its category out from under
+            # downstream logic that already depends on it.
+            is_hls, is_vod, is_live_continuous = False, True, False
         stream_info.is_hls = is_hls
         stream_info.is_vod = is_vod
         stream_info.is_live_continuous = is_live_continuous
@@ -802,7 +840,16 @@ class StreamManager:
                 self.stream_clients.pop(stream_id, None)
                 self._direct_broadcast_primary.pop(stream_id, None)
                 self._direct_broadcast_queues.pop(stream_id, None)
-                self._vod_probe_locks.pop(stream_id, None)
+                # Deliberately NOT popping _vod_probe_locks here: this is a
+                # same-stream_id recycle, not a real teardown, and a probe
+                # for the just-replaced StreamInfo could still be in flight.
+                # Popping would hand the fresh session a brand-new Lock
+                # object, letting its own probe run concurrently with the
+                # stale one instead of serializing behind it - reopening the
+                # exact "second concurrent upstream connection" race this
+                # lock exists to prevent. The Lock is cheap to keep around
+                # and stream_id is stable across a recycle, so reusing it is
+                # correct, not a leak.
                 self._stats.active_streams = max(0, self._stats.active_streams - 1)
 
         if stream_id not in self.streams:
@@ -1523,14 +1570,17 @@ class StreamManager:
                 response.raise_for_status()
 
                 prefix = b""
+                # 32 bytes rather than a bare 10: a non-conformant but genuine
+                # HLS server can emit a leading blank line, BOM, or other
+                # whitespace before #EXTM3U. Too small a window here would cut
+                # the tag off entirely and misclassify - and unlike a wrong
+                # guess elsewhere, this one gets locked in as "verified".
                 async for chunk in response.aiter_bytes():
                     prefix += chunk
-                    if len(prefix) >= 10:
+                    if len(prefix) >= 32:
                         break
 
-                is_hls = prefix.startswith(b"#EXTM3U") or prefix.startswith(
-                    b"\xef\xbb\xbf#EXTM3U"
-                )
+                is_hls = prefix.lstrip(b"\xef\xbb\xbf \t\r\n").startswith(b"#EXTM3U")
                 # A failover can swap in a new URL (and reset classification
                 # for it) while this probe was awaiting the old URL's
                 # response. Committing this result then would overwrite the
@@ -1775,6 +1825,9 @@ class StreamManager:
                         f"Reverting to configured entry point."
                     )
                     stream_info.current_url = None
+                    self._reset_content_type_for_new_url(
+                        stream_info, stream_info.original_url
+                    )
                     return True
 
                 return False
@@ -4473,6 +4526,9 @@ class StreamManager:
                             f"Sticky origin {stream_info.current_url} failed. Reverting to original configured entry point."
                         )
                         stream_info.current_url = None
+                        self._reset_content_type_for_new_url(
+                            stream_info, stream_info.original_url
+                        )
 
                 # Try failover if available and not the last attempt
                 has_failovers = bool(

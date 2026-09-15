@@ -14,7 +14,7 @@ from pydantic import BaseModel, field_validator
 from datetime import datetime, timezone
 import os
 
-from stream_manager import StreamManager, StreamInfo, DashProcessor
+from stream_manager import StreamManager, StreamInfo, DashProcessor, is_vod_path_marker
 from events import EventManager
 from models import StreamEvent, EventType, WebhookConfig
 from config import settings, VERSION
@@ -89,24 +89,17 @@ def is_direct_stream(url: str) -> bool:
     """Check if URL is a direct stream (not HLS playlist, not DASH manifest)"""
     # Split off query string before checking extension
     path = str(url).split("?")[0].lower()
-    url_lower = str(url).lower()
 
-    # Provider VOD/movie/series URLs sometimes end in .m3u8 without being
-    # genuine HLS (and vice versa) - route these through /stream/ like other
-    # VOD content, mirroring StreamManager._detect_stream_type(). The runtime
-    # content-type probe (StreamManager.resolve_vod_content_type) corrects
-    # this and hands off to /hls/ if the actual response is real HLS. An
-    # explicit /live/ marker wins over this, exactly as in
-    # _detect_stream_type() - keep both classifiers in agreement.
-    if (
-        path.endswith(".m3u8")
-        and (
-            "/movie/" in url_lower
-            or "/series/" in url_lower
-            or "/timeshift/" in url_lower
-        )
-        and "/live/" not in url_lower
-    ):
+    # Provider VOD/movie/series/timeshift URLs are on-demand content
+    # regardless of extension - including ending in .m3u8 without being
+    # genuine HLS, or having no extension at all. Uses the exact same check
+    # as StreamManager._detect_stream_type() (imported, not reimplemented)
+    # so the two classifiers can't drift out of agreement - an extensionless
+    # /movie/12345 URL must get the same answer here as it does internally.
+    # The runtime content-type probe (StreamManager.resolve_vod_content_type)
+    # corrects the .m3u8 case and hands off to /hls/ if the actual response
+    # is real HLS.
+    if is_vod_path_marker(url):
         return True
 
     # M3U8 and MPD URLs are always routed to their own handlers, even if

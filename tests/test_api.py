@@ -53,6 +53,17 @@ class TestHelperFunctions:
         assert is_direct_stream("http://p.example.com/live/movie/u/p/1.m3u8") is False
         assert is_direct_stream("http://p.example.com/live/series/u/p/1.m3u8") is False
 
+    def test_is_direct_stream_vod_path_extensionless(self):
+        """The movie/series/timeshift carve-out must apply regardless of
+        extension, matching StreamManager._detect_stream_type() exactly - an
+        extensionless /movie/12345 URL is flagged VOD internally regardless
+        of extension, so is_direct_stream() must agree here too."""
+        assert is_direct_stream("http://p.example.com/movie/u/p/12345") is True
+        assert is_direct_stream("http://p.example.com/series/u/p/12345") is True
+        assert (
+            is_direct_stream("http://p.example.com/timeshift/u/p/1/2/12345") is True
+        )
+
 
 class TestAPI:
     """Test FastAPI endpoints"""
@@ -515,6 +526,96 @@ class TestAPI:
             assert probe_called is False
             assert stream_info.content_type_verified is True
             assert stream_info.is_vod is True
+        finally:
+            asyncio.run(manager.http_client.aclose())
+            asyncio.run(manager.live_stream_client.aclose())
+
+    def test_probe_tolerates_leading_whitespace_before_extm3u(self, monkeypatch):
+        """A non-conformant but genuine HLS server can emit a leading blank
+        line or BOM before #EXTM3U - too tight a byte window or a strict
+        startswith() would misclassify it as raw and lock that in forever."""
+        manager = StreamManager()
+        vod_url = "http://provider.example.com/movie/1234.m3u8"
+        stream_id = asyncio.run(manager.get_or_create_stream(vod_url))
+        stream_info = manager.streams[stream_id]
+
+        class _FakeResponse:
+            status_code = 200
+            headers = {}
+
+            def raise_for_status(self):
+                pass
+
+            async def aiter_bytes(self):
+                yield b"\n\n#EXTM3U\n#EXT-X-VERSION:3\nrest-of-playlist"
+
+            async def aclose(self):
+                pass
+
+        async def fake_send(request, stream=True, **kwargs):
+            return _FakeResponse()
+
+        monkeypatch.setattr(manager.http_client, "send", fake_send)
+
+        try:
+            asyncio.run(manager.resolve_vod_content_type(stream_id))
+
+            assert stream_info.is_hls is True
+            assert stream_info.content_type_verified is True
+        finally:
+            asyncio.run(manager.http_client.aclose())
+            asyncio.run(manager.live_stream_client.aclose())
+
+    def test_failover_never_flips_live_stream_to_vod_category(self, monkeypatch):
+        """A failover URL's shape must never change a live/continuous
+        stream's fundamental category - doing so would orphan its existing
+        broadcast-sharing subscribers (gated on is_vod) and pick the wrong
+        httpx client/timeout profile (chosen from is_live_continuous)."""
+        manager = StreamManager()
+        # Primary looks live; failover URL happens to look VOD-shaped.
+        primary_url = "http://primary.example.com/live/u/p/1.ts"
+        failover_url = "http://backup.example.com/movie/u/p/1.mp4"
+
+        stream_id = asyncio.run(
+            manager.get_or_create_stream(primary_url, failover_urls=[failover_url])
+        )
+        stream_info = manager.streams[stream_id]
+        assert stream_info.is_live_continuous is True
+        assert stream_info.is_vod is False
+
+        try:
+            asyncio.run(
+                manager._try_update_failover_url(stream_id, "test_reason")
+            )
+
+            assert stream_info.current_url == failover_url
+            # Category is locked - still live, not reclassified as VOD.
+            assert stream_info.is_live_continuous is True
+            assert stream_info.is_vod is False
+            # Never eligible for probing in the first place, so untouched.
+            assert stream_info.content_type_verified is False
+        finally:
+            asyncio.run(manager.http_client.aclose())
+            asyncio.run(manager.live_stream_client.aclose())
+
+    def test_recycled_stream_keeps_its_probe_lock(self):
+        """Recycling an orphaned stream_id (0 clients) must not pop its
+        probe lock - a probe for the just-replaced StreamInfo could still be
+        in flight, and popping would hand the fresh session a brand-new Lock,
+        letting two probes run concurrently against the same provider."""
+        manager = StreamManager()
+        vod_url = "http://provider.example.com/movie/1234.m3u8"
+
+        try:
+            stream_id = asyncio.run(manager.get_or_create_stream(vod_url))
+            lock_before = manager._vod_probe_locks.setdefault(
+                stream_id, asyncio.Lock()
+            )
+
+            # Recycle: same stream_id, 0 clients, requested again.
+            asyncio.run(manager.get_or_create_stream(vod_url))
+
+            assert manager._vod_probe_locks.get(stream_id) is lock_before
         finally:
             asyncio.run(manager.http_client.aclose())
             asyncio.run(manager.live_stream_client.aclose())

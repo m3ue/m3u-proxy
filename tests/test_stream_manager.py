@@ -1,4 +1,10 @@
-from stream_manager import StreamManager, ClientInfo, StreamInfo, M3U8Processor
+from stream_manager import (
+    StreamManager,
+    ClientInfo,
+    StreamInfo,
+    M3U8Processor,
+    is_vod_path_marker,
+)
 import pytest
 import asyncio
 from datetime import datetime, timezone
@@ -310,6 +316,18 @@ class TestStreamManager:
         assert stream_manager._detect_stream_type(
             "http://p.example.com/movie/u/p/1.m3u8"
         ) == (False, True, False)
+
+    def test_is_vod_path_marker_shared_by_both_classifiers(self):
+        """_detect_stream_type() and api.is_direct_stream() both delegate to
+        this function for the movie/series/timeshift/live check - a direct
+        test here pins the contract both actually rely on, instead of only
+        being verified indirectly through each classifier's own tests."""
+        assert is_vod_path_marker("http://p.example.com/movie/u/p/1.m3u8") is True
+        assert is_vod_path_marker("http://p.example.com/movie/u/p/1") is True
+        assert (
+            is_vod_path_marker("http://p.example.com/live/movie/u/p/1.m3u8") is False
+        )
+        assert is_vod_path_marker("http://p.example.com/live/u/p/1.ts") is False
 
     def test_get_stream_info_nonexistent(self, stream_manager):
         # Current API doesn't have get_stream_info method
