@@ -626,17 +626,21 @@ class StreamManager:
         path = url.split("?")[0].lower()
 
         # VOD/Timeshift detection - these should NOT use strict mode.
-        # Checked before the .m3u8 extension check below: provider movie/series
-        # URLs sometimes end in .m3u8 without being genuine HLS (and vice
-        # versa) - path context wins over the extension guess here, and
-        # get_direct_stream()/resolve_vod_content_type() confirm the real
-        # content type from the actual response before serving VOD content.
+        # Unambiguous raw video extensions are always on-demand, regardless of path.
+        if path.endswith((".mp4", ".mkv", ".webm", ".avi")):
+            return (False, True, False)
+
+        # Provider movie/series/timeshift URLs sometimes end in .m3u8 without
+        # being genuine HLS (and vice versa), so this path context is checked
+        # before the .m3u8 extension check below - get_direct_stream()/
+        # resolve_vod_content_type() confirm the real content type from the
+        # actual response before serving VOD content. An explicit /live/
+        # marker wins over this: it's a stronger, more specific signal that
+        # this is actually a live channel whose URL happens to also contain
+        # "movie"/"series"/"timeshift" (e.g. an EPG category segment).
         if (
-            path.endswith((".mp4", ".mkv", ".webm", ".avi"))
-            or "/timeshift/" in url_lower
-            or "/movie/" in url_lower
-            or "/series/" in url_lower
-        ):
+            "/timeshift/" in url_lower or "/movie/" in url_lower or "/series/" in url_lower
+        ) and "/live/" not in url_lower:
             return (False, True, False)
 
         # HLS detection - check path only, not the full URL, to handle query params like ?location=ABC123
@@ -649,6 +653,26 @@ class StreamManager:
 
         # Default: treat as live continuous
         return (False, False, True)
+
+    def _reset_content_type_for_new_url(
+        self, stream_info: "StreamInfo", new_url: str
+    ) -> None:
+        """Re-derive a stream's type guess for a failover URL and clear
+        content_type_verified so resolve_vod_content_type() re-confirms it
+        for real on the next request. A failover URL can be a different
+        provider/backend entirely - keeping the old URL's verified
+        classification would let a genuinely-HLS backup keep being served raw
+        (or vice versa), reproducing the exact bug this probe exists to fix.
+        Transcoded streams are exempt - they're never probed in the first
+        place, since their served content is FFmpeg's output.
+        """
+        if stream_info.is_transcoded:
+            return
+        is_hls, is_vod, is_live_continuous = self._detect_stream_type(new_url)
+        stream_info.is_hls = is_hls
+        stream_info.is_vod = is_vod
+        stream_info.is_live_continuous = is_live_continuous
+        stream_info.content_type_verified = False
 
     @staticmethod
     def _detect_output_mode(
@@ -3968,6 +3992,7 @@ class StreamManager:
             # Note: current_failover_index is already incremented by _resolve_next_failover_url
             stream_info.failover_attempts += 1
             stream_info.last_failover_time = datetime.now(timezone.utc)
+            self._reset_content_type_for_new_url(stream_info, next_url)
 
             logger.info(f"Seamless failover successful for stream {stream_id}")
 
@@ -4958,6 +4983,7 @@ class StreamManager:
         stream_info.current_url = next_url
         stream_info.failover_attempts += 1
         stream_info.last_failover_time = datetime.now(timezone.utc)
+        self._reset_content_type_for_new_url(stream_info, next_url)
 
         logger.info(
             f"Failover triggered for stream {stream_id} (reason: {reason}): {old_url} -> {stream_info.current_url}"

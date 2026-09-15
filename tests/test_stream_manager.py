@@ -283,6 +283,29 @@ class TestStreamManager:
         stream_id2 = await stream_manager.get_or_create_stream(url)
         assert stream_id == stream_id2
 
+    def test_detect_stream_type_movie_series_m3u8_is_vod(self, stream_manager):
+        """Provider movie/series URLs ending in .m3u8 aren't reliably real
+        HLS - path context should win over the extension guess."""
+        assert stream_manager._detect_stream_type(
+            "http://p.example.com/movie/u/p/123.m3u8"
+        ) == (False, True, False)
+        assert stream_manager._detect_stream_type(
+            "http://p.example.com/series/u/p/123.m3u8"
+        ) == (False, True, False)
+
+    def test_detect_stream_type_live_wins_over_movie_series_path(
+        self, stream_manager
+    ):
+        """A live channel URL that merely contains /movie/ or /series/ (e.g.
+        an EPG category segment) must stay live-classified, not fall into the
+        VOD bucket and lose shared-broadcast-connection handling."""
+        assert stream_manager._detect_stream_type(
+            "http://p.example.com/live/movie_channel/u/p/1.m3u8"
+        ) == (True, False, False)
+        assert stream_manager._detect_stream_type(
+            "http://p.example.com/live/u/p/1.m3u8"
+        ) == (True, False, False)
+
     def test_get_stream_info_nonexistent(self, stream_manager):
         # Current API doesn't have get_stream_info method
         # Instead, check that stream doesn't exist in streams dict

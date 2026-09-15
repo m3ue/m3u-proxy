@@ -568,6 +568,48 @@ class TestAPI:
             asyncio.run(manager.http_client.aclose())
             asyncio.run(manager.live_stream_client.aclose())
 
+    def test_hls_redirect_forwards_username_shorthand_aliases(self, monkeypatch):
+        """get_client_info() accepts username under 'user' or 'u' as well as
+        'username' - the redirect must not silently drop those aliases."""
+        manager = StreamManager()
+        vod_url = "http://provider.example.com/movie/1234.m3u8"
+
+        class _FakeResponse:
+            status_code = 200
+            headers = {}
+
+            def raise_for_status(self):
+                pass
+
+            async def aiter_bytes(self):
+                yield b"#EXTM3U\nrest"
+
+            async def aclose(self):
+                pass
+
+        async def fake_send(request, stream=True, **kwargs):
+            return _FakeResponse()
+
+        monkeypatch.setattr(manager.http_client, "send", fake_send)
+
+        try:
+            with patch("api.stream_manager", manager):
+                client = TestClient(app)
+                for i, alias in enumerate(("user", "u")):
+                    stream_id = asyncio.run(
+                        manager.get_or_create_stream(f"{vod_url}?variant={i}")
+                    )
+                    response = client.get(
+                        f"/stream/{stream_id}",
+                        params={alias: "bob"},
+                        follow_redirects=False,
+                    )
+                    assert response.status_code == 302
+                    assert "username=bob" in response.headers["location"]
+        finally:
+            asyncio.run(manager.http_client.aclose())
+            asyncio.run(manager.live_stream_client.aclose())
+
     def test_direct_stream_endpoint_recovers_from_redirect_502(self, monkeypatch):
         """API regression: /stream recovers when sticky redirected upstream returns 502 on reconnect."""
         manager = StreamManager()

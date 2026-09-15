@@ -553,6 +553,29 @@ class TestFailoverStats:
             manager._running = False
 
     @pytest.mark.asyncio
+    async def test_failover_resets_content_type_verification(self, stream_manager):
+        """A failover URL can be a different provider/backend entirely, so a
+        stale content_type_verified from the old URL must not stick - a
+        genuinely-HLS backup would otherwise keep being served raw forever."""
+        primary_url = "http://primary.example.com/movie/u/p/123.m3u8"
+        failover_url = "http://backup.example.com/movie/u/p/123.m3u8"
+
+        stream_id = await stream_manager.get_or_create_stream(
+            primary_url, failover_urls=[failover_url]
+        )
+        stream_info = stream_manager.streams[stream_id]
+        assert stream_info.is_vod is True
+
+        # Simulate the primary having already been probed and confirmed raw.
+        stream_info.content_type_verified = True
+
+        await stream_manager._try_update_failover_url(stream_id, "test_reason")
+
+        assert stream_info.current_url == failover_url
+        assert stream_info.content_type_verified is False
+        assert stream_info.is_vod is True
+
+    @pytest.mark.asyncio
     async def test_failover_attempt_tracking(self, stream_manager):
         """Test that failover attempts are tracked"""
         primary_url = "http://primary.example.com/stream.ts"

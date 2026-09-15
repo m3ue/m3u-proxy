@@ -121,7 +121,10 @@ def _hls_redirect_url(
     root_path = getattr(settings, "ROOT_PATH", "")
     redirect_url = f"{root_path}/hls/{stream_id}/playlist.m3u8"
     params = {}
-    username = request.query_params.get("username")
+    # get_client_info() accepts username under any of these aliases - forward
+    # whichever one the caller actually used so it isn't silently dropped.
+    qp = request.query_params
+    username = qp.get("username") or qp.get("user") or qp.get("u")
     if username:
         params["username"] = username
     if client_id:
@@ -129,6 +132,31 @@ def _hls_redirect_url(
     if params:
         redirect_url += f"?{urlencode(params)}"
     return redirect_url
+
+
+async def _probe_and_redirect_if_hls(
+    stream_manager: StreamManager,
+    stream_info,
+    stream_id: str,
+    request: Request,
+    client_id: Optional[str] = None,
+) -> Optional[RedirectResponse]:
+    """Shared by get_direct_stream/head_direct_stream: confirm a VOD stream's
+    real content type (once) and, if it's genuine HLS, redirect to the HLS
+    endpoint instead of streaming it as raw bytes. Returns None when the
+    caller should proceed with its normal direct-stream handling."""
+    if (
+        not stream_info.is_transcoded
+        and stream_info.is_vod
+        and not stream_info.content_type_verified
+    ):
+        await stream_manager.resolve_vod_content_type(stream_id)
+    if not stream_info.is_transcoded and stream_info.is_hls:
+        return RedirectResponse(
+            url=_hls_redirect_url(stream_id, request, client_id),
+            status_code=302,
+        )
+    return None
 
 
 def detect_https_from_headers(request: Request) -> bool:
@@ -1689,19 +1717,11 @@ async def get_direct_stream(
         # actually being genuine HLS (the URL extension alone isn't reliable
         # for this content class). Probe once and hand off to the HLS
         # endpoint if so, instead of streaming a master playlist as raw bytes.
-        # Transcoded streams are exempt - their served content is FFmpeg's
-        # output, not the source URL, so the source's content type is moot.
-        if (
-            not stream_info.is_transcoded
-            and stream_info.is_vod
-            and not stream_info.content_type_verified
-        ):
-            await stream_manager.resolve_vod_content_type(stream_id)
-        if not stream_info.is_transcoded and stream_info.is_hls:
-            return RedirectResponse(
-                url=_hls_redirect_url(stream_id, request, client_id),
-                status_code=302,
-            )
+        redirect = await _probe_and_redirect_if_hls(
+            stream_manager, stream_info, stream_id, request, client_id
+        )
+        if redirect is not None:
+            return redirect
 
         stream_url = stream_info.current_url or stream_info.original_url
 
@@ -1874,17 +1894,11 @@ async def head_direct_stream(
 
         # Probe and redirect exactly as the GET handler does - a player may
         # issue HEAD before its first GET, and that must not bypass detection.
-        if (
-            not stream_info.is_transcoded
-            and stream_info.is_vod
-            and not stream_info.content_type_verified
-        ):
-            await stream_manager.resolve_vod_content_type(stream_id)
-        if not stream_info.is_transcoded and stream_info.is_hls:
-            return RedirectResponse(
-                url=_hls_redirect_url(stream_id, request, client_id),
-                status_code=302,
-            )
+        redirect = await _probe_and_redirect_if_hls(
+            stream_manager, stream_info, stream_id, request, client_id
+        )
+        if redirect is not None:
+            return redirect
 
         stream_url = stream_info.current_url or stream_info.original_url
 
