@@ -84,6 +84,10 @@ class StreamInfo:
     is_dash: bool = False
     is_vod: bool = False
     is_live_continuous: bool = False
+    # Set once the actual playback response has confirmed the stream type
+    # (see auto-detection in get_playlist_content), so a later transient
+    # error response can't flip an already-confirmed classification.
+    content_type_verified: bool = False
     # DASH DRM detection - set once the manifest has been fetched and parsed;
     # used to refuse FFmpeg transcoding of DRM-protected DASH content
     is_encrypted: bool = False
@@ -4009,7 +4013,11 @@ class StreamManager:
                                     f"HLS failover successful for stream {stream_id}, retrying with new URL"
                                 )
                                 return await self.get_playlist_content(
-                                    stream_id, client_id, base_proxy_url
+                                    stream_id,
+                                    client_id,
+                                    base_proxy_url,
+                                    allow_direct=allow_direct,
+                                    range_header=range_header,
                                 )
                         # No failover available or failover failed
                         logger.error(
@@ -4065,7 +4073,11 @@ class StreamManager:
                                         f"HLS failover successful for stream {stream_id}, retrying with new URL"
                                     )
                                     return await self.get_playlist_content(
-                                        stream_id, client_id, base_proxy_url
+                                        stream_id,
+                                        client_id,
+                                        base_proxy_url,
+                                        allow_direct=allow_direct,
+                                        range_header=range_header,
                                     )
                             # No failover available or failover failed
                             logger.error(
@@ -4115,7 +4127,11 @@ class StreamManager:
                                         f"HLS failover successful for stream {stream_id}, retrying with new URL"
                                     )
                                     return await self.get_playlist_content(
-                                        stream_id, client_id, base_proxy_url
+                                        stream_id,
+                                        client_id,
+                                        base_proxy_url,
+                                        allow_direct=allow_direct,
+                                        range_header=range_header,
                                     )
                             # No failover available or failover failed
                             logger.error(
@@ -4166,9 +4182,19 @@ class StreamManager:
                             final_url,
                             parent_stream_id=parent_id,
                         )
-                        processed_content = processor.process_playlist(
-                            playlist_text, base_proxy_url, base_url
-                        )
+                        try:
+                            processed_content = processor.process_playlist(
+                                playlist_text, base_proxy_url, base_url
+                            )
+                        except ValueError as e:
+                            # A malformed playlist here means FFmpeg's output is
+                            # transiently unreadable (e.g. mid-write). Fail cleanly
+                            # rather than falling through to fetch the untranscoded
+                            # source below, which would bypass transcoding entirely.
+                            logger.error(
+                                f"Malformed transcoded playlist for stream {stream_id}: {e}"
+                            )
+                            return None
 
                         stream_info.last_access = datetime.now(timezone.utc)
                         if client_id in self.clients:
@@ -4220,7 +4246,11 @@ class StreamManager:
                     )
                     response = await self.http_client.send(request, stream=True)
                     try:
-                        if response.status_code != 416:
+                        # A 416 is only a legitimate, non-error response when it's
+                        # answering a Range we forwarded (e.g. a player's seekability
+                        # probe). A spontaneous 416 with no Range sent is a genuine
+                        # upstream error and should still trigger failover below.
+                        if not (range_header and response.status_code == 416):
                             response.raise_for_status()
                         chunks = response.aiter_bytes()
                         prefix = b""
@@ -4233,26 +4263,30 @@ class StreamManager:
                             b"\xef\xbb\xbf#EXTM3U"
                         )
                         if not is_hls:
-                            stream_info.is_hls = False
-                            stream_info.is_vod = True
-                            stream_info.is_live_continuous = False
+                            # Only commit the classification once: a later transient
+                            # error response (e.g. a "stream offline" holding page)
+                            # must not flip an already-confirmed stream type.
+                            if not stream_info.content_type_verified:
+                                stream_info.is_hls = False
+                                stream_info.is_vod = True
+                                stream_info.is_live_continuous = False
+                                stream_info.content_type_verified = True
 
                             async def direct_body():
-                                try:
-                                    yield prefix
-                                    async for chunk in chunks:
-                                        now = datetime.now(timezone.utc)
-                                        stream_info.last_access = now
-                                        if client_id in self.clients:
-                                            self.clients[client_id].last_access = now
-                                            self.clients[client_id].last_data_time = now
-                                            self.clients[client_id].bytes_served += len(
-                                                chunk
-                                            )
-                                        stream_info.total_bytes_served += len(chunk)
-                                        yield chunk
-                                finally:
-                                    await response.aclose()
+                                # response.aclose() runs via the BackgroundTask below
+                                # once Starlette finishes sending this body.
+                                yield prefix
+                                async for chunk in chunks:
+                                    now = datetime.now(timezone.utc)
+                                    stream_info.last_access = now
+                                    if client_id in self.clients:
+                                        self.clients[client_id].last_access = now
+                                        self.clients[client_id].last_data_time = now
+                                        self.clients[client_id].bytes_served += len(
+                                            chunk
+                                        )
+                                    stream_info.total_bytes_served += len(chunk)
+                                    yield chunk
 
                             response_headers = {
                                 key: response.headers[key]
@@ -4273,6 +4307,22 @@ class StreamManager:
                                 response_headers["content-type"] = (
                                     "application/octet-stream"
                                 )
+
+                            final_url = str(response.url)
+                            stream_info.final_playlist_url = final_url
+                            # STICKY SESSION HANDLER: see the identical block below
+                            # for HLS responses - applied here too so direct-video
+                            # responses also stick to the resolved backend origin.
+                            if (
+                                stream_info.use_sticky_session
+                                and current_url
+                                and final_url != current_url
+                            ):
+                                stream_info.current_url = final_url
+                                logger.debug(
+                                    f"Sticky session: Locking stream {stream_id} to origin: {final_url}"
+                                )
+
                             return StreamingResponse(
                                 direct_body(),
                                 status_code=response.status_code,
@@ -4281,7 +4331,11 @@ class StreamManager:
                             )
                         content = prefix + b"".join([chunk async for chunk in chunks])
                         content = content.decode("utf-8-sig")
-                        stream_info.is_hls = True
+                        if not stream_info.content_type_verified:
+                            stream_info.is_hls = True
+                            stream_info.is_vod = False
+                            stream_info.is_live_continuous = False
+                            stream_info.content_type_verified = True
                     except BaseException:
                         await response.aclose()
                         raise
