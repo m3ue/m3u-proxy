@@ -371,6 +371,11 @@ class DashProcessor:
 
 
 class StreamManager:
+    # Extensions that unambiguously identify raw video regardless of path -
+    # shared between _detect_stream_type() and resolve_vod_content_type() so
+    # the two never drift: a URL matching this is never worth probing.
+    _UNAMBIGUOUS_RAW_VIDEO_EXTENSIONS = (".mp4", ".mkv", ".webm", ".avi")
+
     def __init__(self, redis_url: Optional[str] = None, enable_pooling: bool = True):
         self.streams: Dict[str, StreamInfo] = {}
         self.clients: Dict[str, ClientInfo] = {}
@@ -632,7 +637,7 @@ class StreamManager:
 
         # VOD/Timeshift detection - these should NOT use strict mode.
         # Unambiguous raw video extensions are always on-demand, regardless of path.
-        if path.endswith((".mp4", ".mkv", ".webm", ".avi")):
+        if path.endswith(self._UNAMBIGUOUS_RAW_VIDEO_EXTENSIONS):
             return (False, True, False)
 
         # Provider movie/series/timeshift URLs sometimes end in .m3u8 without
@@ -1449,6 +1454,18 @@ class StreamManager:
             return
         if stream_info.content_type_verified:
             return
+
+        # Only ambiguous VOD sources need probing. A URL with a definite raw
+        # video extension is unambiguous by construction (the same check
+        # _detect_stream_type() uses to classify it as VOD in the first
+        # place) and never needs the extra upstream connection and latency
+        # this probe costs - skip it and treat the URL's own guess as final.
+        probe_url = stream_info.current_url or stream_info.original_url
+        if probe_url.split("?")[0].lower().endswith(
+            self._UNAMBIGUOUS_RAW_VIDEO_EXTENSIONS
+        ):
+            stream_info.content_type_verified = True
+            return
         if stream_info.content_type_probe_failed_at is not None:
             elapsed = (
                 datetime.now(timezone.utc) - stream_info.content_type_probe_failed_at
@@ -1512,28 +1529,52 @@ class StreamManager:
                 is_hls = prefix.startswith(b"#EXTM3U") or prefix.startswith(
                     b"\xef\xbb\xbf#EXTM3U"
                 )
-                stream_info.is_hls = is_hls
-                stream_info.is_vod = not is_hls
-                stream_info.is_live_continuous = False
-                stream_info.content_type_verified = True
-                stream_info.content_type_probe_failed_at = None
-                logger.info(
-                    f"VOD content-type probe for stream {stream_id}: "
-                    f"{'genuine HLS' if is_hls else 'direct media'}"
-                )
+                # A failover can swap in a new URL (and reset classification
+                # for it) while this probe was awaiting the old URL's
+                # response. Committing this result then would overwrite the
+                # fresh state with a stale answer about a URL nobody is
+                # serving anymore - discard it and let the new URL be probed
+                # for real on its own next request.
+                if (stream_info.current_url or stream_info.original_url) != url:
+                    logger.debug(
+                        f"Discarding stale content-type probe for stream "
+                        f"{stream_id} - URL changed (failover) while probing {url}"
+                    )
+                else:
+                    stream_info.is_hls = is_hls
+                    stream_info.is_vod = not is_hls
+                    stream_info.is_live_continuous = False
+                    stream_info.content_type_verified = True
+                    stream_info.content_type_probe_failed_at = None
+                    logger.info(
+                        f"VOD content-type probe for stream {stream_id}: "
+                        f"{'genuine HLS' if is_hls else 'direct media'}"
+                    )
             except Exception as e:
-                # An error here means we don't actually know the real content
-                # type - do NOT set content_type_verified, or one transient
-                # network blip on a genuinely-HLS stream would lock it into
-                # being served raw forever (the exact bug this probe exists to
-                # fix). Instead, start a cooldown so a flaky upstream isn't
-                # reprobed on every request in the meantime, but the stream
-                # still gets a real answer once it recovers.
-                stream_info.content_type_probe_failed_at = datetime.now(timezone.utc)
-                logger.warning(
-                    f"VOD content-type probe failed for stream {stream_id}, "
-                    f"will retry after {settings.VOD_PROBE_RETRY_COOLDOWN}s: {e}"
-                )
+                # Same stale-result guard as above, applied to the failure
+                # path: don't start a cooldown against a URL that's no longer
+                # current, or the new URL's own probe gets needlessly delayed.
+                if (stream_info.current_url or stream_info.original_url) != url:
+                    logger.debug(
+                        f"Discarding stale content-type probe failure for "
+                        f"stream {stream_id} - URL changed (failover) while probing {url}"
+                    )
+                else:
+                    # An error here means we don't actually know the real
+                    # content type - do NOT set content_type_verified, or one
+                    # transient network blip on a genuinely-HLS stream would
+                    # lock it into being served raw forever (the exact bug
+                    # this probe exists to fix). Instead, start a cooldown so
+                    # a flaky upstream isn't reprobed on every request in the
+                    # meantime, but the stream still gets a real answer once
+                    # it recovers.
+                    stream_info.content_type_probe_failed_at = datetime.now(
+                        timezone.utc
+                    )
+                    logger.warning(
+                        f"VOD content-type probe failed for stream {stream_id}, "
+                        f"will retry after {settings.VOD_PROBE_RETRY_COOLDOWN}s: {e}"
+                    )
             finally:
                 if response is not None:
                     await response.aclose()

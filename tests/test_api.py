@@ -490,6 +490,108 @@ class TestAPI:
             asyncio.run(manager.http_client.aclose())
             asyncio.run(manager.live_stream_client.aclose())
 
+    def test_probe_skipped_for_unambiguous_raw_video_extension(self, monkeypatch):
+        """A VOD URL with a definite raw-video extension is unambiguous by
+        construction - probing it wastes an upstream connection and up to
+        VOD_PROBE_TIMEOUT of latency for no benefit."""
+        manager = StreamManager()
+        vod_url = "http://provider.example.com/movie/1234.mp4"
+        stream_id = asyncio.run(manager.get_or_create_stream(vod_url))
+        stream_info = manager.streams[stream_id]
+        assert stream_info.is_vod is True
+
+        probe_called = False
+
+        async def fake_send(request, stream=True, **kwargs):
+            nonlocal probe_called
+            probe_called = True
+            raise AssertionError("should not probe an unambiguous .mp4 URL")
+
+        monkeypatch.setattr(manager.http_client, "send", fake_send)
+
+        try:
+            asyncio.run(manager.resolve_vod_content_type(stream_id))
+
+            assert probe_called is False
+            assert stream_info.content_type_verified is True
+            assert stream_info.is_vod is True
+        finally:
+            asyncio.run(manager.http_client.aclose())
+            asyncio.run(manager.live_stream_client.aclose())
+
+    def test_probe_discards_stale_result_after_concurrent_failover(
+        self, monkeypatch
+    ):
+        """If a failover swaps in a new URL (and resets classification) while
+        a probe for the old URL is still in flight, the in-flight probe's
+        result must not overwrite the fresh state when it finally resolves -
+        otherwise a genuinely-HLS failover URL can be permanently marked
+        "verified, not HLS" from stale data about a different URL entirely."""
+        manager = StreamManager()
+        old_url = "http://old.example.com/movie/1234.m3u8"
+        new_url = "http://new.example.com/movie/1234.m3u8"
+
+        stream_id = asyncio.run(
+            manager.get_or_create_stream(old_url, failover_urls=[new_url])
+        )
+        stream_info = manager.streams[stream_id]
+
+        probe_started = asyncio.Event()
+        release_probe = asyncio.Event()
+
+        async def fake_send(request, stream=True, **kwargs):
+            # Only the (first, old-URL) probe should ever reach here - once
+            # discarded, resolve_vod_content_type() for the new URL runs
+            # again after the lock frees up, but the test asserts on state
+            # before that second call, so a single fake response suffices.
+            probe_started.set()
+            await release_probe.wait()
+
+            class _FakeResponse:
+                status_code = 200
+                headers = {}
+
+                def raise_for_status(self):
+                    pass
+
+                async def aiter_bytes(self):
+                    yield b"#EXTM3U\nrest"
+
+                async def aclose(self):
+                    pass
+
+            return _FakeResponse()
+
+        monkeypatch.setattr(manager.http_client, "send", fake_send)
+
+        try:
+
+            async def scenario():
+                probe_task = asyncio.create_task(
+                    manager.resolve_vod_content_type(stream_id)
+                )
+                await probe_started.wait()
+
+                # Failover swaps the URL and resets classification while the
+                # above probe (for old_url) is still awaiting its response.
+                await manager._try_update_failover_url(stream_id, "test")
+                assert stream_info.current_url == new_url
+                assert stream_info.content_type_verified is False
+
+                # Now let the stale (old_url) probe finish.
+                release_probe.set()
+                await probe_task
+
+            asyncio.run(scenario())
+
+            # The stale probe's "genuine HLS" result about old_url must not
+            # have been committed - the fresh, post-failover state stands.
+            assert stream_info.current_url == new_url
+            assert stream_info.content_type_verified is False
+        finally:
+            asyncio.run(manager.http_client.aclose())
+            asyncio.run(manager.live_stream_client.aclose())
+
     def test_probe_failure_does_not_permanently_lock_in_classification(
         self, monkeypatch
     ):

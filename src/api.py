@@ -14,7 +14,7 @@ from pydantic import BaseModel, field_validator
 from datetime import datetime, timezone
 import os
 
-from stream_manager import StreamManager, DashProcessor
+from stream_manager import StreamManager, StreamInfo, DashProcessor
 from events import EventManager
 from models import StreamEvent, EventType, WebhookConfig
 from config import settings, VERSION
@@ -143,7 +143,7 @@ def _hls_redirect_url(
 
 async def _probe_and_redirect_if_hls(
     stream_manager: StreamManager,
-    stream_info,
+    stream_info: StreamInfo,
     stream_id: str,
     request: Request,
     client_id: Optional[str] = None,
