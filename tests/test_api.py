@@ -34,6 +34,17 @@ class TestHelperFunctions:
         assert is_direct_stream("playlist.m3u8") is False
         assert is_direct_stream("unknown.xyz") is False
 
+    def test_is_direct_stream_vod_path_m3u8(self):
+        """Provider movie/series URLs ending in .m3u8 aren't reliably real
+        HLS - route them like other VOD content and let the runtime probe
+        (resolve_vod_content_type) redirect to /hls/ if it turns out to be."""
+        assert is_direct_stream("http://p.example.com/movie/u/p/123.m3u8") is True
+        assert is_direct_stream("http://p.example.com/series/u/p/123.m3u8") is True
+        assert is_direct_stream("http://p.example.com/timeshift/u/p/1/2/x.m3u8") is True
+        # Live .m3u8 URLs are unaffected - still routed to the HLS endpoint.
+        assert is_direct_stream("http://p.example.com/live/u/p/123.m3u8") is False
+        assert is_direct_stream("http://p.example.com/hls/stream.m3u8") is False
+
 
 class TestAPI:
     """Test FastAPI endpoints"""
@@ -299,7 +310,7 @@ class TestAPI:
             async def aclose(self):
                 pass
 
-        async def fake_send(request, stream=True):
+        async def fake_send(request, stream=True, **kwargs):
             return _FakeResponse()
 
         monkeypatch.setattr(manager.http_client, "send", fake_send)
@@ -342,7 +353,7 @@ class TestAPI:
             async def aclose(self):
                 pass
 
-        async def fake_probe_send(request, stream=True):
+        async def fake_probe_send(request, stream=True, **kwargs):
             return _FakeResponse()
 
         monkeypatch.setattr(manager.http_client, "send", fake_probe_send)
@@ -387,7 +398,7 @@ class TestAPI:
 
         probe_called = False
 
-        async def fake_probe_send(request, stream=True):
+        async def fake_probe_send(request, stream=True, **kwargs):
             nonlocal probe_called
             probe_called = True
             raise AssertionError("should not probe a transcoded stream's source")
@@ -414,6 +425,145 @@ class TestAPI:
             assert response.content == b"transcoded-bytes"
             assert probe_called is False
             assert stream_info.content_type_verified is False
+        finally:
+            asyncio.run(manager.http_client.aclose())
+            asyncio.run(manager.live_stream_client.aclose())
+
+    def test_resolve_vod_content_type_probes_only_once_under_concurrency(
+        self, monkeypatch
+    ):
+        """Concurrent callers racing to probe a never-before-verified VOD
+        stream must only trigger one upstream connection, not one each -
+        providers commonly cap concurrent connections per account."""
+        manager = StreamManager()
+        vod_url = "http://provider.example.com/movie/1234.m3u8"
+        stream_id = asyncio.run(manager.get_or_create_stream(vod_url))
+        stream_info = manager.streams[stream_id]
+
+        probe_count = 0
+
+        async def fake_send(request, stream=True, **kwargs):
+            nonlocal probe_count
+            probe_count += 1
+            await asyncio.sleep(0.05)  # widen the race window
+
+            class _FakeResponse:
+                status_code = 200
+                headers = {}
+
+                def raise_for_status(self):
+                    pass
+
+                async def aiter_bytes(self):
+                    yield b"#EXTM3U\nrest"
+
+                async def aclose(self):
+                    pass
+
+            return _FakeResponse()
+
+        monkeypatch.setattr(manager.http_client, "send", fake_send)
+
+        try:
+
+            async def run_concurrent():
+                await asyncio.gather(
+                    manager.resolve_vod_content_type(stream_id),
+                    manager.resolve_vod_content_type(stream_id),
+                    manager.resolve_vod_content_type(stream_id),
+                )
+
+            asyncio.run(run_concurrent())
+
+            assert probe_count == 1
+            assert stream_info.is_hls is True
+            assert stream_info.content_type_verified is True
+        finally:
+            asyncio.run(manager.http_client.aclose())
+            asyncio.run(manager.live_stream_client.aclose())
+
+    def test_head_direct_stream_probes_and_redirects_on_first_request(
+        self, monkeypatch
+    ):
+        """A player's HEAD before any GET must not skip content-type probing -
+        otherwise HEAD hits the raw backend URL directly for what turns out
+        to be a genuine HLS master playlist."""
+        manager = StreamManager()
+        vod_url = "http://provider.example.com/movie/1234.m3u8"
+        stream_id = asyncio.run(manager.get_or_create_stream(vod_url))
+        stream_info = manager.streams[stream_id]
+        assert stream_info.content_type_verified is False
+
+        class _FakeResponse:
+            status_code = 200
+            headers = {}
+
+            def raise_for_status(self):
+                pass
+
+            async def aiter_bytes(self):
+                yield b"#EXTM3U\nrest"
+
+            async def aclose(self):
+                pass
+
+        async def fake_send(request, stream=True, **kwargs):
+            return _FakeResponse()
+
+        monkeypatch.setattr(manager.http_client, "send", fake_send)
+
+        try:
+            with patch("api.stream_manager", manager):
+                client = TestClient(app)
+                response = client.head(f"/stream/{stream_id}", follow_redirects=False)
+
+            assert response.status_code == 302
+            assert response.headers["location"].endswith(
+                f"/hls/{stream_id}/playlist.m3u8"
+            )
+            assert stream_info.content_type_verified is True
+        finally:
+            asyncio.run(manager.http_client.aclose())
+            asyncio.run(manager.live_stream_client.aclose())
+
+    def test_hls_redirect_forwards_explicit_client_id_and_username(self, monkeypatch):
+        """An explicit client_id/username passed to /stream/ must survive the
+        redirect to /hls/, or session/client-record continuity breaks."""
+        manager = StreamManager()
+        vod_url = "http://provider.example.com/movie/1234.m3u8"
+        stream_id = asyncio.run(manager.get_or_create_stream(vod_url))
+
+        class _FakeResponse:
+            status_code = 200
+            headers = {}
+
+            def raise_for_status(self):
+                pass
+
+            async def aiter_bytes(self):
+                yield b"#EXTM3U\nrest"
+
+            async def aclose(self):
+                pass
+
+        async def fake_send(request, stream=True, **kwargs):
+            return _FakeResponse()
+
+        monkeypatch.setattr(manager.http_client, "send", fake_send)
+
+        try:
+            with patch("api.stream_manager", manager):
+                client = TestClient(app)
+                response = client.get(
+                    f"/stream/{stream_id}",
+                    params={"client_id": "my-fixed-id", "username": "alice"},
+                    follow_redirects=False,
+                )
+
+            assert response.status_code == 302
+            location = response.headers["location"]
+            assert "client_id=my-fixed-id" in location
+            assert "username=alice" in location
         finally:
             asyncio.run(manager.http_client.aclose())
             asyncio.run(manager.live_stream_client.aclose())

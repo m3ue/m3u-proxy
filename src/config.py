@@ -53,6 +53,11 @@ class Settings(BaseSettings):
     # Live TV timeout - emphasizes keeping connection alive during client buffering
     # 30 minutes - safety net while supporting client backpressure
     LIVE_TV_WRITE_TIMEOUT: float = 1800.0
+    # VOD content-type probe timeout - deliberately short and separate from
+    # VOD_READ_TIMEOUT. This probe blocks the player's first request while it
+    # runs, so a slow-starting upstream must fail fast rather than hang the
+    # player for the full VOD stall-tolerance window.
+    VOD_PROBE_TIMEOUT: float = 8.0
 
     # Connection Idle Monitoring - detect and alert on long-held connections that may be resource leaks
     # Alert threshold for connections held idle (warning log when exceeded)

@@ -373,6 +373,12 @@ class StreamManager:
         self.client_timeout = settings.CLIENT_TIMEOUT
         self.stream_timeout = settings.STREAM_TIMEOUT
 
+        # Serializes resolve_vod_content_type() per stream so concurrent
+        # requests for a never-before-probed VOD stream don't each open their
+        # own upstream probe connection (providers often cap concurrent
+        # connections per account).
+        self._vod_probe_locks: Dict[str, asyncio.Lock] = {}
+
         # Track cancellation flags for active streaming generators
         # Key: connection_id (unique per streaming request), Value: asyncio.Event that gets set when stream should stop
         # Changed from client_id to connection_id to fix race condition when clients make concurrent connections
@@ -633,7 +639,7 @@ class StreamManager:
         ):
             return (False, True, False)
 
-        # HLS detection — check path only, not the full URL, to handle query params like ?location=ABC123
+        # HLS detection - check path only, not the full URL, to handle query params like ?location=ABC123
         if path.endswith(".m3u8"):
             return (True, False, False)
 
@@ -759,6 +765,7 @@ class StreamManager:
                 self.stream_clients.pop(stream_id, None)
                 self._direct_broadcast_primary.pop(stream_id, None)
                 self._direct_broadcast_queues.pop(stream_id, None)
+                self._vod_probe_locks.pop(stream_id, None)
                 self._stats.active_streams = max(0, self._stats.active_streams - 1)
 
         if stream_id not in self.streams:
@@ -1414,43 +1421,77 @@ class StreamManager:
         ):
             return
 
-        url = stream_info.current_url or stream_info.original_url
-        headers = {"User-Agent": stream_info.user_agent, "Accept-Encoding": "identity"}
-        headers.update(stream_info.headers)
+        # Serialize per stream: VOD playback is normally many concurrent/
+        # sequential range requests from the same player, and providers often
+        # cap concurrent connections per account - without this, every one of
+        # those requests could race to probe the same never-before-verified
+        # stream at once.
+        lock = self._vod_probe_locks.setdefault(stream_id, asyncio.Lock())
+        async with lock:
+            # Re-check now that we hold the lock: another request may have
+            # already completed the probe while we were waiting for it.
+            if stream_info.content_type_verified:
+                return
 
-        response = None
-        try:
-            request = self.http_client.build_request("GET", url, headers=headers)
-            response = await self.http_client.send(request, stream=True)
-            response.raise_for_status()
+            url = stream_info.current_url or stream_info.original_url
+            headers = {
+                "User-Agent": stream_info.user_agent,
+                "Accept-Encoding": "identity",
+            }
+            headers.update(stream_info.headers)
 
-            prefix = b""
-            async for chunk in response.aiter_bytes():
-                prefix += chunk
-                if len(prefix) >= 10:
-                    break
+            response = None
+            try:
+                request = self.http_client.build_request("GET", url, headers=headers)
+                # Use a short, dedicated timeout rather than self.http_client's
+                # VOD-tolerant defaults (VOD_READ_TIMEOUT is up to an hour) -
+                # this probe blocks the player's first request, so a
+                # slow-starting upstream must fail fast instead of hanging
+                # playback.
+                response = await self.http_client.send(
+                    request,
+                    stream=True,
+                    timeout=httpx.Timeout(
+                        connect=settings.DEFAULT_CONNECTION_TIMEOUT,
+                        read=settings.VOD_PROBE_TIMEOUT,
+                        write=settings.VOD_PROBE_TIMEOUT,
+                        pool=10.0,
+                    ),
+                )
+                response.raise_for_status()
 
-            is_hls = prefix.startswith(b"#EXTM3U") or prefix.startswith(
-                b"\xef\xbb\xbf#EXTM3U"
-            )
-            stream_info.is_hls = is_hls
-            stream_info.is_vod = not is_hls
-            stream_info.is_live_continuous = False
-            stream_info.content_type_verified = True
-            logger.info(
-                f"VOD content-type probe for stream {stream_id}: "
-                f"{'genuine HLS' if is_hls else 'direct media'}"
-            )
-        except Exception as e:
-            # Leave content_type_verified unset so a later request can retry -
-            # a transient probe failure shouldn't permanently lock in a guess.
-            logger.warning(
-                f"VOD content-type probe failed for stream {stream_id}, "
-                f"keeping default classification: {e}"
-            )
-        finally:
-            if response is not None:
-                await response.aclose()
+                prefix = b""
+                async for chunk in response.aiter_bytes():
+                    prefix += chunk
+                    if len(prefix) >= 10:
+                        break
+
+                is_hls = prefix.startswith(b"#EXTM3U") or prefix.startswith(
+                    b"\xef\xbb\xbf#EXTM3U"
+                )
+                stream_info.is_hls = is_hls
+                stream_info.is_vod = not is_hls
+                stream_info.is_live_continuous = False
+                logger.info(
+                    f"VOD content-type probe for stream {stream_id}: "
+                    f"{'genuine HLS' if is_hls else 'direct media'}"
+                )
+            except Exception as e:
+                # VOD playback is normally many sequential range requests from
+                # the same player - if we retried on every one of them after a
+                # failed probe, one transient hiccup would multiply into an
+                # extra upstream connection (and this probe's own latency) on
+                # every subsequent request. Keep the current best-guess
+                # classification and move on; this is no worse than the
+                # pre-probe behavior for this stream.
+                logger.warning(
+                    f"VOD content-type probe failed for stream {stream_id}, "
+                    f"keeping default classification: {e}"
+                )
+            finally:
+                if response is not None:
+                    await response.aclose()
+                stream_info.content_type_verified = True
 
     async def stream_continuous_direct(
         self, stream_id: str, client_id: str, range_header: Optional[str] = None
@@ -5093,6 +5134,7 @@ class StreamManager:
                 # finally block didn't run or _signal_subscribers_end missed).
                 self._direct_broadcast_primary.pop(stream_id, None)
                 self._direct_broadcast_queues.pop(stream_id, None)
+                self._vod_probe_locks.pop(stream_id, None)
 
                 del self.streams[stream_id]
                 if stream_id in self.stream_clients:

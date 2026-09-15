@@ -8,7 +8,7 @@ import logging
 import hashlib
 import subprocess
 import uuid
-from urllib.parse import unquote, urlparse, urljoin
+from urllib.parse import unquote, urlparse, urljoin, urlencode
 from typing import Optional, List, Dict, Literal
 from pydantic import BaseModel, field_validator
 from datetime import datetime, timezone
@@ -89,6 +89,18 @@ def is_direct_stream(url: str) -> bool:
     """Check if URL is a direct stream (not HLS playlist, not DASH manifest)"""
     # Split off query string before checking extension
     path = str(url).split("?")[0].lower()
+    url_lower = str(url).lower()
+
+    # Provider VOD/movie/series URLs sometimes end in .m3u8 without being
+    # genuine HLS (and vice versa) - route these through /stream/ like other
+    # VOD content, mirroring StreamManager._detect_stream_type(). The runtime
+    # content-type probe (StreamManager.resolve_vod_content_type) corrects
+    # this and hands off to /hls/ if the actual response is real HLS.
+    if path.endswith(".m3u8") and (
+        "/movie/" in url_lower or "/series/" in url_lower or "/timeshift/" in url_lower
+    ):
+        return True
+
     # M3U8 and MPD URLs are always routed to their own handlers, even if
     # /live/ appears in the path
     if path.endswith(".m3u8") or path.endswith(".mpd"):
@@ -98,6 +110,25 @@ def is_direct_stream(url: str) -> bool:
         or str(url).lower().endswith("?profile=pass")
         or "/live/" in str(url)
     )
+
+
+def _hls_redirect_url(
+    stream_id: str, request: Request, client_id: Optional[str] = None
+) -> str:
+    """Build the redirect target for a VOD stream confirmed to be genuine HLS,
+    forwarding traceability/session params a caller may have passed to /stream/
+    so they carry over to the /hls/ endpoint's own client-id resolution."""
+    root_path = getattr(settings, "ROOT_PATH", "")
+    redirect_url = f"{root_path}/hls/{stream_id}/playlist.m3u8"
+    params = {}
+    username = request.query_params.get("username")
+    if username:
+        params["username"] = username
+    if client_id:
+        params["client_id"] = client_id
+    if params:
+        redirect_url += f"?{urlencode(params)}"
+    return redirect_url
 
 
 def detect_https_from_headers(request: Request) -> bool:
@@ -1667,12 +1698,10 @@ async def get_direct_stream(
         ):
             await stream_manager.resolve_vod_content_type(stream_id)
         if not stream_info.is_transcoded and stream_info.is_hls:
-            root_path = getattr(settings, "ROOT_PATH", "")
-            redirect_url = f"{root_path}/hls/{stream_id}/playlist.m3u8"
-            username = request.query_params.get("username")
-            if username:
-                redirect_url += f"?username={username}"
-            return RedirectResponse(url=redirect_url, status_code=302)
+            return RedirectResponse(
+                url=_hls_redirect_url(stream_id, request, client_id),
+                status_code=302,
+            )
 
         stream_url = stream_info.current_url or stream_info.original_url
 
@@ -1843,15 +1872,19 @@ async def head_direct_stream(
         # The stream_id is now validated by the resolve_stream_id dependency
         stream_info = stream_manager.streams[stream_id]
 
-        # If a prior GET already confirmed this VOD stream is genuine HLS,
-        # keep HEAD consistent with it rather than HEAD-ing the raw URL.
-        if stream_info.is_hls and stream_info.content_type_verified:
-            root_path = getattr(settings, "ROOT_PATH", "")
-            redirect_url = f"{root_path}/hls/{stream_id}/playlist.m3u8"
-            username = request.query_params.get("username")
-            if username:
-                redirect_url += f"?username={username}"
-            return RedirectResponse(url=redirect_url, status_code=302)
+        # Probe and redirect exactly as the GET handler does - a player may
+        # issue HEAD before its first GET, and that must not bypass detection.
+        if (
+            not stream_info.is_transcoded
+            and stream_info.is_vod
+            and not stream_info.content_type_verified
+        ):
+            await stream_manager.resolve_vod_content_type(stream_id)
+        if not stream_info.is_transcoded and stream_info.is_hls:
+            return RedirectResponse(
+                url=_hls_redirect_url(stream_id, request, client_id),
+                status_code=302,
+            )
 
         stream_url = stream_info.current_url or stream_info.original_url
 
