@@ -324,9 +324,7 @@ class TestStreamManager:
         being verified indirectly through each classifier's own tests."""
         assert is_vod_path_marker("http://p.example.com/movie/u/p/1.m3u8") is True
         assert is_vod_path_marker("http://p.example.com/movie/u/p/1") is True
-        assert (
-            is_vod_path_marker("http://p.example.com/live/movie/u/p/1.m3u8") is False
-        )
+        assert is_vod_path_marker("http://p.example.com/live/movie/u/p/1.m3u8") is False
         assert is_vod_path_marker("http://p.example.com/live/u/p/1.ts") is False
 
     def test_get_stream_info_nonexistent(self, stream_manager):

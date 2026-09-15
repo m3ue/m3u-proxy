@@ -60,9 +60,7 @@ class TestHelperFunctions:
         of extension, so is_direct_stream() must agree here too."""
         assert is_direct_stream("http://p.example.com/movie/u/p/12345") is True
         assert is_direct_stream("http://p.example.com/series/u/p/12345") is True
-        assert (
-            is_direct_stream("http://p.example.com/timeshift/u/p/1/2/12345") is True
-        )
+        assert is_direct_stream("http://p.example.com/timeshift/u/p/1/2/12345") is True
 
 
 class TestAPI:
@@ -584,9 +582,7 @@ class TestAPI:
         assert stream_info.is_vod is False
 
         try:
-            asyncio.run(
-                manager._try_update_failover_url(stream_id, "test_reason")
-            )
+            asyncio.run(manager._try_update_failover_url(stream_id, "test_reason"))
 
             assert stream_info.current_url == failover_url
             # Category is locked - still live, not reclassified as VOD.
@@ -608,9 +604,7 @@ class TestAPI:
 
         try:
             stream_id = asyncio.run(manager.get_or_create_stream(vod_url))
-            lock_before = manager._vod_probe_locks.setdefault(
-                stream_id, asyncio.Lock()
-            )
+            lock_before = manager._vod_probe_locks.setdefault(stream_id, asyncio.Lock())
 
             # Recycle: same stream_id, 0 clients, requested again.
             asyncio.run(manager.get_or_create_stream(vod_url))
