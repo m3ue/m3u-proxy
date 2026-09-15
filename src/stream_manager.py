@@ -1461,8 +1461,10 @@ class StreamManager:
         # place) and never needs the extra upstream connection and latency
         # this probe costs - skip it and treat the URL's own guess as final.
         probe_url = stream_info.current_url or stream_info.original_url
-        if probe_url.split("?")[0].lower().endswith(
-            self._UNAMBIGUOUS_RAW_VIDEO_EXTENSIONS
+        if (
+            probe_url.split("?")[0]
+            .lower()
+            .endswith(self._UNAMBIGUOUS_RAW_VIDEO_EXTENSIONS)
         ):
             stream_info.content_type_verified = True
             return

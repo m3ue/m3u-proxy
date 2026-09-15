@@ -519,9 +519,7 @@ class TestAPI:
             asyncio.run(manager.http_client.aclose())
             asyncio.run(manager.live_stream_client.aclose())
 
-    def test_probe_discards_stale_result_after_concurrent_failover(
-        self, monkeypatch
-    ):
+    def test_probe_discards_stale_result_after_concurrent_failover(self, monkeypatch):
         """If a failover swaps in a new URL (and resets classification) while
         a probe for the old URL is still in flight, the in-flight probe's
         result must not overwrite the fresh state when it finally resolves -
