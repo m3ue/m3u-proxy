@@ -523,12 +523,13 @@ class TestAPI:
             asyncio.run(manager.http_client.aclose())
             asyncio.run(manager.live_stream_client.aclose())
 
-    def test_resolve_vod_content_type_probes_only_once_under_concurrency(
-        self, monkeypatch
-    ):
+    def test_resolve_vod_content_type_converges_under_concurrency(self, monkeypatch):
         """Concurrent callers racing to probe a never-before-verified VOD
-        stream must only trigger one upstream connection, not one each -
-        providers commonly cap concurrent connections per account."""
+        stream may each open their own upstream connection - there's no
+        shared connection to save, since the probe's connection is always
+        the same one that goes on to serve playback. What matters is that
+        they still converge on the same, correct classification rather than
+        corrupting each other's result."""
         manager = StreamManager()
         vod_url = "http://provider.example.com/movie/1234.m3u8"
         stream_id = asyncio.run(manager.get_or_create_stream(vod_url))
@@ -569,7 +570,7 @@ class TestAPI:
 
             asyncio.run(run_concurrent())
 
-            assert probe_count == 1
+            assert probe_count == 3
             assert stream_info.is_hls is True
             assert stream_info.content_type_verified is True
         finally:
@@ -671,22 +672,21 @@ class TestAPI:
             asyncio.run(manager.http_client.aclose())
             asyncio.run(manager.live_stream_client.aclose())
 
-    def test_recycled_stream_keeps_its_probe_lock(self):
-        """Recycling an orphaned stream_id (0 clients) must not pop its
-        probe lock - a probe for the just-replaced StreamInfo could still be
-        in flight, and popping would hand the fresh session a brand-new Lock,
-        letting two probes run concurrently against the same provider."""
+    def test_recycled_stream_starts_unverified(self):
+        """Recycling an orphaned stream_id (0 clients) replaces its
+        StreamInfo entirely, so the fresh session must start unverified and
+        get its own real probe rather than inheriting any prior state."""
         manager = StreamManager()
         vod_url = "http://provider.example.com/movie/1234.m3u8"
 
         try:
             stream_id = asyncio.run(manager.get_or_create_stream(vod_url))
-            lock_before = manager._vod_probe_locks.setdefault(stream_id, asyncio.Lock())
+            manager.streams[stream_id].content_type_verified = True
 
             # Recycle: same stream_id, 0 clients, requested again.
             asyncio.run(manager.get_or_create_stream(vod_url))
 
-            assert manager._vod_probe_locks.get(stream_id) is lock_before
+            assert manager.streams[stream_id].content_type_verified is False
         finally:
             asyncio.run(manager.http_client.aclose())
             asyncio.run(manager.live_stream_client.aclose())

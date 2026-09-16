@@ -2447,8 +2447,6 @@ async def delete_oldest_stream_by_metadata(
             del stream_manager.streams[oldest_stream_id]
         if oldest_stream_id in stream_manager.stream_clients:
             del stream_manager.stream_clients[oldest_stream_id]
-        stream_manager._vod_probe_locks.pop(oldest_stream_id, None)
-
         stream_manager._stats.active_streams -= 1
 
         return {
@@ -2598,8 +2596,6 @@ async def delete_streams_by_metadata(
                     del stream_manager.streams[stream_id]
                 if stream_id in stream_manager.stream_clients:
                     del stream_manager.stream_clients[stream_id]
-                stream_manager._vod_probe_locks.pop(stream_id, None)
-
                 stream_manager._stats.active_streams -= 1
                 deleted_streams.append(stream_id)
 
@@ -2662,8 +2658,6 @@ async def delete_stream(stream_id: str):
             del stream_manager.streams[stream_id]
         if stream_id in stream_manager.stream_clients:
             del stream_manager.stream_clients[stream_id]
-        stream_manager._vod_probe_locks.pop(stream_id, None)
-
         stream_manager._stats.active_streams -= 1
 
         return {"message": f"Stream {stream_id} deleted"}
