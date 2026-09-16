@@ -1735,6 +1735,11 @@ async def get_direct_stream(
     ),
 ):
     """Serve direct streams (.ts, .mp4, .mkv, etc.) for IPTV"""
+    # Bound up front (and closed in the except handler below) so that any
+    # exception raised after the probe is acquired but before it's handed
+    # off to stream_continuous_direct/stream_transcoded - e.g. register_client()
+    # failing - can't leak the still-open upstream connection.
+    reused_probe: Optional[ReusableProbeResponse] = None
     try:
         # The stream_id is now validated by the resolve_stream_id dependency
         stream_info = stream_manager.streams[stream_id]
@@ -1884,6 +1889,7 @@ async def get_direct_stream(
             # if that ever changes.
             if reused_probe is not None:
                 await reused_probe.response.aclose()
+                reused_probe = None
 
             # For transcoded streams outputting to pipe:1 or other non-HLS formats,
             # use streamed transcoding path
@@ -1913,6 +1919,11 @@ async def get_direct_stream(
                 range_header=range_header,
                 reused_probe=reused_probe,
             )
+            # Ownership of any still-open probe connection has now passed to
+            # stream_continuous_direct's generator, which is responsible for
+            # closing it - don't let the except block below double-close it
+            # if something after this point raises.
+            reused_probe = None
 
             # Start ASGI disconnect monitor so the generator exits promptly
             # when the client disconnects.  Without this, the primary generator
@@ -1927,6 +1938,15 @@ async def get_direct_stream(
     except Exception as e:
         logger.error(f"Error serving direct stream: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Belt-and-suspenders: every intentional exit path above already
+        # closes/clears reused_probe, so this only fires if something
+        # raised in between - without it, that connection leaks silently.
+        if reused_probe is not None:
+            try:
+                await reused_probe.response.aclose()
+            except Exception:
+                pass
 
 
 @app.head("/stream/{stream_id}")

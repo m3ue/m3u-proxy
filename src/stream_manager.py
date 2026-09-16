@@ -1813,7 +1813,8 @@ class StreamManager:
             nonlocal \
                 provider_status_code, \
                 provider_content_range, \
-                provider_content_length
+                provider_content_length, \
+                reused_probe
 
             bytes_served = 0
             resume_from_byte = None
@@ -2019,6 +2020,16 @@ class StreamManager:
                             )
                             response = await stream_context.__aenter__()
                         else:
+                            # This is the only iteration where use_reused_probe could
+                            # ever be True (failover_count/retry_count are both 0 only
+                            # on the very first attempt), so if we didn't take it here
+                            # - e.g. a concurrent failover moved active_url out from
+                            # under us - it will never be consumed. Close it now
+                            # instead of leaking the provider connection.
+                            if reused_probe is not None and not used_reused_probe:
+                                await reused_probe.response.aclose()
+                                reused_probe = None
+
                             # OPEN provider connection - happens ONLY when client starts consuming
                             logger.info(
                                 f"Opening provider connection for {stream_id} to {active_url}"
