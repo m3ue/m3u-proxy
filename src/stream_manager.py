@@ -13,7 +13,7 @@ import os
 import re
 import uuid
 import xml.etree.ElementTree as ET
-from typing import Dict, Optional, List, Set, Any
+from typing import Dict, Optional, List, Set, Any, AsyncIterator, NamedTuple
 from urllib.parse import urlparse, urljoin, quote
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
@@ -83,6 +83,15 @@ class StreamInfo:
     is_dash: bool = False
     is_vod: bool = False
     is_live_continuous: bool = False
+    # Set once a VOD stream's real content type has been confirmed by probing
+    # the actual playback response (see StreamManager.resolve_vod_content_type),
+    # so we only ever probe a given stream once it succeeds.
+    content_type_verified: bool = False
+    # Set when a probe attempt errors out (as opposed to succeeding and
+    # finding non-HLS content) - gates a cooldown before retrying, so a
+    # flaky upstream isn't reprobed on every request, but the stream also
+    # isn't permanently locked into a wrong guess from one bad attempt.
+    content_type_probe_failed_at: Optional[datetime] = None
     # DASH DRM detection - set once the manifest has been fetched and parsed;
     # used to refuse FFmpeg transcoding of DRM-protected DASH content
     is_encrypted: bool = False
@@ -361,7 +370,77 @@ class DashProcessor:
             return content
 
 
+def is_vod_path_marker(url: str) -> bool:
+    """True if the URL's path signals on-demand movie/series/timeshift
+    content, unless an explicit /live/ marker overrides it (a stronger,
+    more specific signal that this is actually a live channel whose URL
+    happens to also contain one of those words, e.g. an EPG category
+    segment). Shared by StreamManager._detect_stream_type() and
+    api.is_direct_stream() so the two classifiers can't drift out of
+    agreement on this specific check - as they did twice before this was
+    factored out (once when the /live/ exception was added to only one of
+    them, once when the .m3u8-only extension gating was added to only one
+    of them).
+    """
+    path_lower = url.split("?")[0].lower()
+    return (
+        "/movie/" in path_lower
+        or "/series/" in path_lower
+        or "/timeshift/" in path_lower
+    ) and "/live/" not in path_lower
+
+
+class ReusableProbeResponse(NamedTuple):
+    """An upstream response left open by resolve_vod_content_type() after
+    confirming a VOD stream is genuine direct media, handed back to the
+    caller instead of being closed. Some providers issue single-use or
+    session-bound VOD URLs that reject a second request outright - reusing
+    the probe's own connection for the immediately-following playback
+    request avoids opening (and having rejected) a second one. The caller
+    takes ownership of closing `response`."""
+
+    response: httpx.Response
+    prefix: bytes
+    byte_iter: AsyncIterator[bytes]
+    url: str
+
+
+class _PreOpenedStreamContext:
+    """Adapts an already-open httpx.Response (from a ReusableProbeResponse)
+    to the same async-context-manager shape as `client.stream(...)`, so the
+    failover/retry loop in StreamManager.stream_continuous_direct can treat a
+    reused connection exactly like one it opened itself - every one of that
+    loop's many `stream_context.__aexit__(...)` cleanup call sites then works
+    unchanged, without needing to know which kind of context it holds."""
+
+    def __init__(self, response: httpx.Response):
+        self._response = response
+
+    async def __aenter__(self) -> httpx.Response:
+        return self._response
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
+        await self._response.aclose()
+
+
+async def _prefixed_byte_iter(
+    prefix: bytes, byte_iter: AsyncIterator[bytes]
+) -> AsyncIterator[bytes]:
+    """Yield already-sniffed prefix bytes from a reused probe response, then
+    continue draining the same underlying iterator so no bytes are lost or
+    re-requested."""
+    if prefix:
+        yield prefix
+    async for chunk in byte_iter:
+        yield chunk
+
+
 class StreamManager:
+    # Extensions that unambiguously identify raw video regardless of path -
+    # shared between _detect_stream_type() and resolve_vod_content_type() so
+    # the two never drift: a URL matching this is never worth probing.
+    _UNAMBIGUOUS_RAW_VIDEO_EXTENSIONS = (".mp4", ".mkv", ".webm", ".avi")
+
     def __init__(self, redis_url: Optional[str] = None, enable_pooling: bool = True):
         self.streams: Dict[str, StreamInfo] = {}
         self.clients: Dict[str, ClientInfo] = {}
@@ -615,18 +694,22 @@ class StreamManager:
         # Strip query string before checking extension
         path = url.split("?")[0].lower()
 
-        # HLS detection — check path only, not the full URL, to handle query params like ?location=ABC123
+        # VOD/Timeshift detection - these should NOT use strict mode.
+        # Unambiguous raw video extensions are always on-demand, regardless of path.
+        if path.endswith(self._UNAMBIGUOUS_RAW_VIDEO_EXTENSIONS):
+            return (False, True, False)
+
+        # Provider movie/series/timeshift URLs sometimes end in .m3u8 without
+        # being genuine HLS (and vice versa), so this path context is checked
+        # before the .m3u8 extension check below - get_direct_stream()/
+        # resolve_vod_content_type() confirm the real content type from the
+        # actual response before serving VOD content.
+        if is_vod_path_marker(url):
+            return (False, True, False)
+
+        # HLS detection - check path only, not the full URL, to handle query params like ?location=ABC123
         if path.endswith(".m3u8"):
             return (True, False, False)
-
-        # VOD/Timeshift detection - these should NOT use strict mode
-        if (
-            path.endswith((".mp4", ".mkv", ".webm", ".avi"))
-            or "/timeshift/" in url_lower
-            or "/movie/" in url_lower
-            or "/series/" in url_lower
-        ):
-            return (False, True, False)
 
         # Live continuous stream (.ts or live path)
         if path.endswith(".ts") or "/live/" in url_lower:
@@ -634,6 +717,54 @@ class StreamManager:
 
         # Default: treat as live continuous
         return (False, False, True)
+
+    def _reset_content_type_for_new_url(
+        self, stream_info: "StreamInfo", new_url: str
+    ) -> None:
+        """Handle a stream's URL changing (failover, or sticky-session
+        recovery reverting to the entry point) by clearing any stale
+        content-type verification for the old URL, so resolve_vod_content_type()
+        re-confirms it for real on the next request. Centralizes every write
+        to is_hls/is_vod/is_live_continuous/content_type_verified triggered by
+        a URL change - callers must never set these fields directly, or the
+        invariants enforced here (see below) get bypassed.
+
+        The new URL can be a different provider/backend entirely - keeping
+        the old URL's verified classification would let a genuinely-HLS
+        backup keep being served raw (or vice versa), reproducing the exact
+        bug this probe exists to fix.
+
+        Only ever reclassifies a stream that's already in the "VOD" category
+        (is_vod=True) - a stream that started out live/continuous keeps that
+        category for its whole lifetime, regardless of what a failover URL's
+        shape suggests. This is deliberate, not an oversight: live streams
+        are never probed in the first place (resolve_vod_content_type() only
+        ever runs for is_vod=True streams), and flipping a live stream's
+        category mid-lifetime would silently orphan its existing
+        broadcast-sharing subscribers (stream_continuous_direct() gates
+        connection sharing on is_vod) and pick the wrong httpx client/timeout
+        profile for it (chosen from is_live_continuous elsewhere). VOD
+        streams have no such live infrastructure to disrupt, so re-deriving
+        their finer-grained is_hls/is_vod split from the new URL is safe.
+
+        Transcoded streams are exempt entirely - they're never probed, since
+        their served content is FFmpeg's output, not the source URL's.
+        """
+        if stream_info.is_transcoded or not stream_info.is_vod:
+            return
+        is_hls, is_vod, is_live_continuous = self._detect_stream_type(new_url)
+        if not is_vod:
+            # The new URL doesn't even look VOD-shaped by heuristic (e.g. it
+            # matches /live/) - this stream's category is locked to VOD (see
+            # above), so treat it as an unverified VOD source rather than
+            # silently reclassifying its category out from under
+            # downstream logic that already depends on it.
+            is_hls, is_vod, is_live_continuous = False, True, False
+        stream_info.is_hls = is_hls
+        stream_info.is_vod = is_vod
+        stream_info.is_live_continuous = is_live_continuous
+        stream_info.content_type_verified = False
+        stream_info.content_type_probe_failed_at = None
 
     @staticmethod
     def _detect_output_mode(
@@ -742,7 +873,7 @@ class StreamManager:
                 recycled_segments = old_stream.total_segments_served
                 recycled_created_at = old_stream.created_at
                 logger.info(
-                    f"Recycling orphaned stream {stream_id} (0 clients) — "
+                    f"Recycling orphaned stream {stream_id} (0 clients) - "
                     f"creating fresh state for new session "
                     f"(preserving {recycled_bytes} bytes, {recycled_segments} segments)"
                 )
@@ -1386,12 +1517,187 @@ class StreamManager:
             # Signal any remaining subscribers that this primary is also done.
             self._signal_subscribers_end(stream_id)
 
+    async def resolve_vod_content_type(
+        self, stream_id: str, reuse_for_playback: bool = False
+    ) -> Optional[ReusableProbeResponse]:
+        """Probe a VOD stream's actual playback response to confirm whether it's
+        genuinely HLS. Provider VOD/movie/series URLs sometimes end in .m3u8
+        without being a real HLS playlist (and vice versa), so the URL-based
+        guess in _detect_stream_type() isn't reliable for this content class.
+
+        Runs at most once per stream (content_type_verified). A plain GET with
+        no Range header is used so the sniffed prefix is unambiguously the true
+        start of the body, unlike a Range-based read.
+
+        When reuse_for_playback is True and this call performs a fresh probe
+        that confirms direct (non-HLS) media, the still-open upstream response
+        is returned as a ReusableProbeResponse instead of being closed here -
+        see its docstring for why. Every other outcome (already verified,
+        skipped, redirecting to HLS, or a failed probe) returns None, and the
+        response (if any) is closed before returning, exactly as before.
+        """
+        stream_info = self.streams.get(stream_id)
+        if not stream_info or stream_info.is_transcoded or not stream_info.is_vod:
+            return None
+        if stream_info.content_type_verified:
+            return None
+
+        # Only ambiguous VOD sources need probing. A URL with a definite raw
+        # video extension is unambiguous by construction (the same check
+        # _detect_stream_type() uses to classify it as VOD in the first
+        # place) and never needs the extra upstream connection and latency
+        # this probe costs - skip it and treat the URL's own guess as final.
+        probe_url = stream_info.current_url or stream_info.original_url
+        if (
+            probe_url.split("?")[0]
+            .lower()
+            .endswith(self._UNAMBIGUOUS_RAW_VIDEO_EXTENSIONS)
+        ):
+            stream_info.content_type_verified = True
+            return None
+        if stream_info.content_type_probe_failed_at is not None:
+            elapsed = (
+                datetime.now(timezone.utc) - stream_info.content_type_probe_failed_at
+            ).total_seconds()
+            if elapsed < settings.VOD_PROBE_RETRY_COOLDOWN:
+                return None
+
+        # No per-stream lock here: the probe's connection is always the same
+        # one used for playback (see reuse_for_playback/ReusableProbeResponse
+        # below), so a concurrent requester needs its own upstream connection
+        # regardless of whether this probe is serialized - there is no
+        # connection count to save by making it wait. If two requests do race
+        # a never-before-verified stream, both simply probe independently and
+        # (barring a concurrent failover, guarded below) converge on the same
+        # answer; the second write is a harmless no-op duplicate of the first.
+        url = stream_info.current_url or stream_info.original_url
+        headers = {
+            "User-Agent": stream_info.user_agent,
+            "Accept-Encoding": "identity",
+        }
+        headers.update(stream_info.headers)
+
+        response = None
+        handed_off = False
+        reusable: Optional[ReusableProbeResponse] = None
+        try:
+            request = self.http_client.build_request("GET", url, headers=headers)
+            # Use a short, dedicated timeout rather than self.http_client's
+            # VOD-tolerant defaults (VOD_READ_TIMEOUT is up to an hour) -
+            # this probe blocks the player's first request, so a
+            # slow-starting upstream must fail fast instead of hanging
+            # playback.
+            response = await self.http_client.send(
+                request,
+                stream=True,
+                timeout=httpx.Timeout(
+                    connect=settings.DEFAULT_CONNECTION_TIMEOUT,
+                    read=settings.VOD_PROBE_TIMEOUT,
+                    write=settings.VOD_PROBE_TIMEOUT,
+                    pool=10.0,
+                ),
+            )
+            response.raise_for_status()
+
+            prefix = b""
+            # Keep a handle to this exact async generator (not a fresh
+            # aiter_bytes() call) so that, on the reuse path below, the
+            # caller can keep pulling from the same in-flight response
+            # starting right after the sniffed prefix, instead of a
+            # second call re-iterating (and breaking) the stream.
+            byte_iter = response.aiter_bytes()
+            # 32 bytes rather than a bare 10: a non-conformant but genuine
+            # HLS server can emit a leading blank line, BOM, or other
+            # whitespace before #EXTM3U. Too small a window here would cut
+            # the tag off entirely and misclassify - and unlike a wrong
+            # guess elsewhere, this one gets locked in as "verified".
+            async for chunk in byte_iter:
+                prefix += chunk
+                if len(prefix) >= 32:
+                    break
+
+            is_hls = prefix.lstrip(b"\xef\xbb\xbf \t\r\n").startswith(b"#EXTM3U")
+            # A failover can swap in a new URL (and reset classification
+            # for it) while this probe was awaiting the old URL's
+            # response. Committing this result then would overwrite the
+            # fresh state with a stale answer about a URL nobody is
+            # serving anymore - discard it and let the new URL be probed
+            # for real on its own next request.
+            if (stream_info.current_url or stream_info.original_url) != url:
+                logger.debug(
+                    f"Discarding stale content-type probe for stream "
+                    f"{stream_id} - URL changed (failover) while probing {url}"
+                )
+            else:
+                stream_info.is_hls = is_hls
+                stream_info.is_vod = not is_hls
+                stream_info.is_live_continuous = False
+                stream_info.content_type_verified = True
+                stream_info.content_type_probe_failed_at = None
+                logger.info(
+                    f"VOD content-type probe for stream {stream_id}: "
+                    f"{'genuine HLS' if is_hls else 'direct media'}"
+                )
+                # Genuine HLS hands off to the /hls/ endpoint, which does
+                # its own fetch - nothing to reuse there. Direct media is
+                # exactly the case the caller's very next request would
+                # otherwise re-request from scratch.
+                if reuse_for_playback and not is_hls:
+                    handed_off = True
+                    reusable = ReusableProbeResponse(
+                        response=response,
+                        prefix=prefix,
+                        byte_iter=byte_iter,
+                        url=url,
+                    )
+        except Exception as e:
+            # Same stale-result guard as above, applied to the failure
+            # path: don't start a cooldown against a URL that's no longer
+            # current, or the new URL's own probe gets needlessly delayed.
+            if (stream_info.current_url or stream_info.original_url) != url:
+                logger.debug(
+                    f"Discarding stale content-type probe failure for "
+                    f"stream {stream_id} - URL changed (failover) while probing {url}"
+                )
+            else:
+                # An error here means we don't actually know the real
+                # content type - do NOT set content_type_verified, or one
+                # transient network blip on a genuinely-HLS stream would
+                # lock it into being served raw forever (the exact bug
+                # this probe exists to fix). Instead, start a cooldown so
+                # a flaky upstream isn't reprobed on every request in the
+                # meantime, but the stream still gets a real answer once
+                # it recovers.
+                stream_info.content_type_probe_failed_at = datetime.now(timezone.utc)
+                logger.warning(
+                    f"VOD content-type probe failed for stream {stream_id}, "
+                    f"will retry after {settings.VOD_PROBE_RETRY_COOLDOWN}s: {e}"
+                )
+        finally:
+            if response is not None and not handed_off:
+                await response.aclose()
+
+        return reusable
+
     async def stream_continuous_direct(
-        self, stream_id: str, client_id: str, range_header: Optional[str] = None
+        self,
+        stream_id: str,
+        client_id: str,
+        range_header: Optional[str] = None,
+        reused_probe: Optional[ReusableProbeResponse] = None,
     ) -> StreamingResponse:
         """
         Direct byte-for-byte proxy for continuous streams (.ts, .mp4, .mkv).
         Provider connection is truly ephemeral and only open while streaming.
+
+        reused_probe: an upstream response already opened and verified by
+        resolve_vod_content_type(reuse_for_playback=True) for this exact
+        stream/URL. When present, and this is the first connection attempt
+        for a fresh (non-Range) request, it's consumed directly instead of
+        opening a second provider connection - see ReusableProbeResponse's
+        docstring for why this matters. Any failover/retry beyond the first
+        attempt opens its own connection as normal; reused_probe never
+        applies there.
 
         For live (non-VOD) streams, the first client becomes the "primary" reader
         that opens the upstream connection and broadcasts chunks to any subsequent
@@ -1507,7 +1813,8 @@ class StreamManager:
             nonlocal \
                 provider_status_code, \
                 provider_content_range, \
-                provider_content_length
+                provider_content_length, \
+                reused_probe
 
             bytes_served = 0
             resume_from_byte = None
@@ -1515,6 +1822,7 @@ class StreamManager:
             response = None
             stream_context = None
             stream_iterator = None
+            used_reused_probe = False
             last_stats_update = 0  # Track bytes at last stats update
             vod_reconnects = 0
             failover_count = 0
@@ -1580,6 +1888,9 @@ class StreamManager:
                         f"Reverting to configured entry point."
                     )
                     stream_info.current_url = None
+                    self._reset_content_type_for_new_url(
+                        stream_info, stream_info.original_url
+                    )
                     return True
 
                 return False
@@ -1682,20 +1993,60 @@ class StreamManager:
                             else self.http_client
                         )
 
-                        # OPEN provider connection - happens ONLY when client starts consuming
-                        logger.info(
-                            f"Opening provider connection for {stream_id} to {active_url}"
+                        # Reuse the still-open connection resolve_vod_content_type()
+                        # already made to this exact URL, if this is the very first
+                        # connection attempt for a fresh (non-Range) request - see
+                        # ReusableProbeResponse's docstring for why this matters for
+                        # providers with single-use/session-bound VOD URLs. Any
+                        # failover or retry attempt beyond this first one always
+                        # opens its own connection as normal.
+                        use_reused_probe = (
+                            reused_probe is not None
+                            and not used_reused_probe
+                            and failover_count == 0
+                            and retry_count == 0
+                            and not range_header
+                            and reused_probe.url == active_url
                         )
 
-                        # Get the stream context manager
-                        stream_context = client_to_use.stream(
-                            "GET", active_url, headers=headers, follow_redirects=True
-                        )
-                        # If the client returned a coroutine (test stub), await it to get the context manager
-                        if asyncio.iscoroutine(stream_context):
-                            stream_context = await stream_context
-                        # Enter the context to get the response object
-                        response = await stream_context.__aenter__()
+                        if use_reused_probe:
+                            used_reused_probe = True
+                            logger.info(
+                                f"Reusing content-type probe connection for {stream_id} "
+                                f"({active_url}) instead of opening a second one"
+                            )
+                            stream_context = _PreOpenedStreamContext(
+                                reused_probe.response
+                            )
+                            response = await stream_context.__aenter__()
+                        else:
+                            # This is the only iteration where use_reused_probe could
+                            # ever be True (failover_count/retry_count are both 0 only
+                            # on the very first attempt), so if we didn't take it here
+                            # - e.g. a concurrent failover moved active_url out from
+                            # under us - it will never be consumed. Close it now
+                            # instead of leaking the provider connection.
+                            if reused_probe is not None and not used_reused_probe:
+                                await reused_probe.response.aclose()
+                                reused_probe = None
+
+                            # OPEN provider connection - happens ONLY when client starts consuming
+                            logger.info(
+                                f"Opening provider connection for {stream_id} to {active_url}"
+                            )
+
+                            # Get the stream context manager
+                            stream_context = client_to_use.stream(
+                                "GET",
+                                active_url,
+                                headers=headers,
+                                follow_redirects=True,
+                            )
+                            # If the client returned a coroutine (test stub), await it to get the context manager
+                            if asyncio.iscoroutine(stream_context):
+                                stream_context = await stream_context
+                            # Enter the context to get the response object
+                            response = await stream_context.__aenter__()
 
                         # Now we can call methods on the actual response object
                         response.raise_for_status()
@@ -1727,7 +2078,16 @@ class StreamManager:
                         # IMPORTANT: Async iterators can only be consumed once! We must use the same
                         # iterator for both pre-buffering and main streaming. The pre-buffer phase yields
                         # chunks directly (no storage), then breaks to let the main loop continue seamlessly.
-                        stream_iterator = response.aiter_bytes(chunk_size=32768)
+                        if use_reused_probe:
+                            # The probe already called aiter_bytes() once on this
+                            # response - a second call would conflict with it.
+                            # Continue draining that same generator instead,
+                            # prefixed with the bytes the probe already read off it.
+                            stream_iterator = _prefixed_byte_iter(
+                                reused_probe.prefix, reused_probe.byte_iter
+                            )
+                        else:
+                            stream_iterator = response.aiter_bytes(chunk_size=32768)
 
                         # Initialize last_chunk_time for circuit breaker tracking
                         last_chunk_time = asyncio.get_event_loop().time()
@@ -3861,6 +4221,7 @@ class StreamManager:
             # Note: current_failover_index is already incremented by _resolve_next_failover_url
             stream_info.failover_attempts += 1
             stream_info.last_failover_time = datetime.now(timezone.utc)
+            self._reset_content_type_for_new_url(stream_info, next_url)
 
             logger.info(f"Seamless failover successful for stream {stream_id}")
 
@@ -4277,6 +4638,9 @@ class StreamManager:
                             f"Sticky origin {stream_info.current_url} failed. Reverting to original configured entry point."
                         )
                         stream_info.current_url = None
+                        self._reset_content_type_for_new_url(
+                            stream_info, stream_info.original_url
+                        )
 
                 # Try failover if available and not the last attempt
                 has_failovers = bool(
@@ -4851,6 +5215,7 @@ class StreamManager:
         stream_info.current_url = next_url
         stream_info.failover_attempts += 1
         stream_info.last_failover_time = datetime.now(timezone.utc)
+        self._reset_content_type_for_new_url(stream_info, next_url)
 
         logger.info(
             f"Failover triggered for stream {stream_id} (reason: {reason}): {old_url} -> {stream_info.current_url}"

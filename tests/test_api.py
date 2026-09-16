@@ -1,9 +1,11 @@
 # Add src to path first
 from stream_manager import StreamManager
 from api import app, get_content_type, is_direct_stream
+from config import settings
 import httpx
 import asyncio
 import pytest
+from datetime import datetime, timezone, timedelta
 from fastapi.testclient import TestClient
 from unittest.mock import Mock, AsyncMock, patch
 import sys
@@ -34,6 +36,49 @@ class TestHelperFunctions:
         assert is_direct_stream("playlist.m3u8") is False
         assert is_direct_stream("unknown.xyz") is False
 
+    def test_is_direct_stream_vod_path_m3u8(self):
+        """Provider movie/series URLs ending in .m3u8 aren't reliably real
+        HLS - route them like other VOD content and let the runtime probe
+        (resolve_vod_content_type) redirect to /hls/ if it turns out to be."""
+        assert is_direct_stream("http://p.example.com/movie/u/p/123.m3u8") is True
+        assert is_direct_stream("http://p.example.com/series/u/p/123.m3u8") is True
+        assert is_direct_stream("http://p.example.com/timeshift/u/p/1/2/x.m3u8") is True
+        # Live .m3u8 URLs are unaffected - still routed to the HLS endpoint.
+        assert is_direct_stream("http://p.example.com/live/u/p/123.m3u8") is False
+        assert is_direct_stream("http://p.example.com/hls/stream.m3u8") is False
+        # A live URL that genuinely contains the /movie/ or /series/ path
+        # segment (e.g. an EPG category) must agree with
+        # StreamManager._detect_stream_type()'s /live/ precedence, or the two
+        # classifiers route the same URL inconsistently across entry points.
+        assert is_direct_stream("http://p.example.com/live/movie/u/p/1.m3u8") is False
+        assert is_direct_stream("http://p.example.com/live/series/u/p/1.m3u8") is False
+
+    def test_is_direct_stream_vod_path_extensionless(self):
+        """The movie/series/timeshift carve-out must apply regardless of
+        extension, matching StreamManager._detect_stream_type() exactly - an
+        extensionless /movie/12345 URL is flagged VOD internally regardless
+        of extension, so is_direct_stream() must agree here too."""
+        assert is_direct_stream("http://p.example.com/movie/u/p/12345") is True
+        assert is_direct_stream("http://p.example.com/series/u/p/12345") is True
+        assert is_direct_stream("http://p.example.com/timeshift/u/p/1/2/12345") is True
+
+    def test_is_direct_stream_vod_mpd_routes_to_dash_not_direct(self):
+        """A VOD .mpd URL must still be excluded from direct-stream handling
+        (DASH manifests always go through their own handler) even though its
+        path also matches the movie/series/timeshift VOD marker - the .mpd
+        guard has to run before that marker check, not after it."""
+        assert is_direct_stream("http://p.example.com/movie/u/p/12345.mpd") is False
+        assert is_direct_stream("http://p.example.com/series/u/p/12345.mpd") is False
+
+    def test_is_direct_stream_ignores_live_in_query_string(self):
+        """A genuine VOD URL with '/live/' appearing only in its query string
+        must not be misrouted as a live direct stream because of a bare
+        substring match against the full URL instead of just its path."""
+        assert (
+            is_direct_stream("http://p.example.com/movie/u/p/1.mp4?ref=/live/foo")
+            is True
+        )
+
 
 class TestAPI:
     """Test FastAPI endpoints"""
@@ -46,9 +91,14 @@ class TestAPI:
     def mock_stream_manager(self):
         with patch("api.stream_manager") as mock:
             # Mock the streams dict to include test_stream_123
-            mock.streams = {"test_stream_123": Mock()}
+            mock.streams = {
+                "test_stream_123": Mock(
+                    is_vod=False, is_hls=False, content_type_verified=True
+                )
+            }
 
             mock.get_or_create_stream = AsyncMock(return_value="test_stream_123")
+            mock.resolve_vod_content_type = AsyncMock(return_value=None)
             mock.get_stream_info = Mock(
                 return_value=Mock(
                     stream_id="test_stream_123",
@@ -269,6 +319,652 @@ class TestAPI:
 
         response = client.get("/stream/test_stream_123")
         assert response.status_code == 200
+
+    def test_direct_stream_endpoint_redirects_genuine_hls_vod(self, monkeypatch):
+        """A VOD URL that looks raw but whose response is genuinely HLS should
+        redirect to the HLS endpoint instead of streaming the master playlist
+        as raw bytes (the private-backend-URL leak this probe exists to fix)."""
+        manager = StreamManager()
+        vod_url = "http://provider.example.com/movie/1234.m3u8"
+
+        stream_id = asyncio.run(manager.get_or_create_stream(vod_url))
+        stream_info = manager.streams[stream_id]
+        assert stream_info.is_vod is True
+
+        class _FakeResponse:
+            status_code = 200
+            headers = {}
+
+            def raise_for_status(self):
+                pass
+
+            async def aiter_bytes(self):
+                yield b"#EXTM3U\n#EXT-X-STREAM-INF\nvariant.m3u8"
+
+            async def aclose(self):
+                pass
+
+        async def fake_send(request, stream=True, **kwargs):
+            return _FakeResponse()
+
+        monkeypatch.setattr(manager.http_client, "send", fake_send)
+
+        try:
+            with patch("api.stream_manager", manager):
+                client = TestClient(app)
+                response = client.get(f"/stream/{stream_id}", follow_redirects=False)
+
+            assert response.status_code == 302
+            assert response.headers["location"].endswith(
+                f"/hls/{stream_id}/playlist.m3u8"
+            )
+            assert stream_info.is_hls is True
+            assert stream_info.is_vod is False
+            assert stream_info.content_type_verified is True
+        finally:
+            asyncio.run(manager.http_client.aclose())
+            asyncio.run(manager.live_stream_client.aclose())
+
+    def test_direct_stream_endpoint_keeps_raw_vod_unredirected(self, monkeypatch):
+        """A VOD URL that is genuinely raw media must not be redirected, and
+        should fall through to the normal direct-stream path unchanged."""
+        manager = StreamManager()
+        vod_url = "http://provider.example.com/movie/1234.m3u8"
+
+        stream_id = asyncio.run(manager.get_or_create_stream(vod_url))
+        stream_info = manager.streams[stream_id]
+
+        class _FakeResponse:
+            status_code = 200
+            headers = {}
+
+            def raise_for_status(self):
+                pass
+
+            async def aiter_bytes(self):
+                yield b"\x00\x00\x00\x18ftypmp42"
+
+            async def aclose(self):
+                pass
+
+        async def fake_probe_send(request, stream=True, **kwargs):
+            return _FakeResponse()
+
+        monkeypatch.setattr(manager.http_client, "send", fake_probe_send)
+
+        from fastapi.responses import StreamingResponse
+
+        async def mock_stream_generator():
+            yield b"raw-video-bytes"
+
+        manager.stream_continuous_direct = AsyncMock(
+            return_value=StreamingResponse(
+                mock_stream_generator(), media_type="video/mp4"
+            )
+        )
+
+        try:
+            with patch("api.stream_manager", manager):
+                client = TestClient(app)
+                response = client.get(f"/stream/{stream_id}")
+
+            assert response.status_code == 200
+            assert response.content == b"raw-video-bytes"
+            assert stream_info.is_hls is False
+            assert stream_info.is_vod is True
+            assert stream_info.content_type_verified is True
+        finally:
+            asyncio.run(manager.http_client.aclose())
+            asyncio.run(manager.live_stream_client.aclose())
+
+    def test_direct_stream_endpoint_reuses_probe_connection_for_playback(
+        self, monkeypatch
+    ):
+        """A confirmed-raw VOD stream's very first request must serve
+        playback bytes from the same upstream connection the content-type
+        probe already opened, not open a second one. Some providers issue
+        single-use or session-bound VOD URLs that reject a second request to
+        the same URL outright - opening two connections for one client
+        request breaks playback entirely for those providers."""
+        manager = StreamManager()
+        vod_url = "http://provider.example.com/movie/1234.m3u8"
+        stream_id = asyncio.run(manager.get_or_create_stream(vod_url))
+        stream_info = manager.streams[stream_id]
+
+        connection_count = 0
+        body = b"\x00\x00\x00\x18ftypmp42" + b"restofthevideobytes" * 100
+
+        class _FakeResponse:
+            status_code = 200
+            headers = {}
+
+            def raise_for_status(self):
+                pass
+
+            async def aiter_bytes(self, chunk_size=None):
+                yield body
+
+            async def aclose(self):
+                pass
+
+        async def fake_send(request, stream=True, **kwargs):
+            nonlocal connection_count
+            connection_count += 1
+            return _FakeResponse()
+
+        monkeypatch.setattr(manager.http_client, "send", fake_send)
+
+        def fake_stream(method, url, **kwargs):
+            raise AssertionError(
+                "playback must reuse the probe's connection, not open a "
+                "second one via client.stream()"
+            )
+
+        monkeypatch.setattr(manager.http_client, "stream", fake_stream)
+
+        try:
+            with patch("api.stream_manager", manager):
+                client = TestClient(app)
+                response = client.get(f"/stream/{stream_id}")
+
+            assert response.status_code == 200
+            assert response.content == body
+            assert connection_count == 1
+            assert stream_info.is_vod is True
+            assert stream_info.is_hls is False
+            assert stream_info.content_type_verified is True
+        finally:
+            asyncio.run(manager.http_client.aclose())
+            asyncio.run(manager.live_stream_client.aclose())
+
+    def test_transcoded_vod_stream_is_never_probed_or_redirected(self, monkeypatch):
+        """A transcoded VOD stream must not be probed or redirected to the HLS
+        endpoint - the served content is FFmpeg's output, not the source URL,
+        so the source's real content type is irrelevant here."""
+        manager = StreamManager()
+        vod_url = "http://provider.example.com/movie/1234.m3u8"
+
+        stream_id = asyncio.run(
+            manager.get_or_create_stream(vod_url, is_transcoded=True)
+        )
+        stream_info = manager.streams[stream_id]
+        assert stream_info.is_vod is True
+
+        probe_called = False
+
+        async def fake_probe_send(request, stream=True, **kwargs):
+            nonlocal probe_called
+            probe_called = True
+            raise AssertionError("should not probe a transcoded stream's source")
+
+        monkeypatch.setattr(manager.http_client, "send", fake_probe_send)
+
+        from fastapi.responses import StreamingResponse
+
+        async def mock_transcoded_generator():
+            yield b"transcoded-bytes"
+
+        manager.stream_transcoded = AsyncMock(
+            return_value=StreamingResponse(
+                mock_transcoded_generator(), media_type="video/mp2t"
+            )
+        )
+
+        try:
+            with patch("api.stream_manager", manager):
+                client = TestClient(app)
+                response = client.get(f"/stream/{stream_id}")
+
+            assert response.status_code == 200
+            assert response.content == b"transcoded-bytes"
+            assert probe_called is False
+            assert stream_info.content_type_verified is False
+        finally:
+            asyncio.run(manager.http_client.aclose())
+            asyncio.run(manager.live_stream_client.aclose())
+
+    def test_resolve_vod_content_type_converges_under_concurrency(self, monkeypatch):
+        """Concurrent callers racing to probe a never-before-verified VOD
+        stream may each open their own upstream connection - there's no
+        shared connection to save, since the probe's connection is always
+        the same one that goes on to serve playback. What matters is that
+        they still converge on the same, correct classification rather than
+        corrupting each other's result."""
+        manager = StreamManager()
+        vod_url = "http://provider.example.com/movie/1234.m3u8"
+        stream_id = asyncio.run(manager.get_or_create_stream(vod_url))
+        stream_info = manager.streams[stream_id]
+
+        probe_count = 0
+
+        async def fake_send(request, stream=True, **kwargs):
+            nonlocal probe_count
+            probe_count += 1
+            await asyncio.sleep(0.05)  # widen the race window
+
+            class _FakeResponse:
+                status_code = 200
+                headers = {}
+
+                def raise_for_status(self):
+                    pass
+
+                async def aiter_bytes(self):
+                    yield b"#EXTM3U\nrest"
+
+                async def aclose(self):
+                    pass
+
+            return _FakeResponse()
+
+        monkeypatch.setattr(manager.http_client, "send", fake_send)
+
+        try:
+
+            async def run_concurrent():
+                await asyncio.gather(
+                    manager.resolve_vod_content_type(stream_id),
+                    manager.resolve_vod_content_type(stream_id),
+                    manager.resolve_vod_content_type(stream_id),
+                )
+
+            asyncio.run(run_concurrent())
+
+            assert probe_count == 3
+            assert stream_info.is_hls is True
+            assert stream_info.content_type_verified is True
+        finally:
+            asyncio.run(manager.http_client.aclose())
+            asyncio.run(manager.live_stream_client.aclose())
+
+    def test_probe_skipped_for_unambiguous_raw_video_extension(self, monkeypatch):
+        """A VOD URL with a definite raw-video extension is unambiguous by
+        construction - probing it wastes an upstream connection and up to
+        VOD_PROBE_TIMEOUT of latency for no benefit."""
+        manager = StreamManager()
+        vod_url = "http://provider.example.com/movie/1234.mp4"
+        stream_id = asyncio.run(manager.get_or_create_stream(vod_url))
+        stream_info = manager.streams[stream_id]
+        assert stream_info.is_vod is True
+
+        probe_called = False
+
+        async def fake_send(request, stream=True, **kwargs):
+            nonlocal probe_called
+            probe_called = True
+            raise AssertionError("should not probe an unambiguous .mp4 URL")
+
+        monkeypatch.setattr(manager.http_client, "send", fake_send)
+
+        try:
+            asyncio.run(manager.resolve_vod_content_type(stream_id))
+
+            assert probe_called is False
+            assert stream_info.content_type_verified is True
+            assert stream_info.is_vod is True
+        finally:
+            asyncio.run(manager.http_client.aclose())
+            asyncio.run(manager.live_stream_client.aclose())
+
+    def test_probe_tolerates_leading_whitespace_before_extm3u(self, monkeypatch):
+        """A non-conformant but genuine HLS server can emit a leading blank
+        line or BOM before #EXTM3U - too tight a byte window or a strict
+        startswith() would misclassify it as raw and lock that in forever."""
+        manager = StreamManager()
+        vod_url = "http://provider.example.com/movie/1234.m3u8"
+        stream_id = asyncio.run(manager.get_or_create_stream(vod_url))
+        stream_info = manager.streams[stream_id]
+
+        class _FakeResponse:
+            status_code = 200
+            headers = {}
+
+            def raise_for_status(self):
+                pass
+
+            async def aiter_bytes(self):
+                yield b"\n\n#EXTM3U\n#EXT-X-VERSION:3\nrest-of-playlist"
+
+            async def aclose(self):
+                pass
+
+        async def fake_send(request, stream=True, **kwargs):
+            return _FakeResponse()
+
+        monkeypatch.setattr(manager.http_client, "send", fake_send)
+
+        try:
+            asyncio.run(manager.resolve_vod_content_type(stream_id))
+
+            assert stream_info.is_hls is True
+            assert stream_info.content_type_verified is True
+        finally:
+            asyncio.run(manager.http_client.aclose())
+            asyncio.run(manager.live_stream_client.aclose())
+
+    def test_failover_never_flips_live_stream_to_vod_category(self, monkeypatch):
+        """A failover URL's shape must never change a live/continuous
+        stream's fundamental category - doing so would orphan its existing
+        broadcast-sharing subscribers (gated on is_vod) and pick the wrong
+        httpx client/timeout profile (chosen from is_live_continuous)."""
+        manager = StreamManager()
+        # Primary looks live; failover URL happens to look VOD-shaped.
+        primary_url = "http://primary.example.com/live/u/p/1.ts"
+        failover_url = "http://backup.example.com/movie/u/p/1.mp4"
+
+        stream_id = asyncio.run(
+            manager.get_or_create_stream(primary_url, failover_urls=[failover_url])
+        )
+        stream_info = manager.streams[stream_id]
+        assert stream_info.is_live_continuous is True
+        assert stream_info.is_vod is False
+
+        try:
+            asyncio.run(manager._try_update_failover_url(stream_id, "test_reason"))
+
+            assert stream_info.current_url == failover_url
+            # Category is locked - still live, not reclassified as VOD.
+            assert stream_info.is_live_continuous is True
+            assert stream_info.is_vod is False
+            # Never eligible for probing in the first place, so untouched.
+            assert stream_info.content_type_verified is False
+        finally:
+            asyncio.run(manager.http_client.aclose())
+            asyncio.run(manager.live_stream_client.aclose())
+
+    def test_recycled_stream_starts_unverified(self):
+        """Recycling an orphaned stream_id (0 clients) replaces its
+        StreamInfo entirely, so the fresh session must start unverified and
+        get its own real probe rather than inheriting any prior state."""
+        manager = StreamManager()
+        vod_url = "http://provider.example.com/movie/1234.m3u8"
+
+        try:
+            stream_id = asyncio.run(manager.get_or_create_stream(vod_url))
+            manager.streams[stream_id].content_type_verified = True
+
+            # Recycle: same stream_id, 0 clients, requested again.
+            asyncio.run(manager.get_or_create_stream(vod_url))
+
+            assert manager.streams[stream_id].content_type_verified is False
+        finally:
+            asyncio.run(manager.http_client.aclose())
+            asyncio.run(manager.live_stream_client.aclose())
+
+    def test_probe_discards_stale_result_after_concurrent_failover(self, monkeypatch):
+        """If a failover swaps in a new URL (and resets classification) while
+        a probe for the old URL is still in flight, the in-flight probe's
+        result must not overwrite the fresh state when it finally resolves -
+        otherwise a genuinely-HLS failover URL can be permanently marked
+        "verified, not HLS" from stale data about a different URL entirely."""
+        manager = StreamManager()
+        old_url = "http://old.example.com/movie/1234.m3u8"
+        new_url = "http://new.example.com/movie/1234.m3u8"
+
+        stream_id = asyncio.run(
+            manager.get_or_create_stream(old_url, failover_urls=[new_url])
+        )
+        stream_info = manager.streams[stream_id]
+
+        probe_started = asyncio.Event()
+        release_probe = asyncio.Event()
+
+        async def fake_send(request, stream=True, **kwargs):
+            # Only the (first, old-URL) probe should ever reach here - once
+            # discarded, resolve_vod_content_type() for the new URL runs
+            # again after the lock frees up, but the test asserts on state
+            # before that second call, so a single fake response suffices.
+            probe_started.set()
+            await release_probe.wait()
+
+            class _FakeResponse:
+                status_code = 200
+                headers = {}
+
+                def raise_for_status(self):
+                    pass
+
+                async def aiter_bytes(self):
+                    yield b"#EXTM3U\nrest"
+
+                async def aclose(self):
+                    pass
+
+            return _FakeResponse()
+
+        monkeypatch.setattr(manager.http_client, "send", fake_send)
+
+        try:
+
+            async def scenario():
+                probe_task = asyncio.create_task(
+                    manager.resolve_vod_content_type(stream_id)
+                )
+                await probe_started.wait()
+
+                # Failover swaps the URL and resets classification while the
+                # above probe (for old_url) is still awaiting its response.
+                await manager._try_update_failover_url(stream_id, "test")
+                assert stream_info.current_url == new_url
+                assert stream_info.content_type_verified is False
+
+                # Now let the stale (old_url) probe finish.
+                release_probe.set()
+                await probe_task
+
+            asyncio.run(scenario())
+
+            # The stale probe's "genuine HLS" result about old_url must not
+            # have been committed - the fresh, post-failover state stands.
+            assert stream_info.current_url == new_url
+            assert stream_info.content_type_verified is False
+        finally:
+            asyncio.run(manager.http_client.aclose())
+            asyncio.run(manager.live_stream_client.aclose())
+
+    def test_probe_failure_does_not_permanently_lock_in_classification(
+        self, monkeypatch
+    ):
+        """A network error during the probe must not mark content_type_verified
+        - otherwise one transient blip on a genuinely-HLS stream would lock it
+        into being served raw forever, the exact bug this probe exists to fix."""
+        manager = StreamManager()
+        vod_url = "http://provider.example.com/movie/1234.m3u8"
+        stream_id = asyncio.run(manager.get_or_create_stream(vod_url))
+        stream_info = manager.streams[stream_id]
+
+        async def fake_send_error(request, stream=True, **kwargs):
+            raise httpx.ConnectTimeout("simulated network blip")
+
+        monkeypatch.setattr(manager.http_client, "send", fake_send_error)
+
+        try:
+            asyncio.run(manager.resolve_vod_content_type(stream_id))
+
+            assert stream_info.content_type_verified is False
+            assert stream_info.content_type_probe_failed_at is not None
+        finally:
+            asyncio.run(manager.http_client.aclose())
+            asyncio.run(manager.live_stream_client.aclose())
+
+    def test_probe_skips_retry_within_cooldown_then_retries_after(self, monkeypatch):
+        """After a failed probe, requests within the cooldown window must not
+        re-probe (avoids hammering a flaky upstream), but a request after the
+        cooldown expires must get a real, fresh answer."""
+        manager = StreamManager()
+        vod_url = "http://provider.example.com/movie/1234.m3u8"
+        stream_id = asyncio.run(manager.get_or_create_stream(vod_url))
+        stream_info = manager.streams[stream_id]
+
+        probe_count = 0
+
+        async def fake_send_success(request, stream=True, **kwargs):
+            nonlocal probe_count
+            probe_count += 1
+
+            class _FakeResponse:
+                status_code = 200
+                headers = {}
+
+                def raise_for_status(self):
+                    pass
+
+                async def aiter_bytes(self):
+                    yield b"#EXTM3U\nrest"
+
+                async def aclose(self):
+                    pass
+
+            return _FakeResponse()
+
+        monkeypatch.setattr(manager.http_client, "send", fake_send_success)
+
+        try:
+            # Simulate a failure that just happened - well within the cooldown.
+            stream_info.content_type_probe_failed_at = datetime.now(timezone.utc)
+            asyncio.run(manager.resolve_vod_content_type(stream_id))
+            assert probe_count == 0
+            assert stream_info.content_type_verified is False
+
+            # Simulate the cooldown having fully elapsed.
+            stream_info.content_type_probe_failed_at = datetime.now(
+                timezone.utc
+            ) - timedelta(seconds=settings.VOD_PROBE_RETRY_COOLDOWN + 1)
+            asyncio.run(manager.resolve_vod_content_type(stream_id))
+            assert probe_count == 1
+            assert stream_info.is_hls is True
+            assert stream_info.content_type_verified is True
+        finally:
+            asyncio.run(manager.http_client.aclose())
+            asyncio.run(manager.live_stream_client.aclose())
+
+    def test_head_direct_stream_probes_and_redirects_on_first_request(
+        self, monkeypatch
+    ):
+        """A player's HEAD before any GET must not skip content-type probing -
+        otherwise HEAD hits the raw backend URL directly for what turns out
+        to be a genuine HLS master playlist."""
+        manager = StreamManager()
+        vod_url = "http://provider.example.com/movie/1234.m3u8"
+        stream_id = asyncio.run(manager.get_or_create_stream(vod_url))
+        stream_info = manager.streams[stream_id]
+        assert stream_info.content_type_verified is False
+
+        class _FakeResponse:
+            status_code = 200
+            headers = {}
+
+            def raise_for_status(self):
+                pass
+
+            async def aiter_bytes(self):
+                yield b"#EXTM3U\nrest"
+
+            async def aclose(self):
+                pass
+
+        async def fake_send(request, stream=True, **kwargs):
+            return _FakeResponse()
+
+        monkeypatch.setattr(manager.http_client, "send", fake_send)
+
+        try:
+            with patch("api.stream_manager", manager):
+                client = TestClient(app)
+                response = client.head(f"/stream/{stream_id}", follow_redirects=False)
+
+            assert response.status_code == 302
+            assert response.headers["location"].endswith(
+                f"/hls/{stream_id}/playlist.m3u8"
+            )
+            assert stream_info.content_type_verified is True
+        finally:
+            asyncio.run(manager.http_client.aclose())
+            asyncio.run(manager.live_stream_client.aclose())
+
+    def test_hls_redirect_forwards_explicit_client_id_and_username(self, monkeypatch):
+        """An explicit client_id/username passed to /stream/ must survive the
+        redirect to /hls/, or session/client-record continuity breaks."""
+        manager = StreamManager()
+        vod_url = "http://provider.example.com/movie/1234.m3u8"
+        stream_id = asyncio.run(manager.get_or_create_stream(vod_url))
+
+        class _FakeResponse:
+            status_code = 200
+            headers = {}
+
+            def raise_for_status(self):
+                pass
+
+            async def aiter_bytes(self):
+                yield b"#EXTM3U\nrest"
+
+            async def aclose(self):
+                pass
+
+        async def fake_send(request, stream=True, **kwargs):
+            return _FakeResponse()
+
+        monkeypatch.setattr(manager.http_client, "send", fake_send)
+
+        try:
+            with patch("api.stream_manager", manager):
+                client = TestClient(app)
+                response = client.get(
+                    f"/stream/{stream_id}",
+                    params={"client_id": "my-fixed-id", "username": "alice"},
+                    follow_redirects=False,
+                )
+
+            assert response.status_code == 302
+            location = response.headers["location"]
+            assert "client_id=my-fixed-id" in location
+            assert "username=alice" in location
+        finally:
+            asyncio.run(manager.http_client.aclose())
+            asyncio.run(manager.live_stream_client.aclose())
+
+    def test_hls_redirect_forwards_username_shorthand_aliases(self, monkeypatch):
+        """get_client_info() accepts username under 'user' or 'u' as well as
+        'username' - the redirect must not silently drop those aliases."""
+        manager = StreamManager()
+        vod_url = "http://provider.example.com/movie/1234.m3u8"
+
+        class _FakeResponse:
+            status_code = 200
+            headers = {}
+
+            def raise_for_status(self):
+                pass
+
+            async def aiter_bytes(self):
+                yield b"#EXTM3U\nrest"
+
+            async def aclose(self):
+                pass
+
+        async def fake_send(request, stream=True, **kwargs):
+            return _FakeResponse()
+
+        monkeypatch.setattr(manager.http_client, "send", fake_send)
+
+        try:
+            with patch("api.stream_manager", manager):
+                client = TestClient(app)
+                for i, alias in enumerate(("user", "u")):
+                    stream_id = asyncio.run(
+                        manager.get_or_create_stream(f"{vod_url}?variant={i}")
+                    )
+                    response = client.get(
+                        f"/stream/{stream_id}",
+                        params={alias: "bob"},
+                        follow_redirects=False,
+                    )
+                    assert response.status_code == 302
+                    assert "username=bob" in response.headers["location"]
+        finally:
+            asyncio.run(manager.http_client.aclose())
+            asyncio.run(manager.live_stream_client.aclose())
 
     def test_direct_stream_endpoint_recovers_from_redirect_502(self, monkeypatch):
         """API regression: /stream recovers when sticky redirected upstream returns 502 on reconnect."""

@@ -1,4 +1,10 @@
-from stream_manager import StreamManager, ClientInfo, StreamInfo, M3U8Processor
+from stream_manager import (
+    StreamManager,
+    ClientInfo,
+    StreamInfo,
+    M3U8Processor,
+    is_vod_path_marker,
+)
 import pytest
 import asyncio
 from datetime import datetime, timezone
@@ -282,6 +288,58 @@ class TestStreamManager:
         # Same URL should generate same ID
         stream_id2 = await stream_manager.get_or_create_stream(url)
         assert stream_id == stream_id2
+
+    def test_detect_stream_type_movie_series_m3u8_is_vod(self, stream_manager):
+        """Provider movie/series URLs ending in .m3u8 aren't reliably real
+        HLS - path context should win over the extension guess."""
+        assert stream_manager._detect_stream_type(
+            "http://p.example.com/movie/u/p/123.m3u8"
+        ) == (False, True, False)
+        assert stream_manager._detect_stream_type(
+            "http://p.example.com/series/u/p/123.m3u8"
+        ) == (False, True, False)
+
+    def test_detect_stream_type_live_wins_over_movie_series_path(self, stream_manager):
+        """A live channel URL that genuinely contains the /movie/ or /series/
+        path segment (e.g. an EPG category segment) must stay
+        live-classified, not fall into the VOD bucket and lose
+        shared-broadcast-connection handling."""
+        assert stream_manager._detect_stream_type(
+            "http://p.example.com/live/movie/u/p/1.m3u8"
+        ) == (True, False, False)
+        assert stream_manager._detect_stream_type(
+            "http://p.example.com/live/series/u/p/1.m3u8"
+        ) == (True, False, False)
+        # Sanity check: without the guard, this URL would go through the
+        # VOD-path branch on its own merits - confirms the assertions above
+        # are actually exercising the /live/ precedence, not a no-op.
+        assert stream_manager._detect_stream_type(
+            "http://p.example.com/movie/u/p/1.m3u8"
+        ) == (False, True, False)
+
+    def test_is_vod_path_marker_shared_by_both_classifiers(self):
+        """_detect_stream_type() and api.is_direct_stream() both delegate to
+        this function for the movie/series/timeshift/live check - a direct
+        test here pins the contract both actually rely on, instead of only
+        being verified indirectly through each classifier's own tests."""
+        assert is_vod_path_marker("http://p.example.com/movie/u/p/1.m3u8") is True
+        assert is_vod_path_marker("http://p.example.com/movie/u/p/1") is True
+        assert is_vod_path_marker("http://p.example.com/live/movie/u/p/1.m3u8") is False
+        assert is_vod_path_marker("http://p.example.com/live/u/p/1.ts") is False
+
+    def test_is_vod_path_marker_ignores_live_in_query_string(self):
+        """The /live/ override must only apply to the path, not the whole URL
+        - a genuine VOD URL with /live/ appearing in its query string (e.g.
+        a referrer/category param) must still be classified as VOD, not
+        flipped to live just because that substring shows up after the '?'."""
+        assert (
+            is_vod_path_marker("http://p.example.com/movie/u/p/1.mp4?ref=/live/foo")
+            is True
+        )
+        assert (
+            is_vod_path_marker("http://p.example.com/series/u/p/1?from=/live/tv")
+            is True
+        )
 
     def test_get_stream_info_nonexistent(self, stream_manager):
         # Current API doesn't have get_stream_info method

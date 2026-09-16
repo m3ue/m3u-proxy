@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Query, Response, Request, Depends, Header
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import asyncio
@@ -8,13 +8,19 @@ import logging
 import hashlib
 import subprocess
 import uuid
-from urllib.parse import unquote, urlparse, urljoin
+from urllib.parse import unquote, urlparse, urljoin, urlencode
 from typing import Optional, List, Dict, Literal
 from pydantic import BaseModel, field_validator
 from datetime import datetime, timezone
 import os
 
-from stream_manager import StreamManager, DashProcessor
+from stream_manager import (
+    StreamManager,
+    StreamInfo,
+    DashProcessor,
+    is_vod_path_marker,
+    ReusableProbeResponse,
+)
 from events import EventManager
 from models import StreamEvent, EventType, WebhookConfig
 from config import settings, VERSION
@@ -89,15 +95,94 @@ def is_direct_stream(url: str) -> bool:
     """Check if URL is a direct stream (not HLS playlist, not DASH manifest)"""
     # Split off query string before checking extension
     path = str(url).split("?")[0].lower()
-    # M3U8 and MPD URLs are always routed to their own handlers, even if
-    # /live/ appears in the path
-    if path.endswith(".m3u8") or path.endswith(".mpd"):
+
+    # DASH manifests always route to their own handler regardless of path,
+    # even a /movie/ or /series/ one - this guard must run before the VOD
+    # marker check below, or a VOD .mpd URL would be misclassified as a
+    # direct stream.
+    if path.endswith(".mpd"):
+        return False
+
+    # Provider VOD/movie/series/timeshift URLs are on-demand content
+    # regardless of extension - including ending in .m3u8 without being
+    # genuine HLS, or having no extension at all. Uses the exact same check
+    # as StreamManager._detect_stream_type() (imported, not reimplemented)
+    # so the two classifiers can't drift out of agreement - an extensionless
+    # /movie/12345 URL must get the same answer here as it does internally.
+    # The runtime content-type probe (StreamManager.resolve_vod_content_type)
+    # corrects the .m3u8 case and hands off to /hls/ if the actual response
+    # is real HLS.
+    if is_vod_path_marker(url):
+        return True
+
+    # M3U8 URLs are always routed to their own handler, even if /live/
+    # appears in the path
+    if path.endswith(".m3u8"):
         return False
     return (
         path.endswith((".ts", ".mp4", ".mkv", ".webm", ".avi"))
         or str(url).lower().endswith("?profile=pass")
         or "/live/" in str(url)
     )
+
+
+def _hls_redirect_url(
+    stream_id: str, request: Request, client_id: Optional[str] = None
+) -> str:
+    """Build the redirect target for a VOD stream confirmed to be genuine HLS,
+    forwarding traceability/session params a caller may have passed to /stream/
+    so they carry over to the /hls/ endpoint's own client-id resolution."""
+    root_path = getattr(settings, "ROOT_PATH", "")
+    redirect_url = f"{root_path}/hls/{stream_id}/playlist.m3u8"
+    params = {}
+    # Reuse get_client_info()'s own alias/header resolution instead of
+    # duplicating it here, so this stays in sync with what it actually accepts.
+    username = get_client_info(request).get("username")
+    if username:
+        params["username"] = username
+    if client_id:
+        params["client_id"] = client_id
+    if params:
+        redirect_url += f"?{urlencode(params)}"
+    return redirect_url
+
+
+async def _probe_and_redirect_if_hls(
+    stream_manager: StreamManager,
+    stream_info: StreamInfo,
+    stream_id: str,
+    request: Request,
+    client_id: Optional[str] = None,
+    reuse_for_playback: bool = False,
+) -> tuple[Optional[RedirectResponse], Optional[ReusableProbeResponse]]:
+    """Shared by get_direct_stream/head_direct_stream: confirm a VOD stream's
+    real content type (once) and, if it's genuine HLS, redirect to the HLS
+    endpoint instead of streaming it as raw bytes.
+
+    Returns (redirect, reused_probe). redirect is None when the caller should
+    proceed with its normal direct-stream handling. reused_probe is only ever
+    non-None when reuse_for_playback=True and this call performed a fresh
+    probe that confirmed direct (non-HLS) media - see ReusableProbeResponse's
+    docstring. A caller that receives one and doesn't intend to consume it
+    (e.g. a HEAD request, which has no body) must close its `.response`."""
+    reused_probe = None
+    if (
+        not stream_info.is_transcoded
+        and stream_info.is_vod
+        and not stream_info.content_type_verified
+    ):
+        reused_probe = await stream_manager.resolve_vod_content_type(
+            stream_id, reuse_for_playback=reuse_for_playback
+        )
+    if not stream_info.is_transcoded and stream_info.is_hls:
+        return (
+            RedirectResponse(
+                url=_hls_redirect_url(stream_id, request, client_id),
+                status_code=302,
+            ),
+            reused_probe,
+        )
+    return None, reused_probe
 
 
 def detect_https_from_headers(request: Request) -> bool:
@@ -1650,9 +1735,36 @@ async def get_direct_stream(
     ),
 ):
     """Serve direct streams (.ts, .mp4, .mkv, etc.) for IPTV"""
+    # Bound up front (and closed in the except handler below) so that any
+    # exception raised after the probe is acquired but before it's handed
+    # off to stream_continuous_direct/stream_transcoded - e.g. register_client()
+    # failing - can't leak the still-open upstream connection.
+    reused_probe: Optional[ReusableProbeResponse] = None
     try:
         # The stream_id is now validated by the resolve_stream_id dependency
         stream_info = stream_manager.streams[stream_id]
+
+        # Provider VOD/movie/series URLs are sometimes routed here despite
+        # actually being genuine HLS (the URL extension alone isn't reliable
+        # for this content class). Probe once and hand off to the HLS
+        # endpoint if so, instead of streaming a master playlist as raw bytes.
+        # reuse_for_playback=True: this handler goes on to stream the body
+        # itself, so a confirmed-direct-media probe's still-open connection
+        # can be handed straight to stream_continuous_direct below instead of
+        # opening a second one - see ReusableProbeResponse's docstring.
+        redirect, reused_probe = await _probe_and_redirect_if_hls(
+            stream_manager,
+            stream_info,
+            stream_id,
+            request,
+            client_id,
+            reuse_for_playback=True,
+        )
+        if redirect is not None:
+            if reused_probe is not None:
+                await reused_probe.response.aclose()
+            return redirect
+
         stream_url = stream_info.current_url or stream_info.original_url
 
         # Generate or reuse client ID based on request characteristics.
@@ -1772,6 +1884,13 @@ async def get_direct_stream(
                 f"Using transcoded stream for {stream_id} with profile: {stream_info.transcode_profile}"
             )
 
+            # Transcoded streams never produce a reused_probe (resolve_vod_content_type
+            # exempts them), but close defensively rather than leak a connection
+            # if that ever changes.
+            if reused_probe is not None:
+                await reused_probe.response.aclose()
+                reused_probe = None
+
             # For transcoded streams outputting to pipe:1 or other non-HLS formats,
             # use streamed transcoding path
             response = await stream_manager.stream_transcoded(
@@ -1785,11 +1904,26 @@ async def get_direct_stream(
 
             return response
         else:
+            # A Range request wasn't what the probe's plain GET represented -
+            # don't hand it to a request that needs different bytes than the
+            # probe already started reading from byte 0.
+            if reused_probe is not None and range_header:
+                await reused_probe.response.aclose()
+                reused_probe = None
+
             # Use direct proxy for continuous streams
             # This provides true byte-for-byte proxying with per-client connections
             response = await stream_manager.stream_continuous_direct(
-                stream_id, client_id, range_header=range_header
+                stream_id,
+                client_id,
+                range_header=range_header,
+                reused_probe=reused_probe,
             )
+            # Ownership of any still-open probe connection has now passed to
+            # stream_continuous_direct's generator, which is responsible for
+            # closing it - don't let the except block below double-close it
+            # if something after this point raises.
+            reused_probe = None
 
             # Start ASGI disconnect monitor so the generator exits promptly
             # when the client disconnects.  Without this, the primary generator
@@ -1804,6 +1938,15 @@ async def get_direct_stream(
     except Exception as e:
         logger.error(f"Error serving direct stream: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        # Belt-and-suspenders: every intentional exit path above already
+        # closes/clears reused_probe, so this only fires if something
+        # raised in between - without it, that connection leaks silently.
+        if reused_probe is not None:
+            try:
+                await reused_probe.response.aclose()
+            except Exception:
+                pass
 
 
 @app.head("/stream/{stream_id}")
@@ -1821,6 +1964,20 @@ async def head_direct_stream(
     try:
         # The stream_id is now validated by the resolve_stream_id dependency
         stream_info = stream_manager.streams[stream_id]
+
+        # Probe and redirect exactly as the GET handler does - a player may
+        # issue HEAD before its first GET, and that must not bypass detection.
+        # reuse_for_playback is left False here: HEAD never streams a body,
+        # so there's nothing to hand a reused connection to - close it
+        # immediately rather than let it dangle.
+        redirect, reused_probe = await _probe_and_redirect_if_hls(
+            stream_manager, stream_info, stream_id, request, client_id
+        )
+        if reused_probe is not None:
+            await reused_probe.response.aclose()
+        if redirect is not None:
+            return redirect
+
         stream_url = stream_info.current_url or stream_info.original_url
 
         # Determine content type
@@ -2310,7 +2467,6 @@ async def delete_oldest_stream_by_metadata(
             del stream_manager.streams[oldest_stream_id]
         if oldest_stream_id in stream_manager.stream_clients:
             del stream_manager.stream_clients[oldest_stream_id]
-
         stream_manager._stats.active_streams -= 1
 
         return {
@@ -2460,7 +2616,6 @@ async def delete_streams_by_metadata(
                     del stream_manager.streams[stream_id]
                 if stream_id in stream_manager.stream_clients:
                     del stream_manager.stream_clients[stream_id]
-
                 stream_manager._stats.active_streams -= 1
                 deleted_streams.append(stream_id)
 
@@ -2523,7 +2678,6 @@ async def delete_stream(stream_id: str):
             del stream_manager.streams[stream_id]
         if stream_id in stream_manager.stream_clients:
             del stream_manager.stream_clients[stream_id]
-
         stream_manager._stats.active_streams -= 1
 
         return {"message": f"Stream {stream_id} deleted"}
