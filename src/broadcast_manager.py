@@ -17,6 +17,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set
+from urllib.parse import urlparse
 
 import httpx
 
@@ -210,6 +211,21 @@ class NetworkBroadcastProcess:
                     "10",
                 ]
             )
+
+            # Some providers disguise HLS segments as .jpg/.css, which FFmpeg's
+            # HLS demuxer rejects unless its extension checks are relaxed. These
+            # options are HLS-only (FFmpeg aborts on them for other inputs).
+            if isinstance(url, str) and urlparse(url).path.lower().endswith(".m3u8"):
+                cmd.extend(
+                    [
+                        "-allowed_extensions",
+                        "ALL",
+                        "-allowed_segment_extensions",
+                        "ALL",
+                        "-extension_picky",
+                        "0",
+                    ]
+                )
 
             # If headers are provided explicitly in the BroadcastConfig, prefer them.
             if (
