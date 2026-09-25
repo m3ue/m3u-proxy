@@ -1618,7 +1618,7 @@ def _start_disconnect_monitor(
                             f"ASGI disconnect: signaling subscribers for "
                             f"stream {stream_id} (primary was {client_id})"
                         )
-                        sm._signal_subscribers_end(stream_id)
+                        sm._signal_subscribers_end(stream_id, conn_id)
 
                     # Remove the client immediately instead of waiting for the
                     # generator to unwind (it may never resume) or the periodic

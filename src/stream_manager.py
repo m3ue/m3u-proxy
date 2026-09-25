@@ -361,6 +361,49 @@ class DashProcessor:
             return content
 
 
+class ShieldedUpstreamReader:
+    """Async iterator over upstream chunks whose in-flight read survives cancellation.
+
+    When a live client disconnects, Starlette cancels the task that is streaming
+    to it — usually while it is awaiting the next upstream chunk. Cancelling a
+    read on httpx's ``aiter_bytes()`` closes the underlying provider connection,
+    so the connection could never be handed off to a promoted subscriber. Reads
+    here run in their own task behind ``asyncio.shield``: cancelling (or timing
+    out) the caller leaves the read running, and the next ``__anext__`` — from
+    whoever inherits this reader — picks up its result without losing data.
+    """
+
+    def __init__(self, iterator) -> None:
+        self._iterator = iterator
+        self._pending: Optional[asyncio.Future] = None
+
+    def __aiter__(self) -> "ShieldedUpstreamReader":
+        return self
+
+    async def _read(self) -> bytes:
+        return await self._iterator.__anext__()
+
+    @staticmethod
+    def _consume_result(future: asyncio.Future) -> None:
+        # Retrieve the outcome of an abandoned read so asyncio doesn't log
+        # "exception was never retrieved" once the connection is closed.
+        if not future.cancelled():
+            future.exception()
+
+    async def __anext__(self) -> bytes:
+        if self._pending is None:
+            self._pending = asyncio.ensure_future(self._read())
+            self._pending.add_done_callback(self._consume_result)
+        pending = self._pending
+        try:
+            return await asyncio.shield(pending)
+        finally:
+            # Keep the read pending only if this caller was cancelled or timed
+            # out before it finished; otherwise the next call starts a new one.
+            if pending.done() and self._pending is pending:
+                self._pending = None
+
+
 class StreamManager:
     def __init__(self, redis_url: Optional[str] = None, enable_pooling: bool = True):
         self.streams: Dict[str, StreamInfo] = {}
@@ -392,6 +435,10 @@ class StreamManager:
         self._handoff_upstream: Dict[
             str, tuple
         ] = {}  # stream_id -> (stream_context, response, stream_iterator)
+        # Set once the departing primary's cleanup has decided whether to hand
+        # off its upstream connection, so the promoted subscriber can wait for
+        # the handoff instead of racing it and opening a second connection.
+        self._handoff_settled: Dict[str, asyncio.Event] = {}
 
         # Pooling configuration
         self.enable_pooling = enable_pooling
@@ -750,6 +797,7 @@ class StreamManager:
                 self.stream_clients.pop(stream_id, None)
                 self._direct_broadcast_primary.pop(stream_id, None)
                 self._direct_broadcast_queues.pop(stream_id, None)
+                self._handoff_settled.pop(stream_id, None)
                 self._stats.active_streams = max(0, self._stats.active_streams - 1)
 
         if stream_id not in self.streams:
@@ -967,7 +1015,7 @@ class StreamManager:
                     f"Primary reader {client_id} disconnecting from broadcast stream {stream_id}, "
                     f"signaling subscribers to promote"
                 )
-                self._signal_subscribers_end(stream_id)
+                self._signal_subscribers_end(stream_id, effective_conn_id)
 
             if stream_id and stream_id in self.stream_clients:
                 self.stream_clients[stream_id].discard(client_id)
@@ -1098,15 +1146,144 @@ class StreamManager:
                 except asyncio.QueueFull:
                     pass
 
-    def _signal_subscribers_end(self, stream_id: str) -> None:
-        """Signal all subscribers that the primary reader has stopped."""
-        queues = self._direct_broadcast_queues.pop(stream_id, {})
-        for queue in queues.values():
+    def _signal_subscribers_end(
+        self, stream_id: str, primary_connection_id: str
+    ) -> None:
+        """Hand a broadcast stream over to one subscriber after its primary stops.
+
+        Only the current primary can trigger this, so the repeated safety-net
+        calls from the departing primary's cleanup paths are no-ops once a
+        subscriber has taken over. The chosen subscriber is registered as primary
+        immediately (before its generator resumes), which keeps new clients
+        subscribing rather than opening their own upstream. Every other
+        subscriber stays attached and receives chunks from the new primary.
+        """
+        if self._direct_broadcast_primary.get(stream_id) != primary_connection_id:
+            return
+
+        queues = self._direct_broadcast_queues.get(stream_id)
+        # Drop subscribers whose own client already disconnected: their queue
+        # lingers until their generator is finalized, and promoting one would
+        # leave the stream with a primary that never reads.
+        for conn_id in list(queues or {}):
+            cancel = self.connection_cancel_events.get(conn_id)
+            if cancel is None or cancel.is_set():
+                queues.pop(conn_id, None)
+        if not queues:
+            self._direct_broadcast_primary.pop(stream_id, None)
+            self._direct_broadcast_queues.pop(stream_id, None)
+            self._handoff_settled.pop(stream_id, None)
+            return
+
+        # The departing primary only hands off its upstream connection when it
+        # left because its client disconnected, so only then is it worth waiting.
+        departing_cancel = self.connection_cancel_events.get(primary_connection_id)
+        stream_info = self.streams.get(stream_id)
+        if (
+            departing_cancel is not None
+            and departing_cancel.is_set()
+            and stream_info is not None
+            and not stream_info.is_vod
+        ):
+            self._handoff_settled[stream_id] = asyncio.Event()
+        else:
+            self._handoff_settled.pop(stream_id, None)
+
+        next_connection_id = next(iter(queues))
+        next_queue = queues.pop(next_connection_id)
+        self._direct_broadcast_primary[stream_id] = next_connection_id
+
+        try:
+            next_queue.put_nowait(None)  # None sentinel = promote to primary
+        except asyncio.QueueFull:
             try:
-                queue.put_nowait(None)  # None sentinel = end of stream
+                next_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            next_queue.put_nowait(None)
+
+    def _settle_handoff(self, stream_id: str) -> None:
+        """Wake a promoted subscriber waiting on this stream's upstream handoff."""
+        settled = self._handoff_settled.get(stream_id)
+        if settled is not None:
+            settled.set()
+
+    def _can_hand_off_upstream(
+        self, stream_id: str, client_id: str, cancel_event: asyncio.Event
+    ) -> bool:
+        """Whether a departing primary should park its upstream for a subscriber.
+
+        Only when its own client disconnected (the upstream is still healthy),
+        the stream is live, and other clients are still watching.
+        """
+        stream_info = self.streams.get(stream_id)
+        return (
+            cancel_event.is_set()
+            and stream_info is not None
+            and not stream_info.is_vod
+            and len(self.stream_clients.get(stream_id, set()) - {client_id}) > 0
+        )
+
+    def _offer_upstream_handoff(
+        self, stream_id: str, client_id: str, handoff_entry: tuple
+    ) -> None:
+        """Park a departing primary's upstream connection for the promoted subscriber.
+
+        Reusing the connection avoids opening a second one (which could exceed
+        provider limits and makes the provider replay its buffer). The entry is
+        closed if nobody claims it within 5 seconds.
+        """
+        self._handoff_upstream[stream_id] = handoff_entry
+        logger.info(
+            f"Upstream connection handed off for stream {stream_id} "
+            f"(client {client_id} disconnected, subscriber will inherit)"
+        )
+
+        async def _cleanup_handoff() -> None:
+            await asyncio.sleep(5)
+            # Only close this entry — a newer handoff for the same stream may
+            # have replaced it in the meantime.
+            if self._handoff_upstream.get(stream_id) is not handoff_entry:
+                return
+            self._handoff_upstream.pop(stream_id, None)
+            try:
+                await handoff_entry[0].__aexit__(None, None, None)
             except Exception:
                 pass
-        self._direct_broadcast_primary.pop(stream_id, None)
+            logger.info(f"Closed unclaimed handoff upstream for stream {stream_id}")
+
+        asyncio.ensure_future(_cleanup_handoff())
+
+    async def _claim_handoff(self, stream_id: str) -> Optional[tuple]:
+        """Take the departing primary's upstream connection, if it offers one.
+
+        The departing primary stores the handoff from its generator's finally
+        block, which can run after this subscriber has already been promoted.
+        When a handoff is expected, wait up to PRIMARY_HANDOFF_WAIT_SECONDS for
+        it rather than opening a new connection straight away.
+        """
+        handoff = self._handoff_upstream.pop(stream_id, None)
+        if handoff is not None:
+            return handoff
+
+        settled = self._handoff_settled.get(stream_id)
+        if settled is None:
+            return None
+
+        try:
+            await asyncio.wait_for(
+                settled.wait(), timeout=settings.PRIMARY_HANDOFF_WAIT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            logger.info(
+                f"No upstream handoff for stream {stream_id} within "
+                f"{settings.PRIMARY_HANDOFF_WAIT_SECONDS}s"
+            )
+        finally:
+            if self._handoff_settled.get(stream_id) is settled:
+                self._handoff_settled.pop(stream_id, None)
+
+        return self._handoff_upstream.pop(stream_id, None)
 
     async def _serve_subscriber_stream(
         self,
@@ -1264,7 +1441,8 @@ class StreamManager:
     ):
         """Async generator for a subscriber that has been promoted to primary.
 
-        Opens a fresh upstream connection and streams chunks to the client
+        Inherits the departing primary's upstream connection when it was handed
+        off (falling back to a fresh connection) and streams chunks to the client
         while broadcasting to any remaining subscribers.  This is a simplified
         version of the full generate() inside stream_continuous_direct —
         it handles the common case (upstream works, stream until client or
@@ -1300,57 +1478,82 @@ class StreamManager:
             else self.http_client
         )
 
+        async def _open_fresh_upstream():
+            logger.info(
+                f"Promoted subscriber {client_id} opening new upstream connection "
+                f"for stream {stream_id} to {active_url}"
+            )
+            ctx = client_to_use.stream(
+                "GET", active_url, headers=headers, follow_redirects=True
+            )
+            if asyncio.iscoroutine(ctx):
+                ctx = await ctx
+            resp = await ctx.__aenter__()
+            try:
+                resp.raise_for_status()
+            except Exception:
+                await ctx.__aexit__(None, None, None)
+                raise
+            logger.info(
+                f"Promoted primary connected: {resp.status_code} for stream {stream_id}"
+            )
+            return ctx, resp
+
+        chunk_timeout = (
+            settings.LIVE_CHUNK_TIMEOUT_SECONDS
+            if hasattr(settings, "LIVE_CHUNK_TIMEOUT_SECONDS")
+            else 5.0
+        )
+
+        async def _next_chunk(iterator):
+            if chunk_timeout and chunk_timeout > 0:
+                return await asyncio.wait_for(
+                    iterator.__anext__(), timeout=chunk_timeout
+                )
+            return await iterator.__anext__()
+
         stream_context = None
         try:
-            # Check for a handed-off upstream connection (stored by the
-            # primary's finally block when it exited due to client disconnect).
-            # This reuses the SAME TCP connection — no new connection, no gap.
-            handoff = self._handoff_upstream.pop(stream_id, None)
-            inherited_iterator = None
+            # Prefer the departing primary's upstream connection (stored by its
+            # finally block when it exited due to client disconnect). Reusing the
+            # SAME TCP connection continues from exactly where the old primary
+            # left off; a fresh connection makes the provider replay its buffer
+            # and costs an extra provider connection slot.
+            handoff = await self._claim_handoff(stream_id)
+            first_chunk = None
+            stream_iterator = None
             if handoff:
-                stream_context, response, inherited_iterator = handoff
+                stream_context, response, stream_iterator = handoff
                 logger.info(
                     f"Promoted subscriber {client_id} inherited upstream "
                     f"connection for stream {stream_id} (seamless handoff)"
                 )
-            else:
-                logger.info(
-                    f"Promoted subscriber {client_id} opening new upstream connection "
-                    f"for stream {stream_id} to {active_url}"
-                )
+                try:
+                    first_chunk = await _next_chunk(stream_iterator)
+                except Exception as e:
+                    logger.warning(
+                        f"Inherited upstream for stream {stream_id} is unusable "
+                        f"({type(e).__name__}), opening a new connection"
+                    )
+                    try:
+                        await stream_context.__aexit__(None, None, None)
+                    except Exception:
+                        pass
+                    stream_context = None
+                    stream_iterator = None
 
-                stream_context = client_to_use.stream(
-                    "GET", active_url, headers=headers, follow_redirects=True
+            if stream_iterator is None:
+                stream_context, response = await _open_fresh_upstream()
+                stream_iterator = ShieldedUpstreamReader(
+                    response.aiter_bytes(chunk_size=32768)
                 )
-                if asyncio.iscoroutine(stream_context):
-                    stream_context = await stream_context
-                response = await stream_context.__aenter__()
-                response.raise_for_status()
-
-                logger.info(
-                    f"Promoted primary connected: {response.status_code} for stream {stream_id}"
-                )
-
-            chunk_timeout = (
-                settings.LIVE_CHUNK_TIMEOUT_SECONDS
-                if hasattr(settings, "LIVE_CHUNK_TIMEOUT_SECONDS")
-                else 5.0
-            )
-            # Reuse the inherited iterator if available — it continues from
-            # exactly where the old primary left off (same TCP connection,
-            # same byte position).  Otherwise create a fresh one.
-            stream_iterator = inherited_iterator or response.aiter_bytes(
-                chunk_size=32768
-            )
 
             while True:
                 try:
-                    if chunk_timeout and chunk_timeout > 0:
-                        chunk = await asyncio.wait_for(
-                            stream_iterator.__anext__(), timeout=chunk_timeout
-                        )
+                    if first_chunk is not None:
+                        chunk, first_chunk = first_chunk, None
                     else:
-                        chunk = await stream_iterator.__anext__()
+                        chunk = await _next_chunk(stream_iterator)
                 except asyncio.TimeoutError:
                     logger.warning(
                         f"Promoted primary chunk timeout for stream {stream_id}, "
@@ -1363,8 +1566,11 @@ class StreamManager:
                 if cancel_event.is_set():
                     break
 
-                yield chunk
+                # Broadcast before yielding: if this client disconnects while
+                # suspended at the yield, subscribers still get the chunk and the
+                # handed-off upstream continues seamlessly from the next one.
                 self._broadcast_chunk_to_subscribers(stream_id, chunk)
+                yield chunk
 
                 # Update stats
                 if client_id in self.clients:
@@ -1379,12 +1585,20 @@ class StreamManager:
             logger.error(f"Error in promoted primary for stream {stream_id}: {e}")
         finally:
             if stream_context is not None:
-                try:
-                    await stream_context.__aexit__(None, None, None)
-                except Exception:
-                    pass
-            # Signal any remaining subscribers that this primary is also done.
-            self._signal_subscribers_end(stream_id)
+                if self._can_hand_off_upstream(stream_id, client_id, cancel_event):
+                    self._offer_upstream_handoff(
+                        stream_id,
+                        client_id,
+                        (stream_context, response, stream_iterator),
+                    )
+                else:
+                    try:
+                        await stream_context.__aexit__(None, None, None)
+                    except Exception:
+                        pass
+            self._settle_handoff(stream_id)
+            # Hand the stream to the next subscriber, if any remain.
+            self._signal_subscribers_end(stream_id, connection_id)
 
     async def stream_continuous_direct(
         self, stream_id: str, client_id: str, range_header: Optional[str] = None
@@ -1445,7 +1659,8 @@ class StreamManager:
         # Register BEFORE entering generate() so that any client arriving between now
         # and the first yielded chunk will see the primary and subscribe.
         self._direct_broadcast_primary[stream_id] = connection_id
-        self._direct_broadcast_queues[stream_id] = {}
+        # Keep any subscribers still attached from a previous primary.
+        self._direct_broadcast_queues.setdefault(stream_id, {})
 
         # Determine if strict mode is enabled (global or per-stream)
         # NEVER apply strict mode to VOD/timeshift content - it needs more time to start
@@ -1727,7 +1942,9 @@ class StreamManager:
                         # IMPORTANT: Async iterators can only be consumed once! We must use the same
                         # iterator for both pre-buffering and main streaming. The pre-buffer phase yields
                         # chunks directly (no storage), then breaks to let the main loop continue seamlessly.
-                        stream_iterator = response.aiter_bytes(chunk_size=32768)
+                        stream_iterator = ShieldedUpstreamReader(
+                            response.aiter_bytes(chunk_size=32768)
+                        )
 
                         # Initialize last_chunk_time for circuit breaker tracking
                         last_chunk_time = asyncio.get_event_loop().time()
@@ -2070,8 +2287,9 @@ class StreamManager:
                             if mark_discontinuity:
                                 chunk = self._inject_ts_discontinuity(chunk)
                                 mark_discontinuity = False
-                            yield chunk
+                            # Broadcast before yielding (see _promoted_primary_generate).
                             self._broadcast_chunk_to_subscribers(stream_id, chunk)
+                            yield chunk
                             bytes_served += len(chunk)
                             chunk_count += 1
 
@@ -2510,8 +2728,11 @@ class StreamManager:
                             f"signaling subscribers and cleaning up "
                             f"(bytes_served: {bytes_served})"
                         )
-                        # Signal subscribers so they can promote to primary
-                        self._signal_subscribers_end(stream_id)
+                        # Mark the connection cancelled first so the inner finally
+                        # hands the upstream off to the promoted subscriber.
+                        cancel_event.set()
+                        # Signal subscribers so one of them can promote to primary
+                        self._signal_subscribers_end(stream_id, connection_id)
                         # Update final stats
                         bytes_remaining = bytes_served - last_stats_update
                         if bytes_remaining > 0:
@@ -3046,41 +3267,14 @@ class StreamManager:
                         # promoted subscriber instead of closing it.  This avoids
                         # opening a second connection (which could exceed provider
                         # limits) and eliminates the ~250ms gap/skip.
-                        if (
-                            stream_context is not None
-                            and cancel_event.is_set()
-                            and not stream_info.is_vod
-                            and stream_id in self.stream_clients
-                            and len(
-                                self.stream_clients.get(stream_id, set()) - {client_id}
-                            )
-                            > 0
+                        if stream_context is not None and self._can_hand_off_upstream(
+                            stream_id, client_id, cancel_event
                         ):
-                            self._handoff_upstream[stream_id] = (
-                                stream_context,
-                                response,
-                                stream_iterator,
+                            self._offer_upstream_handoff(
+                                stream_id,
+                                client_id,
+                                (stream_context, response, stream_iterator),
                             )
-                            logger.info(
-                                f"Upstream connection handed off for stream {stream_id} "
-                                f"(client {client_id} disconnected, subscriber will inherit)"
-                            )
-
-                            # Auto-cleanup if nobody claims it within 5 seconds
-                            async def _cleanup_handoff(sid: str = stream_id) -> None:
-                                await asyncio.sleep(5)
-                                unclaimed = self._handoff_upstream.pop(sid, None)
-                                if unclaimed:
-                                    ctx, _, _ = unclaimed
-                                    try:
-                                        await ctx.__aexit__(None, None, None)
-                                    except Exception:
-                                        pass
-                                    logger.info(
-                                        f"Closed unclaimed handoff upstream for stream {sid}"
-                                    )
-
-                            asyncio.ensure_future(_cleanup_handoff())
                             # Prevent the outer finally from signaling again
                             stream_context = None
                         elif stream_context is not None:
@@ -3092,10 +3286,12 @@ class StreamManager:
                             except Exception as close_error:
                                 logger.warning(f"Error closing response: {close_error}")
 
-                # Primary reader is exiting — signal all subscribers to stop.
-                # They will get a None sentinel and their media player will reconnect,
-                # at which point one of them will become the new primary.
-                self._signal_subscribers_end(stream_id)
+                        # Handoff decided either way — stop the promoted subscriber waiting.
+                        self._settle_handoff(stream_id)
+
+                # Primary reader is exiting — promote one subscriber to take over.
+                # The rest stay attached and receive chunks from the new primary.
+                self._signal_subscribers_end(stream_id, connection_id)
 
                 # Update final stats (add any remaining bytes not yet counted)
                 bytes_remaining = bytes_served - last_stats_update
@@ -3140,7 +3336,7 @@ class StreamManager:
                 # exits (GC, GeneratorExit, exception).  This is idempotent —
                 # if _signal_subscribers_end already ran via the post-loop code
                 # or the ASGI disconnect monitor, it's a no-op.
-                self._signal_subscribers_end(stream_id)
+                self._signal_subscribers_end(stream_id, connection_id)
 
         # Determine content type
         # Add `or current_url.endswith('?profile=pass')` to handle TVHeadend passthrough URLs
@@ -5027,6 +5223,7 @@ class StreamManager:
                 # finally block didn't run or _signal_subscribers_end missed).
                 self._direct_broadcast_primary.pop(stream_id, None)
                 self._direct_broadcast_queues.pop(stream_id, None)
+                self._handoff_settled.pop(stream_id, None)
 
                 del self.streams[stream_id]
                 if stream_id in self.stream_clients:

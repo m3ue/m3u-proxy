@@ -260,6 +260,9 @@ STREAM_TOTAL_TIMEOUT=60.0
 STREAM_RETRY_EXPONENTIAL_BACKOFF=false
 # Timeout for receiving data chunks (seconds)
 LIVE_CHUNK_TIMEOUT_SECONDS=15.0
+# When a shared stream's reading client disconnects, how long (seconds) the
+# client taking over waits to reuse its upstream connection before opening a new one
+PRIMARY_HANDOFF_WAIT_SECONDS=2.0
 
 # Sticky Session Handler (prevents playback loops with load-balanced providers)
 # Locks to specific backend after redirect to maintain playlist consistency
