@@ -21,6 +21,7 @@ from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
 
 from config import settings
+from ts_overlap import OverlapTrimmer, TRIM_MATCHED, TRIM_NO_MATCH
 
 logger = logging.getLogger(__name__)
 
@@ -1737,6 +1738,19 @@ class StreamManager:
             skip_prebuffer = False
             mark_discontinuity = False
             chunk_count_at_last_reconnect = 0
+            # Trims the provider's replayed rolling-buffer overlap after a silent
+            # reconnect so the client doesn't jump back (Strict Live TS only).
+            overlap_trimmer = (
+                OverlapTrimmer(
+                    settings.STRICT_LIVE_TS_OVERLAP_SIGNATURE_SIZE,
+                    settings.STRICT_LIVE_TS_OVERLAP_MAX_SEARCH_SIZE,
+                    settings.STRICT_LIVE_TS_OVERLAP_MAX_WAIT,
+                )
+                if strict_mode_enabled
+                and stream_info.is_live_continuous
+                and settings.STRICT_LIVE_TS_OVERLAP_TRIM
+                else None
+            )
             broke_for_failover = (
                 False  # True when inner loop broke due to failover_event detection
             )
@@ -1997,6 +2011,8 @@ class StreamManager:
                                         chunk = self._inject_ts_discontinuity(chunk)
                                         mark_discontinuity = False
                                     yield chunk
+                                    if overlap_trimmer is not None:
+                                        overlap_trimmer.record(chunk)
                                     self._broadcast_chunk_to_subscribers(
                                         stream_id, chunk
                                     )
@@ -2284,12 +2300,36 @@ class StreamManager:
                                 # Break inner loop to reconnect with new URL
                                 break
 
+                            if overlap_trimmer is not None and overlap_trimmer.pending:
+                                chunk, trim_result = overlap_trimmer.feed(
+                                    chunk, asyncio.get_event_loop().time()
+                                )
+                                if trim_result == TRIM_MATCHED:
+                                    # Exact byte continuation of what the client already has,
+                                    # so there is no splice point to signal.
+                                    mark_discontinuity = False
+                                    logger.info(
+                                        f"STRICT MODE: Trimmed {overlap_trimmer.last_trimmed_bytes} bytes of replayed "
+                                        f"overlap after silent reconnect for client {client_id}"
+                                    )
+                                elif trim_result == TRIM_NO_MATCH:
+                                    logger.info(
+                                        f"STRICT MODE: No overlap found after silent reconnect for client {client_id}, "
+                                        f"forwarding {len(chunk)} held bytes unchanged"
+                                    )
+                                if not chunk:
+                                    # Still searching (or the match consumed the whole chunk)
+                                    chunk_count += 1
+                                    continue
+
                             if mark_discontinuity:
                                 chunk = self._inject_ts_discontinuity(chunk)
                                 mark_discontinuity = False
                             # Broadcast before yielding (see _promoted_primary_generate).
                             self._broadcast_chunk_to_subscribers(stream_id, chunk)
                             yield chunk
+                            if overlap_trimmer is not None:
+                                overlap_trimmer.record(chunk)
                             bytes_served += len(chunk)
                             chunk_count += 1
 
@@ -2680,6 +2720,8 @@ class StreamManager:
                                     # rolling live buffer and causing a jump-back on the client.
                                     skip_prebuffer = True
                                     mark_discontinuity = True
+                                    if overlap_trimmer is not None:
+                                        overlap_trimmer.arm()
                                     chunk_count_at_last_reconnect = chunk_count
                                     continue  # Reconnect to same URL, client stays connected
 
@@ -2932,6 +2974,8 @@ class StreamManager:
                                     response = None
                                     skip_prebuffer = True
                                     mark_discontinuity = True
+                                    if overlap_trimmer is not None:
+                                        overlap_trimmer.arm()
                                     chunk_count_at_last_reconnect = chunk_count
                                     continue  # Reconnect outer loop, client stays connected
                                 else:

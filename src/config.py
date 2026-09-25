@@ -146,6 +146,20 @@ class Settings(BaseSettings):
     # At 32KB chunks and typical IPTV bitrates, a 10s+ connection delivers 300-2000 chunks.
     LIVE_SILENT_RECONNECT_MIN_CHUNKS: int = 10
 
+    # Overlap trimming on silent reconnect (Strict Live TS Mode only).
+    # Providers that close periodically usually restart from their rolling buffer,
+    # a few seconds behind the last byte already sent, which makes players replay
+    # that section. When enabled, the tail of the delivered stream is located in
+    # the new connection and everything up to it is dropped, so playback resumes
+    # from the exact next byte. If no match is found, data is forwarded unchanged.
+    STRICT_LIVE_TS_OVERLAP_TRIM: bool = True
+    # Bytes of the delivered tail used as the match signature
+    STRICT_LIVE_TS_OVERLAP_SIGNATURE_SIZE: int = 16384  # 16 KB
+    # Maximum bytes to hold from the new connection while searching for the overlap
+    STRICT_LIVE_TS_OVERLAP_MAX_SEARCH_SIZE: int = 8388608  # 8 MB
+    # Maximum seconds (after the first byte of the new connection) to hold data while searching
+    STRICT_LIVE_TS_OVERLAP_MAX_WAIT: float = 0.5
+
     # Bitrate Quality Monitoring - detect slow/degraded streams and trigger failover
     # Enable bitrate monitoring for automatic failover on degraded streams
     ENABLE_BITRATE_MONITORING: bool = False

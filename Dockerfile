@@ -1,4 +1,6 @@
-FROM linuxserver/ffmpeg:latest
+# Pinned to match the FFmpeg version embedded in m3u-editor (Alpine edge ffmpeg).
+# Bump both together.
+FROM linuxserver/ffmpeg:8.1.2
 
 # Install Python and system dependencies
 RUN apt-get update && apt-get install -y \
