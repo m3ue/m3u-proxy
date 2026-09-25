@@ -372,3 +372,208 @@ def test_upstream_is_not_handed_off_for_vod_or_a_live_upstream_failure():
     assert manager._can_hand_off_upstream(STREAM_ID, "client-a", disconnected)
     # Upstream ended/failed rather than the client disconnecting.
     assert not manager._can_hand_off_upstream(STREAM_ID, "client-a", asyncio.Event())
+
+
+def ts_payload(size: int) -> bytes:
+    """Random bytes with no 0x47 sync bytes, so discontinuity injection is a no-op."""
+    return os.urandom(size).replace(b"\x47", b"\x00")
+
+
+def ts_packets_with_adaptation_field(count: int) -> bytes:
+    """TS packets carrying an adaptation field whose flags byte can take the
+    discontinuity_indicator bit."""
+    packet = bytes([0x47, 0x00, 0x00, 0x30, 0x01, 0x00]) + b"\x00" * 182
+    return packet * count
+
+
+def chunked(data: bytes, size: int = 32768) -> list[bytes]:
+    return [data[i : i + size] for i in range(0, len(data), size)]
+
+
+def promote_with_trimmer(manager: StreamManager, connection_id: str, trimmer):
+    return manager._promoted_primary_generate(
+        STREAM_ID,
+        f"client-{connection_id}",
+        connection_id,
+        asyncio.Event(),
+        trimmer,
+    )
+
+
+def drain(queue: asyncio.Queue) -> bytes:
+    data = b""
+    while not queue.empty():
+        item = queue.get_nowait()
+        if item is not None:
+            data += item
+    return data
+
+
+@pytest.mark.asyncio
+async def test_promoted_fresh_fallback_trims_the_providers_replayed_buffer():
+    manager = make_manager()
+    queues = attach(manager, "primary", ["sub-a", "sub-b"])
+    # The upstream ended on its own, so there is no handoff to inherit.
+    manager._signal_subscribers_end(STREAM_ID, "primary")
+
+    stream = ts_payload(32768 * 20)
+    cut = 32768 * 10
+    trimmer = manager._promotion_overlap_trimmer(manager.streams[STREAM_ID])
+    # What sub-a's client (and sub-b's) already received from the old primary.
+    for chunk in chunked(stream[:cut]):
+        trimmer.record(chunk)
+
+    # The new connection restarts ~3.5 chunks behind the last delivered byte.
+    fresh = FakeUpstream(chunked(stream[cut - 115_000 :]))
+    manager.live_stream_client = MagicMock()
+    manager.live_stream_client.stream.return_value = fresh
+
+    received = b"".join(
+        [chunk async for chunk in promote_with_trimmer(manager, "sub-a", trimmer)]
+    )
+
+    assert received == stream[cut:]
+    assert drain(queues["sub-b"]) == stream[cut:]
+
+
+@pytest.mark.asyncio
+async def test_promoted_fresh_fallback_flags_the_splice_when_it_cannot_trim():
+    manager = make_manager()
+    attach(manager, "primary", ["sub-a"])
+    manager._signal_subscribers_end(STREAM_ID, "primary")
+
+    fresh = FakeUpstream([ts_packets_with_adaptation_field(4)])
+    manager.live_stream_client = MagicMock()
+    manager.live_stream_client.stream.return_value = fresh
+
+    received = [chunk async for chunk in promote_with_trimmer(manager, "sub-a", None)]
+
+    assert received[0][5] & 0x80  # discontinuity_indicator set on the first packet
+
+
+@pytest.mark.asyncio
+async def test_promoted_inherited_upstream_is_neither_trimmed_nor_flagged():
+    manager = make_manager()
+    attach(manager, "primary", ["sub-a"])
+    manager.connection_cancel_events["primary"].set()
+    manager._signal_subscribers_end(STREAM_ID, "primary")
+
+    trimmer = manager._promotion_overlap_trimmer(manager.streams[STREAM_ID])
+    trimmer.record(ts_payload(32768))
+    data = ts_packets_with_adaptation_field(4)
+    inherited = FakeUpstream([data])
+    manager._handoff_upstream[STREAM_ID] = (
+        inherited,
+        inherited,
+        inherited.aiter_bytes(),
+    )
+
+    received = [
+        chunk async for chunk in promote_with_trimmer(manager, "sub-a", trimmer)
+    ]
+
+    assert received == [data]
+
+
+@pytest.mark.asyncio
+async def test_promoted_primary_hands_off_when_its_task_is_cancelled_mid_read():
+    from stream_manager import ShieldedUpstreamReader
+
+    manager = make_manager()
+    queues = attach(manager, "primary", ["sub-a", "sub-b"])
+    manager.live_stream_client = MagicMock()
+    manager._signal_subscribers_end(STREAM_ID, "primary")
+
+    never = asyncio.Event()
+
+    async def upstream():
+        yield b"one"
+        await never.wait()
+        yield b"two"
+
+    inherited = FakeUpstream([])
+    reader = ShieldedUpstreamReader(upstream())
+    manager._handoff_upstream[STREAM_ID] = (inherited, inherited, reader)
+
+    # Nothing sets sub-a's cancel event: Starlette (ASGI spec 2.3) cancels the
+    # response task directly, before or without the disconnect monitor.
+    cancel_event = manager.connection_cancel_events["sub-a"]
+    received = []
+
+    async def consume():
+        async for chunk in promote(manager, "sub-a", cancel_event):
+            received.append(chunk)
+
+    task = asyncio.create_task(consume())
+    while not received:
+        await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert cancel_event.is_set()
+    assert not inherited.closed
+    assert manager._handoff_upstream[STREAM_ID][2] is reader
+    assert manager._direct_broadcast_primary[STREAM_ID] == "sub-b"
+    assert queues["sub-b"].get_nowait() == b"one"
+    assert queues["sub-b"].get_nowait() is None
+
+
+@pytest.mark.asyncio
+async def test_primary_hands_off_when_its_task_is_cancelled_mid_read(monkeypatch):
+    monkeypatch.setattr("config.settings.STRICT_LIVE_TS", False)
+    monkeypatch.setattr("config.settings.STREAM_RETRY_ATTEMPTS", 0)
+    manager = StreamManager()
+    stream_id = await manager.get_or_create_stream(
+        "http://provider.example.com/live/channel.ts"
+    )
+
+    never = asyncio.Event()
+
+    async def upstream(chunk_size=32768):
+        yield b"one"
+        await never.wait()
+        yield b"two"
+
+    class Response:
+        status_code = 200
+        headers = {"content-type": "video/mp2t"}
+
+        def raise_for_status(self):
+            pass
+
+        def aiter_bytes(self, chunk_size=32768):
+            return upstream()
+
+    class Context:
+        closed = False
+
+        async def __aenter__(self):
+            return Response()
+
+        async def __aexit__(self, *exc):
+            Context.closed = True
+
+    async def fake_stream(method, url, headers=None, follow_redirects=True):
+        return Context()
+
+    monkeypatch.setattr(manager.live_stream_client, "stream", fake_stream)
+
+    response = await manager.stream_continuous_direct(stream_id, "client-a")
+    # A second viewer is still watching, so the upstream is worth handing off.
+    manager.stream_clients[stream_id] = {"client-a", "client-b"}
+    received = []
+
+    async def consume():
+        async for chunk in response.body_iterator:
+            received.append(chunk)
+
+    task = asyncio.create_task(consume())
+    while not received:
+        await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert stream_id in manager._handoff_upstream
+    assert not Context.closed

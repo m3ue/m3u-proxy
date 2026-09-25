@@ -13,6 +13,7 @@ import os
 import re
 import uuid
 import xml.etree.ElementTree as ET
+from contextlib import aclosing
 from typing import Dict, Optional, List, Set, Any
 from urllib.parse import urlparse, urljoin, quote
 from datetime import datetime, timezone, timedelta
@@ -1203,6 +1204,27 @@ class StreamManager:
                 pass
             next_queue.put_nowait(None)
 
+    @staticmethod
+    def _promotion_overlap_trimmer(
+        stream_info: "StreamInfo",
+    ) -> Optional[OverlapTrimmer]:
+        """Overlap trimmer for a subscriber that may be promoted to primary.
+
+        Only live TS can be spliced this way. Not tied to Strict Live TS mode:
+        a promotion fallback is a reconnect the client never asked for, so the
+        replay it causes is always unwanted.
+        """
+        if (
+            not stream_info.is_live_continuous
+            or not settings.STRICT_LIVE_TS_OVERLAP_TRIM
+        ):
+            return None
+        return OverlapTrimmer(
+            settings.STRICT_LIVE_TS_OVERLAP_SIGNATURE_SIZE,
+            settings.STRICT_LIVE_TS_OVERLAP_MAX_SEARCH_SIZE,
+            settings.STRICT_LIVE_TS_OVERLAP_MAX_WAIT,
+        )
+
     def _settle_handoff(self, stream_id: str) -> None:
         """Wake a promoted subscriber waiting on this stream's upstream handoff."""
         settled = self._handoff_settled.get(stream_id)
@@ -1310,6 +1332,10 @@ class StreamManager:
             bytes_served = 0
             consecutive_timeouts = 0
             queue_timeout = 10.0
+            # Remembers the tail of what this client received, so that if it is
+            # promoted and has to open a fresh upstream, the provider's replayed
+            # buffer can be trimmed instead of jumping the viewer back.
+            overlap_trimmer = self._promotion_overlap_trimmer(stream_info)
             try:
                 while True:
                     try:
@@ -1357,11 +1383,18 @@ class StreamManager:
                                 f"Subscriber {client_id} detected primary gone "
                                 f"(timeout path), promoting to primary"
                             )
-                            async for promoted_chunk in self._promoted_primary_generate(
-                                stream_id, client_id, connection_id, cancel_event
-                            ):
-                                yield promoted_chunk
-                                bytes_served += len(promoted_chunk)
+                            async with aclosing(
+                                self._promoted_primary_generate(
+                                    stream_id,
+                                    client_id,
+                                    connection_id,
+                                    cancel_event,
+                                    overlap_trimmer,
+                                )
+                            ) as promoted:
+                                async for promoted_chunk in promoted:
+                                    yield promoted_chunk
+                                    bytes_served += len(promoted_chunk)
                             return
                         continue
 
@@ -1372,11 +1405,21 @@ class StreamManager:
                             f"Subscriber {client_id} promoting to primary for stream {stream_id} "
                             f"(previous primary disconnected), bytes_served so far: {bytes_served}"
                         )
-                        async for promoted_chunk in self._promoted_primary_generate(
-                            stream_id, client_id, connection_id, cancel_event
-                        ):
-                            yield promoted_chunk
-                            bytes_served += len(promoted_chunk)
+                        # aclosing() finalizes the promoted generator as soon as
+                        # this one exits, so its finally (upstream handoff) runs
+                        # immediately rather than whenever it is garbage collected.
+                        async with aclosing(
+                            self._promoted_primary_generate(
+                                stream_id,
+                                client_id,
+                                connection_id,
+                                cancel_event,
+                                overlap_trimmer,
+                            )
+                        ) as promoted:
+                            async for promoted_chunk in promoted:
+                                yield promoted_chunk
+                                bytes_served += len(promoted_chunk)
                         return
 
                     if cancel_event.is_set():
@@ -1384,6 +1427,8 @@ class StreamManager:
 
                     consecutive_timeouts = 0  # Reset on successful data
                     yield chunk
+                    if overlap_trimmer is not None:
+                        overlap_trimmer.record(chunk)
                     bytes_served += len(chunk)
 
                     # Update client stats
@@ -1439,12 +1484,16 @@ class StreamManager:
         client_id: str,
         connection_id: str,
         cancel_event: asyncio.Event,
+        overlap_trimmer: Optional[OverlapTrimmer] = None,
     ):
         """Async generator for a subscriber that has been promoted to primary.
 
         Inherits the departing primary's upstream connection when it was handed
         off (falling back to a fresh connection) and streams chunks to the client
-        while broadcasting to any remaining subscribers.  This is a simplified
+        while broadcasting to any remaining subscribers. On the fresh-connection
+        fallback, ``overlap_trimmer`` (fed by the subscriber with what its client
+        already received) drops the provider's replayed buffer, and the splice is
+        marked with a TS discontinuity when no overlap is found. This is a simplified
         version of the full generate() inside stream_continuous_direct —
         it handles the common case (upstream works, stream until client or
         upstream disconnects) but does NOT include retry / failover logic.
@@ -1514,6 +1563,7 @@ class StreamManager:
             return await iterator.__anext__()
 
         stream_context = None
+        mark_discontinuity = False
         try:
             # Prefer the departing primary's upstream connection (stored by its
             # finally block when it exited due to client disconnect). Reusing the
@@ -1548,6 +1598,13 @@ class StreamManager:
                 stream_iterator = ShieldedUpstreamReader(
                     response.aiter_bytes(chunk_size=32768)
                 )
+                # A fresh connection usually starts from the provider's rolling
+                # buffer, behind what viewers already have. Trim the replayed
+                # overlap when possible, otherwise flag the splice to the players.
+                if stream_info.is_live_continuous:
+                    mark_discontinuity = True
+                    if overlap_trimmer is not None:
+                        overlap_trimmer.arm()
 
             while True:
                 try:
@@ -1558,13 +1615,41 @@ class StreamManager:
                 except asyncio.TimeoutError:
                     logger.warning(
                         f"Promoted primary chunk timeout for stream {stream_id}, "
-                        f"client {client_id} — exiting"
+                        f"client {client_id} - exiting"
                     )
                     break
                 except StopAsyncIteration:
                     break
 
+                if overlap_trimmer is not None and overlap_trimmer.pending:
+                    chunk, trim_result = overlap_trimmer.feed(
+                        chunk, asyncio.get_event_loop().time()
+                    )
+                    if trim_result == TRIM_MATCHED:
+                        # Exact byte continuation of what viewers already have,
+                        # so there is no splice point to signal.
+                        mark_discontinuity = False
+                        logger.info(
+                            f"Promoted primary trimmed {overlap_trimmer.last_trimmed_bytes} "
+                            f"bytes of replayed overlap for stream {stream_id}"
+                        )
+                    elif trim_result == TRIM_NO_MATCH:
+                        logger.info(
+                            f"Promoted primary found no overlap for stream {stream_id}, "
+                            f"forwarding {len(chunk)} held bytes unchanged"
+                        )
+                    if not chunk:
+                        continue
+
+                if mark_discontinuity:
+                    chunk = self._inject_ts_discontinuity(chunk)
+                    mark_discontinuity = False
+
                 if cancel_event.is_set():
+                    # This client is leaving, but the chunk is already read from
+                    # the upstream - pass it on so the next primary resumes from
+                    # the following byte without a gap.
+                    self._broadcast_chunk_to_subscribers(stream_id, chunk)
                     break
 
                 # Broadcast before yielding: if this client disconnects while
@@ -1582,6 +1667,12 @@ class StreamManager:
                     self.streams[stream_id].total_bytes_served += len(chunk)
                     self.streams[stream_id].last_access = datetime.now(timezone.utc)
 
+        except (GeneratorExit, asyncio.CancelledError):
+            # This client disconnected (generator closed, or the response task
+            # cancelled mid-read). Mark it so the finally hands the upstream on
+            # to the next subscriber rather than closing it.
+            cancel_event.set()
+            raise
         except Exception as e:
             logger.error(f"Error in promoted primary for stream {stream_id}: {e}")
         finally:
@@ -2010,12 +2101,13 @@ class StreamManager:
                                     if mark_discontinuity:
                                         chunk = self._inject_ts_discontinuity(chunk)
                                         mark_discontinuity = False
-                                    yield chunk
-                                    if overlap_trimmer is not None:
-                                        overlap_trimmer.record(chunk)
+                                    # Broadcast before yielding (see _promoted_primary_generate).
                                     self._broadcast_chunk_to_subscribers(
                                         stream_id, chunk
                                     )
+                                    yield chunk
+                                    if overlap_trimmer is not None:
+                                        overlap_trimmer.record(chunk)
                                     bytes_served += len(chunk)
                                     chunk_count += 1
                                     prebuffer_size += len(chunk)
@@ -2755,6 +2847,16 @@ class StreamManager:
                                     )
                             break  # Exit the failover loop
                         # else: failover event was set, continue to next iteration
+
+                    except asyncio.CancelledError:
+                        # Client disconnected - on ASGI spec < 2.4 servers (uvicorn
+                        # reports 2.3) Starlette cancels the response task, which
+                        # raises here while awaiting the next upstream chunk. Mark
+                        # the connection cancelled so the inner finally hands the
+                        # upstream off instead of closing it, even when the ASGI
+                        # disconnect monitor hasn't set it yet (or is disabled).
+                        cancel_event.set()
+                        raise
 
                     except GeneratorExit:
                         # Client disconnected — Starlette throws GeneratorExit into the
