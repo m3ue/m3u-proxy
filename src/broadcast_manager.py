@@ -21,6 +21,7 @@ from typing import Dict, List, Optional, Set
 import httpx
 
 from config import settings
+from hls_input import hls_extension_args
 
 logger = logging.getLogger(__name__)
 
@@ -210,6 +211,9 @@ class NetworkBroadcastProcess:
                     "10",
                 ]
             )
+
+            # Some providers disguise HLS segments as .jpg/.css (see hls_input).
+            cmd.extend(hls_extension_args(url))
 
             # If headers are provided explicitly in the BroadcastConfig, prefer them.
             if (
