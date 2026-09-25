@@ -90,7 +90,7 @@ async def test_disconnect_monitor_signals_broadcast_subscribers_before_cleanup()
         _start_disconnect_monitor(request, "client-1", sm)
         await created_tasks[0]
 
-    sm._signal_subscribers_end.assert_called_once_with("stream-1")
+    sm._signal_subscribers_end.assert_called_once_with("stream-1", "conn-1")
     sm.cleanup_client.assert_awaited_once_with("client-1", "conn-1")
 
 
