@@ -111,6 +111,17 @@ STRICT_LIVE_TS_CIRCUIT_BREAKER_COOLDOWN=60
 # Pre-buffer timeout in seconds (default: 10)
 # Maximum time to wait for pre-buffer to complete
 STRICT_LIVE_TS_PREBUFFER_TIMEOUT=10
+
+# Overlap trimming on silent reconnect (default: true)
+# Providers that close the connection periodically usually restart from their
+# rolling buffer, slightly behind what the client already received. The proxy
+# locates the last delivered bytes in the new connection and drops everything
+# up to them, so playback continues from the exact next byte (no jump-back).
+# If no match is found, the held data is forwarded unchanged.
+STRICT_LIVE_TS_OVERLAP_TRIM=true
+STRICT_LIVE_TS_OVERLAP_SIGNATURE_SIZE=16384
+STRICT_LIVE_TS_OVERLAP_MAX_SEARCH_SIZE=8388608
+STRICT_LIVE_TS_OVERLAP_MAX_WAIT=0.5
 ```
 
 ### Per-Stream Configuration (API)
