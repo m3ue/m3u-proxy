@@ -12,6 +12,7 @@ import hashlib
 from typing import Dict, List, Optional, Tuple, Any
 import logging
 from config import settings
+from hls_input import hls_extension_args, is_hls_url
 import os
 import tempfile
 
@@ -311,9 +312,7 @@ class SharedTranscodingProcess:
             # Process ffmpeg_args and insert HLS-specific options right before -i flag
             # For HLS inputs with extensionless segment URLs, we need special handling
             processed_args = []
-            is_hls_input = isinstance(self.url, str) and self.url.lower().endswith(
-                ".m3u8"
-            )
+            is_hls_input = is_hls_url(self.url)
             i = 0
             while i < len(self.ffmpeg_args):
                 arg = self.ffmpeg_args[i]
@@ -335,8 +334,9 @@ class SharedTranscodingProcess:
                                 "2",
                             ]
                         )
-                        # Allow any extensions (including extensionless) for segments
-                        processed_args.extend(["-allowed_extensions", "ALL"])
+                        # Allow any segment extensions (including extensionless or
+                        # disguised .jpg/.css segments)
+                        processed_args.extend(hls_extension_args(self.url))
                     # Add -i flag and use self.url as the input
                     processed_args.append(arg)
                     # Use current URL (updated during failover)
