@@ -2017,6 +2017,23 @@ class StreamManager:
                         # Enter the context to get the response object
                         response = await stream_context.__aenter__()
 
+                        # 416 means the requested range starts at/after EOF - players
+                        # probing the end of a VOD/catchup file (e.g. mpv/ffmpeg) do this
+                        # routinely. It's a definitive answer for that exact range, not a
+                        # transient upstream fault, so retrying only stalls the client
+                        # (several seconds per request). Hand it straight back instead.
+                        if stream_info.is_vod and response.status_code == 416:
+                            provider_status_code = response.status_code
+                            provider_content_range = response.headers.get(
+                                "content-range"
+                            )
+                            natural_vod_completion = True
+                            logger.info(
+                                f"Provider returned 416 for range {range_header} on stream {stream_id}, "
+                                f"passing it through to client {client_id}"
+                            )
+                            break
+
                         # Now we can call methods on the actual response object
                         response.raise_for_status()
 
@@ -3529,6 +3546,16 @@ class StreamManager:
         try:
             first_chunk = await gen.__anext__()
         except StopAsyncIteration:
+            if provider_status_code == 416:
+                if provider_content_range:
+                    headers["Content-Range"] = provider_content_range
+                return StreamingResponse(
+                    iter([]),
+                    status_code=416,
+                    media_type=content_type,
+                    headers=headers,
+                )
+
             # Empty stream
             return StreamingResponse(iter([]), media_type=content_type, headers=headers)
 
