@@ -138,6 +138,12 @@ class NetworkBroadcastProcess:
         self._bytes_written: int = 0  # Cumulative bytes across all segments ever seen
         # Segment filenames already counted
         self._seen_segments: Set[str] = set()
+        # DVR in-place restart state (monotonic clock). The deadline is when the
+        # recording's original duration runs out; restarts only record what's left.
+        self._deadline: Optional[float] = None
+        self._outage_started_at: Optional[float] = None
+        self._restart_count: int = 0
+        self._last_segment_at: Optional[float] = None
 
     # Confirmed live (Plex, via Safari): the embedded-subtitle second input's
     # cues consistently show up ~1s EARLY relative to the dialogue they belong
@@ -401,7 +407,11 @@ class NetworkBroadcastProcess:
         # DVR mode: hls_list_size=0 keeps all segments in the manifest for concat
         hls_list_size = 0 if self.config.dvr_mode else self.config.hls_list_size
         cmd.extend(["-hls_list_size", str(hls_list_size)])
-        cmd.extend(["-start_number", str(self.config.segment_start_number)])
+        if self.config.dvr_mode:
+            # EVENT playlist: players seek across the whole in-progress recording
+            # instead of treating it as a short live sliding window.
+            cmd.extend(["-hls_playlist_type", "event"])
+        cmd.extend(["-start_number", str(self._hls_start_number())])
 
         # HLS flags — DVR mode keeps all segments for post-processing concat
         hls_flags = [
@@ -409,7 +419,11 @@ class NetworkBroadcastProcess:
             "omit_endlist",
             "independent_segments",
         ]
-        if not self.config.dvr_mode:
+        if self.config.dvr_mode:
+            # Restarts (upstream drop, resume after a proxy restart) continue the
+            # same playlist so the recording ends up as one file.
+            hls_flags.append("append_list")
+        else:
             # Rolling-window live broadcasts delete old segments to save space
             hls_flags.insert(0, "delete_segments")
         if self.config.add_discontinuity:
@@ -540,9 +554,11 @@ class NetworkBroadcastProcess:
 
             # On a fresh start (not a transition), remove any leftover segments/playlists
             # so FFmpeg's rolling-window deletion doesn't hit files it didn't write.
+            # DVR keeps them: a leftover recording dir means this start resumes it.
             if (
                 self.config.segment_start_number == 0
                 and not self.config.add_discontinuity
+                and not self.config.dvr_mode
             ):
                 stale_count = 0
                 for filename in (
@@ -588,6 +604,9 @@ class NetworkBroadcastProcess:
 
             self.started_at = datetime.now(timezone.utc)
             self.status = "running"
+            self._last_segment_at = time.monotonic()
+            if self.config.dvr_mode and self.config.duration_seconds > 0:
+                self._deadline = time.monotonic() + self.config.duration_seconds
 
             # Start monitoring tasks
             self._stderr_task = asyncio.create_task(self._log_stderr())
@@ -671,15 +690,20 @@ class NetworkBroadcastProcess:
         "audio:",  # Summary stats
     ]
 
-    async def _log_stderr(self):
-        """Monitor FFmpeg stderr for errors only. Suppresses verbose output."""
-        if not self.process or not self.process.stderr:
+    async def _log_stderr(self, process: Optional[asyncio.subprocess.Process] = None):
+        """Monitor FFmpeg stderr for errors only. Suppresses verbose output.
+
+        Bound to one FFmpeg process, so a DVR restart's new reader never shares a
+        pipe with the old one.
+        """
+        process = process or self.process
+        if not process or not process.stderr:
             return
 
         buf = b""
         try:
-            while self.process.returncode is None:
-                chunk = await self.process.stderr.read(4096)
+            while process.returncode is None:
+                chunk = await process.stderr.read(4096)
                 if not chunk:
                     break
 
@@ -708,6 +732,15 @@ class NetworkBroadcastProcess:
                             continue
 
                         self.error_message = line_str
+                        if self.config.dvr_mode:
+                            # FFmpeg exits on its own when the input is truly gone;
+                            # _monitor_process then restarts it in place and only
+                            # reports broadcast_failed once the outage window runs out.
+                            logger.warning(
+                                f"Broadcast {self.network_id} input error: {line_str}"
+                            )
+                            continue
+
                         self.status = "failed"
                         logger.error(f"Broadcast {self.network_id} error: {line_str}")
                         await self._send_callback(
@@ -742,12 +775,16 @@ class NetworkBroadcastProcess:
             return
 
         try:
-            await self.process.wait()
+            while True:
+                await self.process.wait()
 
-            # Skip callback on intentional stop — the editor initiated it and handles
-            # post-processing directly without waiting for a proxy callback.
-            if self._stopping:
-                return
+                # Skip callback on intentional stop - the editor initiated it and handles
+                # post-processing directly without waiting for a proxy callback.
+                if self._stopping:
+                    return
+
+                if not self.config.dvr_mode or not await self._restart_dvr_capture():
+                    break
 
             # Determine final segment number
             final_segment = self._get_final_segment_number()
@@ -761,7 +798,7 @@ class NetworkBroadcastProcess:
                 ).total_seconds()
 
             exit_code = self.process.returncode
-            if exit_code == 0:
+            if exit_code == 0 or self._dvr_window_complete():
                 # Normal completion (duration limit reached) or intentional DVR stop
                 self.status = "stopped"
                 await self._send_callback(
@@ -790,6 +827,88 @@ class NetworkBroadcastProcess:
             pass
         except Exception as e:
             logger.error(f"Error monitoring broadcast {self.network_id}: {e}")
+
+    # A DVR capture that exits with less than this left counts as finished
+    # rather than restarting FFmpeg for a few seconds of footage.
+    _DVR_MIN_REMAINING_SECONDS = 10.0
+
+    def _dvr_remaining_seconds(self) -> Optional[float]:
+        """Seconds left of the recording's original duration, or None if unbounded."""
+        if self._deadline is None:
+            return None
+        return self._deadline - time.monotonic()
+
+    def _dvr_window_complete(self) -> bool:
+        remaining = self._dvr_remaining_seconds()
+        return (
+            self.config.dvr_mode
+            and remaining is not None
+            and remaining <= self._DVR_MIN_REMAINING_SECONDS
+        )
+
+    async def _restart_dvr_capture(self) -> bool:
+        """Restart a DVR capture's FFmpeg in place after it exits early.
+
+        The new process appends to the same playlist (append_list) and only
+        records what's left of the original duration, so an upstream drop
+        leaves a short gap instead of a failed or split recording. Gives up once
+        the outage (time since the last new segment) exceeds
+        DVR_RESTART_WINDOW_SECONDS.
+
+        Returns True when a new FFmpeg process is running.
+        """
+        if self._dvr_window_complete():
+            return False
+
+        # Without a deadline a clean exit is the only completion signal we get.
+        remaining = self._dvr_remaining_seconds()
+        if remaining is None and self.process.returncode == 0:
+            return False
+
+        now = time.monotonic()
+        if self._outage_started_at is None:
+            self._outage_started_at = now
+        window = float(getattr(settings, "DVR_RESTART_WINDOW_SECONDS", 60.0))
+        outage = now - self._outage_started_at
+        if outage >= window:
+            logger.error(
+                f"Broadcast {self.network_id}: DVR capture down for {outage:.0f}s "
+                f"after {self._restart_count} restart(s), giving up"
+            )
+            return False
+
+        self._restart_count += 1
+        backoff = min(float(self._restart_count), 5.0)
+        logger.warning(
+            f"Broadcast {self.network_id}: DVR capture exited "
+            f"(code {self.process.returncode}), restarting in {backoff:.0f}s "
+            f"(attempt {self._restart_count}, outage {outage:.0f}s/{window:.0f}s)"
+        )
+        await asyncio.sleep(backoff)
+        if self._stopping:
+            return False
+
+        remaining = self._dvr_remaining_seconds()
+        if remaining is not None:
+            if remaining <= self._DVR_MIN_REMAINING_SECONDS:
+                return False
+            self.config.duration_seconds = int(remaining) + 1
+
+        cmd = self._build_ffmpeg_command()
+        logger.info(f"Restarting DVR capture {self.network_id}: {' '.join(cmd)}")
+        self.process = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE
+        )
+        if self._stopping:
+            # stop() ran while we were spawning; don't leak the new process.
+            self.process.kill()
+            await self.process.wait()
+            return False
+
+        self.status = "running"
+        self._last_segment_at = time.monotonic()
+        self._stderr_task = asyncio.create_task(self._log_stderr(self.process))
+        return True
 
     async def _send_callback(self, event: str, data: dict):
         """Send webhook callback to Laravel."""
@@ -855,21 +974,80 @@ class NetworkBroadcastProcess:
                                 and filename not in self._seen_segments
                             ):
                                 self._seen_segments.add(filename)
+                                self._last_segment_at = time.monotonic()
+                                self._outage_started_at = None
+                                self._restart_count = 0
                                 try:
                                     self._bytes_written += os.path.getsize(
                                         os.path.join(self.hls_dir, filename)
                                     )
                                 except OSError:
                                     pass
+                    if self.config.dvr_mode:
+                        self._terminate_if_stalled()
                 except Exception:
                     pass
                 await asyncio.sleep(interval)
         except asyncio.CancelledError:
             pass
 
+    def _terminate_if_stalled(self) -> None:
+        """Terminate a DVR FFmpeg that is still running but no longer producing
+        segments (a hung input that -reconnect never recovers from), so
+        _monitor_process restarts it in place."""
+        if (
+            self._stopping
+            or not self.process
+            or self.process.returncode is not None
+            or self._last_segment_at is None
+        ):
+            return
+
+        stall_timeout = float(getattr(settings, "DVR_STALL_TIMEOUT_SECONDS", 30.0))
+        stalled_for = time.monotonic() - self._last_segment_at
+        if stalled_for < stall_timeout:
+            return
+
+        logger.warning(
+            f"Broadcast {self.network_id}: no new DVR segment for {stalled_for:.0f}s, "
+            "restarting capture"
+        )
+        # The outage began at the last segment, not when we noticed it.
+        if self._outage_started_at is None:
+            self._outage_started_at = self._last_segment_at
+        # Restart the stall clock so a slow-to-exit process isn't signalled every poll.
+        self._last_segment_at = time.monotonic()
+        try:
+            self.process.terminate()
+        except ProcessLookupError:
+            pass
+
     def _get_bytes_written(self) -> int:
         """Return cumulative bytes written across all segments ever seen."""
         return self._bytes_written
+
+    def _hls_start_number(self) -> int:
+        """FFmpeg -start_number for this run.
+
+        DVR restarts use append_list, which reloads the existing playlist and
+        advances its own sequence past every segment it lists, so passing the
+        next index on top of that would skip ahead. Use 0 when the playlist
+        already lists segments; when only loose segment files remain (playlist
+        lost), continue after the highest one so nothing is overwritten.
+        """
+        if not self.config.dvr_mode:
+            return self.config.segment_start_number
+
+        playlist_path = os.path.join(self.hls_dir, "live.m3u8")
+        if self.parse_playlist_segments(playlist_path):
+            return 0
+
+        highest = self._get_final_segment_number()
+        has_segments = os.path.isdir(self.hls_dir) and any(
+            name.startswith("live") and name.endswith(".ts")
+            for name in os.listdir(self.hls_dir)
+        )
+        return highest + 1 if has_segments else self.config.segment_start_number
 
     def _get_final_segment_number(self) -> int:
         """Get the highest segment number from existing files."""
@@ -1069,16 +1247,20 @@ class BroadcastManager:
                 # Stop existing process gracefully
                 final_segment = await existing.stop(graceful=True)
 
-                # Auto-continue segment numbering if not specified
-                if config.segment_start_number == 0:
-                    config.segment_start_number = final_segment + 1
-                    # Force discontinuity on transition
-                    config.add_discontinuity = True
+                # A DVR restart (the editor retrying or resuming a recording) continues
+                # the same playlist via append_list, which handles numbering and the
+                # discontinuity itself, and must keep every segment.
+                if not config.dvr_mode:
+                    # Auto-continue segment numbering if not specified
+                    if config.segment_start_number == 0:
+                        config.segment_start_number = final_segment + 1
+                        # Force discontinuity on transition
+                        config.add_discontinuity = True
 
-                # Clean up segments no longer referenced by the playlist before handing
-                # off to the new FFmpeg process. The playlist itself is left in place so
-                # the new process can overwrite it with a discontinuity marker.
-                existing.cleanup_orphaned_segments(age_threshold=0)
+                    # Clean up segments no longer referenced by the playlist before handing
+                    # off to the new FFmpeg process. The playlist itself is left in place so
+                    # the new process can overwrite it with a discontinuity marker.
+                    existing.cleanup_orphaned_segments(age_threshold=0)
 
                 del self.broadcasts[network_id]
 
@@ -1343,9 +1525,11 @@ class BroadcastManager:
                 )
             }
 
-        # Phase 1: clean orphaned segments from active broadcasts
+        # Phase 1: clean orphaned segments from active broadcasts. DVR recordings keep
+        # every segment; one briefly missing from the playlist mid-restart is not junk.
         for process in active_snapshot.values():
-            process.cleanup_orphaned_segments(age_threshold=60)
+            if not process.config.dvr_mode:
+                process.cleanup_orphaned_segments(age_threshold=60)
 
         # Phase 2: remove entire stale inactive directories
         try:

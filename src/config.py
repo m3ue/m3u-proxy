@@ -108,6 +108,13 @@ class Settings(BaseSettings):
     # Base directory for DVR recording HLS output (separate from live broadcasts).
     # Set to a path shared with the m3u-editor container so post-processing can read segments.
     DVR_RECORDING_DIR: str = "/tmp/m3u-proxy-dvr"
+    # How long (seconds) a DVR recording keeps restarting FFmpeg in place after the
+    # upstream drops before giving up and reporting broadcast_failed. The window is
+    # continuous: it resets as soon as a new segment lands.
+    DVR_RESTART_WINDOW_SECONDS: float = 60.0
+    # Seconds without a new DVR segment (while FFmpeg is still running) before the
+    # capture is treated as stalled and restarted.
+    DVR_STALL_TIMEOUT_SECONDS: float = 30.0
     # Enable GC for orphaned broadcast directories. Uses HLS_GC_INTERVAL and
     # HLS_GC_AGE_THRESHOLD for scan interval and age threshold respectively.
     BROADCAST_GC_ENABLED: bool = True
