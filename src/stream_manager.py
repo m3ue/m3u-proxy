@@ -1826,6 +1826,7 @@ class StreamManager:
             vod_reconnects = 0
             failover_count = 0
             silent_reconnect_count = 0
+            last_same_url_retry_time = None
             skip_prebuffer = False
             mark_discontinuity = False
             chunk_count_at_last_reconnect = 0
@@ -2765,6 +2766,48 @@ class StreamManager:
                                 stream_info.failover_resolver_url
                                 or stream_info.failover_urls
                             )
+                            chunks_this_connection = (
+                                chunk_count - chunk_count_at_last_reconnect
+                            )
+                            min_chunks = settings.LIVE_SILENT_RECONNECT_MIN_CHUNKS
+                            retry_window = (
+                                settings.LIVE_SILENT_CLOSE_RETRY_WINDOW_SECONDS
+                            )
+                            now = asyncio.get_event_loop().time()
+                            # A healthy session that was dropped is retried on the same URL
+                            # once before failing over, unless the previous same-URL retry was
+                            # recent (the upstream keeps closing, so it is genuinely failing).
+                            retry_same_url = (
+                                has_failover
+                                and retry_window > 0
+                                and chunks_this_connection >= min_chunks
+                                and (
+                                    last_same_url_retry_time is None
+                                    or now - last_same_url_retry_time >= retry_window
+                                )
+                            )
+                            if retry_same_url:
+                                silent_reconnect_count += 1
+                                last_same_url_retry_time = now
+                                logger.warning(
+                                    f"Live stream ended unexpectedly for client {client_id} "
+                                    f"({chunks_this_connection} chunks this connection, "
+                                    f"{bytes_served} bytes total) — retrying same URL before "
+                                    f"failover (silent reconnect #{silent_reconnect_count})"
+                                )
+                                if stream_context is not None:
+                                    try:
+                                        await stream_context.__aexit__(None, None, None)
+                                    except Exception:
+                                        pass
+                                stream_context = None
+                                response = None
+                                skip_prebuffer = True
+                                mark_discontinuity = True
+                                if overlap_trimmer is not None:
+                                    overlap_trimmer.arm()
+                                chunk_count_at_last_reconnect = chunk_count
+                                continue  # Reconnect to same URL, client stays connected
                             if has_failover and failover_count < max_failovers:
                                 logger.warning(
                                     f"Live stream ended unexpectedly for client {client_id} "
@@ -2788,6 +2831,9 @@ class StreamManager:
                                 stream_context = None
                                 response = None
                                 failover_count += 1
+                                # Count the failover URL's chunks on their own, so a dead
+                                # failover is not mistaken for a healthy session to retry.
+                                chunk_count_at_last_reconnect = chunk_count
                                 continue  # Retry with failover URL
                             else:
                                 # No failover configured — silently reconnect to the same URL.
@@ -2798,10 +2844,6 @@ class StreamManager:
                                 # last reconnect. A stream that closes after 1-2 chunks has ended
                                 # naturally; a live stream closing after thousands of chunks is a
                                 # periodic provider keep-alive pattern.
-                                chunks_this_connection = (
-                                    chunk_count - chunk_count_at_last_reconnect
-                                )
-                                min_chunks = settings.LIVE_SILENT_RECONNECT_MIN_CHUNKS
                                 if chunks_this_connection < min_chunks:
                                     logger.info(
                                         f"Live stream ended after {chunks_this_connection} chunks "

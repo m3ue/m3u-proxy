@@ -152,6 +152,12 @@ class Settings(BaseSettings):
     # Prevents infinite reconnect loops when a stream ends naturally after a few chunks.
     # At 32KB chunks and typical IPTV bitrates, a 10s+ connection delivers 300-2000 chunks.
     LIVE_SILENT_RECONNECT_MIN_CHUNKS: int = 10
+    # When a live stream with failovers configured is closed cleanly by the provider
+    # after a healthy run, reconnect to the same URL once before failing over: the
+    # provider has usually just dropped the session, and switching feeds mid-stream
+    # makes many players freeze or reconnect. If it closes again within this many
+    # seconds of that retry, fail over as before. 0 disables the same-URL retry.
+    LIVE_SILENT_CLOSE_RETRY_WINDOW_SECONDS: float = 60.0
 
     # Overlap trimming on silent reconnect (Strict Live TS Mode only).
     # Providers that close periodically usually restart from their rolling buffer,
