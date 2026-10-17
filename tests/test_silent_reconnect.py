@@ -431,3 +431,41 @@ async def test_clean_close_with_failover_and_retry_disabled_fails_over_immediate
     assert requested_urls[:2] == [primary_url, failover_url], (
         f"Expected immediate failover with the retry disabled, got {requested_urls}"
     )
+
+
+@pytest.mark.asyncio
+async def test_per_stream_retry_window_overrides_env_default(monkeypatch):
+    """A stream created with silent_close_retry_window=0 fails over immediately."""
+    manager = _make_manager()
+
+    monkeypatch.setattr("config.settings.STREAM_RETRY_ATTEMPTS", 0)
+    monkeypatch.setattr("config.settings.LIVE_SILENT_RECONNECT_MIN_CHUNKS", 5)
+    monkeypatch.setattr("config.settings.LIVE_SILENT_CLOSE_RETRY_WINDOW_SECONDS", 60.0)
+    monkeypatch.setattr("config.settings.MAX_FAILOVER_ATTEMPTS", 1)
+    monkeypatch.setattr("config.settings.LIVE_CHUNK_TIMEOUT_SECONDS", 1.0)
+
+    primary_url = "http://provider.example.com/live/primary.ts"
+    failover_url = "http://provider.example.com/live/failover.ts"
+    stream_id = await manager.get_or_create_stream(
+        primary_url, failover_urls=[failover_url], silent_close_retry_window=0
+    )
+    assert manager.streams[stream_id].silent_close_retry_window == 0
+
+    chunk_data = b"S" * 32768
+    requested_urls = []
+
+    async def fake_stream(method, url, headers=None, follow_redirects=True):
+        requested_urls.append(url)
+        count = 10 if url == primary_url else 4
+        return _MockStreamCM(
+            _response_from_iter(_make_chunks_then_stop(chunk_data, count))
+        )
+
+    monkeypatch.setattr(manager.live_stream_client, "stream", fake_stream)
+
+    response = await manager.stream_continuous_direct(stream_id, "test_client")
+    await _collect(response)
+
+    assert requested_urls[:2] == [primary_url, failover_url], (
+        f"Expected the per-stream 0 to disable the same-URL retry, got {requested_urls}"
+    )

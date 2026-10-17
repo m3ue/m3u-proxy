@@ -126,6 +126,8 @@ class StreamInfo:
     silence_check_interval: Optional[float] = None
     silence_failover_threshold: Optional[int] = None
     silence_monitoring_grace_period: Optional[float] = None
+    # Same-URL retry window on a live silent close (None = use global ENV default)
+    silent_close_retry_window: Optional[float] = None
     # Last HTTP error status code from upstream - passed to failover resolver
     last_error_status_code: Optional[int] = None
 
@@ -728,6 +730,7 @@ class StreamManager:
         silence_check_interval: Optional[float] = None,
         silence_failover_threshold: Optional[int] = None,
         silence_monitoring_grace_period: Optional[float] = None,
+        silent_close_retry_window: Optional[float] = None,
     ) -> str:
         """Get or create a stream and return its ID
 
@@ -750,6 +753,7 @@ class StreamManager:
             silence_check_interval: Override silence check window (s) for this stream
             silence_failover_threshold: Override consecutive silence count before failover for this stream
             silence_monitoring_grace_period: Override grace period (s) before monitoring starts for this stream
+            silent_close_retry_window: Override the same-URL retry window (s) on a live silent close (0 = off)
         """
         import hashlib
 
@@ -852,6 +856,7 @@ class StreamManager:
                 silence_check_interval=silence_check_interval,
                 silence_failover_threshold=silence_failover_threshold,
                 silence_monitoring_grace_period=silence_monitoring_grace_period,
+                silent_close_retry_window=silent_close_retry_window,
             )
             self.stream_clients[stream_id] = set()
 
@@ -2771,7 +2776,9 @@ class StreamManager:
                             )
                             min_chunks = settings.LIVE_SILENT_RECONNECT_MIN_CHUNKS
                             retry_window = (
-                                settings.LIVE_SILENT_CLOSE_RETRY_WINDOW_SECONDS
+                                stream_info.silent_close_retry_window
+                                if stream_info.silent_close_retry_window is not None
+                                else settings.LIVE_SILENT_CLOSE_RETRY_WINDOW_SECONDS
                             )
                             now = asyncio.get_event_loop().time()
                             # A healthy session that was dropped is retried on the same URL
