@@ -802,40 +802,43 @@ class TestManualFailoverRegression:
         )
         stream_info = stream_manager.streams[stream_id]
 
-        # Simulate _try_update_failover_url having already run externally:
-        # current_url = failover URL, event is set, attempt counter updated.
-        stream_info.current_url = failover_url
-        stream_info.failover_event.set()
-        stream_info.failover_attempts = 1
-        stream_info.current_failover_index = 0
+        resolver = AsyncMock(return_value="http://third.example.com/stream.ts")
+        monkeypatch.setattr(stream_manager, "_resolve_next_failover_url", resolver)
 
         called_urls = []
-        call_number = [0]
+
+        def _simulate_external_failover():
+            # What _try_update_failover_url does when a manual failover is requested
+            # while the client is streaming: point at the failover URL and set the event.
+            stream_info.current_url = failover_url
+            stream_info.failover_attempts = 1
+            stream_info.current_failover_index = 0
+            stream_info.failover_event.set()
 
         async def _fake_stream(method, url, **kwargs):
             called_urls.append(url)
-            call_number[0] += 1
-
-            # On the second connection: disable resolver so the natural stream-end
-            # path exits cleanly (has_failover=False, chunks < min_chunks threshold).
-            if call_number[0] >= 2:
-                stream_info.failover_resolver_url = None
-                stream_info.failover_urls = []
+            connection = len(called_urls)
 
             class _Iter:
-                def __init__(self, chunks):
-                    self._chunks = list(chunks)
-                    self._idx = 0
+                def __init__(self):
+                    self._sent = False
 
                 def __aiter__(self):
                     return self
 
                 async def __anext__(self):
-                    if self._idx >= len(self._chunks):
+                    if self._sent:
                         raise StopAsyncIteration
-                    c = self._chunks[self._idx]
-                    self._idx += 1
-                    return c
+                    self._sent = True
+                    if connection == 1:
+                        # Failover requested mid-stream, before this chunk is delivered.
+                        _simulate_external_failover()
+                        return b"primary_data"
+                    # Failover connection: one chunk then end (< LIVE_SILENT_RECONNECT_MIN_CHUNKS
+                    # → natural exit once the resolver has nothing more to offer).
+                    stream_info.failover_resolver_url = None
+                    stream_info.failover_urls = []
+                    return b"failover_data"
 
             class _Resp:
                 status_code = 200
@@ -845,10 +848,7 @@ class TestManualFailoverRegression:
                     pass
 
                 def aiter_bytes(self, chunk_size=32768):
-                    # First connection: no chunks (inner loop detects failover_event immediately).
-                    # Second connection: one chunk (< LIVE_SILENT_RECONNECT_MIN_CHUNKS=10 → natural exit).
-                    data = [] if call_number[0] == 1 else [b"failover_data"]
-                    return _Iter(data)
+                    return _Iter()
 
             class _CM:
                 async def __aenter__(self):
@@ -868,19 +868,14 @@ class TestManualFailoverRegression:
         async for chunk in response.body_iterator:
             chunks.append(chunk)
 
-        assert len(called_urls) >= 2, (
-            f"Expected at least 2 upstream connections, got: {called_urls}"
+        assert called_urls == [primary_url, failover_url], (
+            "After the failover_event break the generator must reconnect to the "
+            "already-set failover URL — _try_update_failover_url must not be called "
+            f"again (that would double-advance to URL #3). Got: {called_urls}"
         )
-        assert called_urls[0] == failover_url, (
-            "First connection should be to the already-set failover URL"
-        )
-        assert called_urls[1] == failover_url, (
-            "Second connection must ALSO be the failover URL — "
-            "_try_update_failover_url must not be called again after the "
-            "failover_event break (that would double-advance to URL #3)"
-        )
+        resolver.assert_not_awaited()
         assert b"failover_data" in chunks, (
-            "Generator should have served data from the second (failover) connection"
+            "Generator should have served data from the failover connection"
         )
 
 

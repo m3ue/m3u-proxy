@@ -2735,10 +2735,17 @@ class StreamManager:
                                     logger.info(
                                         "STRICT MODE: Attempting failover due to circuit breaker"
                                     )
-                                    await self._try_update_failover_url(
+                                    failover_ok = await self._try_update_failover_url(
                                         stream_id, "circuit_breaker_timeout"
                                     )
                                     failover_count += 1
+                                    if not failover_ok:
+                                        # The upstream was just marked bad; reconnecting straight
+                                        # back to it in a loop would only hammer the provider.
+                                        logger.warning(
+                                            f"No failover URL available for stream {stream_id}, giving up"
+                                        )
+                                        break
                                     # Close current connection
                                     if stream_context is not None:
                                         try:
@@ -2818,53 +2825,19 @@ class StreamManager:
                             if has_failover and failover_count < max_failovers:
                                 logger.warning(
                                     f"Live stream ended unexpectedly for client {client_id} "
-                                    f"({chunk_count} chunks, {bytes_served} bytes) — "
+                                    f"({chunks_this_connection} chunks this connection, {bytes_served} bytes total) — "
                                     f"provider may have closed connection. "
                                     f"Attempting failover (attempt {failover_count + 1}/{max_failovers})"
                                 )
-                                await self._try_update_failover_url(
+                                failover_ok = await self._try_update_failover_url(
                                     stream_id, "live_stream_silent_close"
                                 )
-
-                                # Reset circuit breaker state for the old upstream
-                                stream_info.upstream_marked_bad_until = None
-
-                                # Clean up current connection before failover
-                                if stream_context is not None:
-                                    try:
-                                        await stream_context.__aexit__(None, None, None)
-                                    except Exception:
-                                        pass
-                                stream_context = None
-                                response = None
                                 failover_count += 1
-                                # Count the failover URL's chunks on their own, so a dead
-                                # failover is not mistaken for a healthy session to retry.
-                                chunk_count_at_last_reconnect = chunk_count
-                                continue  # Retry with failover URL
-                            else:
-                                # No failover configured — silently reconnect to the same URL.
-                                # Providers that close connections periodically (e.g. every 10-15s)
-                                # require this to keep the client (e.g. Channels DVR) connected
-                                # without a full disconnect/reconnect cycle on their end.
-                                # Guard: only reconnect if enough chunks were delivered since the
-                                # last reconnect. A stream that closes after 1-2 chunks has ended
-                                # naturally; a live stream closing after thousands of chunks is a
-                                # periodic provider keep-alive pattern.
-                                if chunks_this_connection < min_chunks:
-                                    logger.info(
-                                        f"Live stream ended after {chunks_this_connection} chunks "
-                                        f"(min {min_chunks} required for silent reconnect), "
-                                        f"treating as natural completion for client {client_id}"
-                                    )
-                                else:
-                                    silent_reconnect_count += 1
-                                    logger.info(
-                                        f"Live stream closed by provider for client {client_id} "
-                                        f"({chunks_this_connection} chunks this connection, "
-                                        f"{bytes_served} bytes total) — "
-                                        f"reconnecting to same URL (silent reconnect #{silent_reconnect_count})"
-                                    )
+                                if failover_ok:
+                                    # Reset circuit breaker state for the old upstream
+                                    stream_info.upstream_marked_bad_until = None
+
+                                    # Clean up current connection before failover
                                     if stream_context is not None:
                                         try:
                                             await stream_context.__aexit__(
@@ -2874,14 +2847,57 @@ class StreamManager:
                                             pass
                                     stream_context = None
                                     response = None
-                                    # Skip pre-buffer on reconnect to avoid replaying the provider's
-                                    # rolling live buffer and causing a jump-back on the client.
-                                    skip_prebuffer = True
-                                    mark_discontinuity = True
-                                    if overlap_trimmer is not None:
-                                        overlap_trimmer.arm()
+                                    # Count the failover URL's chunks on their own, so a dead
+                                    # failover is not mistaken for a healthy session to retry.
                                     chunk_count_at_last_reconnect = chunk_count
-                                    continue  # Reconnect to same URL, client stays connected
+                                    continue  # Retry with failover URL
+                                # No failover URL to move to. Reconnecting straight back to the URL
+                                # that just closed is what turned an off-air channel into hundreds
+                                # of requests a minute, so fall through to the same-URL rules below:
+                                # reconnect only if this connection was healthy, otherwise end the
+                                # stream and let the client reconnect at its own pace.
+                                logger.warning(
+                                    f"No failover URL available for stream {stream_id} after a silent close; "
+                                    f"not retrying failover for this connection"
+                                )
+                            # No failover configured, failovers exhausted, or the resolver had no
+                            # URL to offer — silently reconnect to the same URL.
+                            # Providers that close connections periodically (e.g. every 10-15s)
+                            # require this to keep the client (e.g. Channels DVR) connected
+                            # without a full disconnect/reconnect cycle on their end.
+                            # Guard: only reconnect if enough chunks were delivered since the
+                            # last reconnect. A stream that closes after 1-2 chunks has ended
+                            # naturally; a live stream closing after thousands of chunks is a
+                            # periodic provider keep-alive pattern.
+                            if chunks_this_connection < min_chunks:
+                                logger.info(
+                                    f"Live stream ended after {chunks_this_connection} chunks "
+                                    f"(min {min_chunks} required for silent reconnect), "
+                                    f"treating as natural completion for client {client_id}"
+                                )
+                            else:
+                                silent_reconnect_count += 1
+                                logger.info(
+                                    f"Live stream closed by provider for client {client_id} "
+                                    f"({chunks_this_connection} chunks this connection, "
+                                    f"{bytes_served} bytes total) — "
+                                    f"reconnecting to same URL (silent reconnect #{silent_reconnect_count})"
+                                )
+                                if stream_context is not None:
+                                    try:
+                                        await stream_context.__aexit__(None, None, None)
+                                    except Exception:
+                                        pass
+                                stream_context = None
+                                response = None
+                                # Skip pre-buffer on reconnect to avoid replaying the provider's
+                                # rolling live buffer and causing a jump-back on the client.
+                                skip_prebuffer = True
+                                mark_discontinuity = True
+                                if overlap_trimmer is not None:
+                                    overlap_trimmer.arm()
+                                chunk_count_at_last_reconnect = chunk_count
+                                continue  # Reconnect to same URL, client stays connected
 
                         # Stream completed normally (VOD, or live with failover exhausted)
                         if not stream_info.failover_event.is_set():
@@ -3769,9 +3785,13 @@ class StreamManager:
                                 logger.warning(
                                     "Failed to create transcoding process, attempting failover"
                                 )
-                                await self._try_update_failover_url(
+                                if not await self._try_update_failover_url(
                                     stream_id, "transcode_start_error"
-                                )
+                                ):
+                                    raise HTTPException(
+                                        status_code=502,
+                                        detail="Failed to start transcoding and no failover URL available",
+                                    )
                                 failover_count += 1
                                 continue
                             else:
@@ -3786,6 +3806,9 @@ class StreamManager:
                         max_wait_time = 2.0  # Wait up to 2 seconds
                         check_interval = 0.1  # Check every 100ms
                         elapsed = 0.0
+                        # Set when the wait loop already failed over, so the final checks below
+                        # don't inspect the old, failed process and fail over a second time.
+                        failed_over_during_wait = False
 
                         while elapsed < max_wait_time:
                             await asyncio.sleep(check_interval)
@@ -3813,10 +3836,15 @@ class StreamManager:
                                         except Exception:
                                             pass
                                     stream_key = None
-                                    await self._try_update_failover_url(
+                                    if not await self._try_update_failover_url(
                                         stream_id, "transcode_input_error"
-                                    )
+                                    ):
+                                        logger.error(
+                                            f"No failover URL available for stream {stream_id}, giving up"
+                                        )
+                                        return
                                     failover_count += 1
+                                    failed_over_during_wait = True
                                     break  # Break out of wait loop to continue outer loop
                                 else:
                                     # No failover available - log error and return empty stream
@@ -3844,10 +3872,15 @@ class StreamManager:
                                         except Exception:
                                             pass
                                     stream_key = None
-                                    await self._try_update_failover_url(
+                                    if not await self._try_update_failover_url(
                                         stream_id, "transcode_process_exited"
-                                    )
+                                    ):
+                                        logger.error(
+                                            f"No failover URL available for stream {stream_id}, giving up"
+                                        )
+                                        return
                                     failover_count += 1
+                                    failed_over_during_wait = True
                                     break  # Break out of wait loop to continue outer loop
                                 else:
                                     logger.error(
@@ -3862,6 +3895,9 @@ class StreamManager:
                                     f"FFmpeg process producing data after {elapsed:.1f}s, starting stream"
                                 )
                                 break
+
+                        if failed_over_during_wait:
+                            continue  # Start the failover URL's transcoding process
 
                         # Check one final time after the wait loop before proceeding
                         # (in case we timed out without detecting the issue)
@@ -3885,9 +3921,13 @@ class StreamManager:
                                     except Exception:
                                         pass
                                 stream_key = None
-                                await self._try_update_failover_url(
+                                if not await self._try_update_failover_url(
                                     stream_id, "transcode_input_error"
-                                )
+                                ):
+                                    logger.error(
+                                        f"No failover URL available for stream {stream_id}, giving up"
+                                    )
+                                    return
                                 failover_count += 1
                                 continue
                             else:
@@ -3915,9 +3955,13 @@ class StreamManager:
                                     except Exception:
                                         pass
                                 stream_key = None
-                                await self._try_update_failover_url(
+                                if not await self._try_update_failover_url(
                                     stream_id, "transcode_process_exited"
-                                )
+                                ):
+                                    logger.error(
+                                        f"No failover URL available for stream {stream_id}, giving up"
+                                    )
+                                    return
                                 failover_count += 1
                                 continue
                             else:
@@ -3975,9 +4019,13 @@ class StreamManager:
                                                 f"Error cleaning up failed stream: {e}"
                                             )
                                     stream_key = None
-                                    await self._try_update_failover_url(
+                                    if not await self._try_update_failover_url(
                                         stream_id, "transcode_runtime_input_error"
-                                    )
+                                    ):
+                                        logger.error(
+                                            f"No failover URL available for stream {stream_id}, giving up"
+                                        )
+                                        return
                                     is_failover = True  # Keep client connection alive during failover
                                     failover_count += 1
                                     break
@@ -4101,7 +4149,7 @@ class StreamManager:
                             logger.info(
                                 f"Attempting automatic failover for transcoded stream (attempt {failover_count + 1}/{max_failovers})"
                             )
-                            await self._try_update_failover_url(
+                            failover_ok = await self._try_update_failover_url(
                                 stream_id, f"transcode_error_{type(e).__name__}"
                             )
                             # Clean up current connection
@@ -4110,6 +4158,11 @@ class StreamManager:
                                     client_id
                                 )
                             failover_count += 1
+                            if not failover_ok:
+                                logger.error(
+                                    f"No failover URL available for stream {stream_id}, giving up"
+                                )
+                                raise
                             continue
                         else:
                             raise
