@@ -469,3 +469,58 @@ async def test_per_stream_retry_window_overrides_env_default(monkeypatch):
     assert requested_urls[:2] == [primary_url, failover_url], (
         f"Expected the per-stream 0 to disable the same-URL retry, got {requested_urls}"
     )
+
+
+def test_same_url_retry_is_off_by_default():
+    """The same-URL retry is opt-in: without an override, silent closes fail over as before."""
+    from config import Settings
+
+    assert Settings.model_fields["LIVE_SILENT_CLOSE_RETRY_WINDOW_SECONDS"].default == 0
+
+
+@pytest.mark.asyncio
+async def test_failover_url_gets_its_own_same_url_retry(monkeypatch):
+    """
+    The retry window is per URL: once the primary's retry dies and the proxy fails
+    over, a healthy failover feed that is then dropped is retried on its own URL
+    instead of skipping straight to the next failover.
+    """
+    manager = _make_manager()
+
+    monkeypatch.setattr("config.settings.STREAM_RETRY_ATTEMPTS", 0)
+    monkeypatch.setattr("config.settings.LIVE_SILENT_RECONNECT_MIN_CHUNKS", 5)
+    monkeypatch.setattr("config.settings.LIVE_SILENT_CLOSE_RETRY_WINDOW_SECONDS", 60.0)
+    monkeypatch.setattr("config.settings.MAX_FAILOVER_ATTEMPTS", 10)
+    monkeypatch.setattr("config.settings.LIVE_CHUNK_TIMEOUT_SECONDS", 1.0)
+
+    primary_url = "http://provider.example.com/live/primary.ts"
+    failover_url = "http://provider.example.com/live/failover.ts"
+    second_failover_url = "http://provider.example.com/live/failover2.ts"
+    stream_id = await manager.get_or_create_stream(
+        primary_url, failover_urls=[failover_url, second_failover_url]
+    )
+
+    chunk_data = b"T" * 32768
+    requested_urls = []
+    # Primary plays then drops, its retry dies, the failover plays then drops.
+    plan = [10, 0, 10]
+
+    async def fake_stream(method, url, headers=None, follow_redirects=True):
+        requested_urls.append(url)
+        index = len(requested_urls) - 1
+        count = plan[index] if index < len(plan) else 0
+        return _MockStreamCM(
+            _response_from_iter(_make_chunks_then_stop(chunk_data, count))
+        )
+
+    monkeypatch.setattr(manager.live_stream_client, "stream", fake_stream)
+
+    response = await manager.stream_continuous_direct(stream_id, "test_client")
+    await _collect(response)
+
+    assert requested_urls[:4] == [
+        primary_url,
+        primary_url,
+        failover_url,
+        failover_url,
+    ], f"Expected the failover feed to get its own same-URL retry, got {requested_urls}"

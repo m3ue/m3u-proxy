@@ -156,8 +156,9 @@ class Settings(BaseSettings):
     # after a healthy run, reconnect to the same URL once before failing over: the
     # provider has usually just dropped the session, and switching feeds mid-stream
     # makes many players freeze or reconnect. If it closes again within this many
-    # seconds of that retry, fail over as before. 0 disables the same-URL retry.
-    LIVE_SILENT_CLOSE_RETRY_WINDOW_SECONDS: float = 60.0
+    # seconds of that retry, fail over as before. 0 (default) disables the same-URL
+    # retry; m3u-editor can enable it per stream with silent_close_retry_window.
+    LIVE_SILENT_CLOSE_RETRY_WINDOW_SECONDS: float = 0.0
 
     # Overlap trimming on silent reconnect (Strict Live TS Mode only).
     # Providers that close periodically usually restart from their rolling buffer,

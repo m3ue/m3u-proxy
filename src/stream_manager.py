@@ -1832,6 +1832,7 @@ class StreamManager:
             failover_count = 0
             silent_reconnect_count = 0
             last_same_url_retry_time = None
+            last_same_url_retry_url = None
             skip_prebuffer = False
             mark_discontinuity = False
             chunk_count_at_last_reconnect = 0
@@ -2788,21 +2789,27 @@ class StreamManager:
                                 else settings.LIVE_SILENT_CLOSE_RETRY_WINDOW_SECONDS
                             )
                             now = asyncio.get_event_loop().time()
+                            active_url = (
+                                stream_info.current_url or stream_info.original_url
+                            )
                             # A healthy session that was dropped is retried on the same URL
-                            # once before failing over, unless the previous same-URL retry was
-                            # recent (the upstream keeps closing, so it is genuinely failing).
+                            # once before failing over, unless the previous same-URL retry of
+                            # this URL was recent (it keeps closing, so it is genuinely failing).
+                            # A failover feed gets its own retry, so the window is per URL.
                             retry_same_url = (
                                 has_failover
                                 and retry_window > 0
                                 and chunks_this_connection >= min_chunks
                                 and (
                                     last_same_url_retry_time is None
+                                    or last_same_url_retry_url != active_url
                                     or now - last_same_url_retry_time >= retry_window
                                 )
                             )
                             if retry_same_url:
                                 silent_reconnect_count += 1
                                 last_same_url_retry_time = now
+                                last_same_url_retry_url = active_url
                                 logger.warning(
                                     f"Live stream ended unexpectedly for client {client_id} "
                                     f"({chunks_this_connection} chunks this connection, "
