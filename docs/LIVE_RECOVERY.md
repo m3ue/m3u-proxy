@@ -45,7 +45,7 @@ Existing handoff/source-selection behavior is reused, not replaced. Original
 metadata, upstream headers, failover resolver and silence settings reach the
 private input. Public metadata is original metadata plus
 `normalize_live_output="true"` and server-set `normalization_encoder="cpu"` or
-`"vaapi"`; client metadata cannot override either marker. No
+`"vaapi"` / `"qsv"`; client metadata cannot override either marker. No
 `transcoding="true"` marker is injected, so
 ordinary-direct editor pooling can still find it.
 
@@ -77,7 +77,7 @@ codec, track-layout, resolution or protocol switching**; audio and video tracks
 are required. HLS/DASH/VOD remain outside this feature. Repeated failures still
 follow existing retry/exhaustion behavior and may eventually terminate playback.
 
-`normalization_encoder` accepts only `"cpu"` (default) or `"vaapi"`. Missing
+`normalization_encoder` accepts only `"cpu"` (default), `"vaapi"` or `"qsv"`. Missing
 encoder fields, including older channel metadata, mean CPU; there is no GPU
 auto-selection. The field has no effect when normalization is off. Both private
 IDs include the encoder and effective profile, isolating CPU/GPU viewers.
@@ -94,8 +94,24 @@ and the same audio resampling/AAC, timestamp,
 PMT and reconnect policy as CPU. Hardware decoding is deliberately not enabled
 for source-switch robustness. Clients cannot choose a command or device.
 
+QSV is a separate explicit mode, not a VAAPI alias or automatic fallback. It
+uses explicit software decoding (`-hwaccel none -err_detect:v explode -ec:v 0`),
+**software** field-aware bwdif, and upload to QSV H.264 encoding. This is a static
+preset, **not a full-GPU pipeline** and not a runtime software fallback. The
+server-owned preset uses `-global_quality 18 -g 25 -bf 0`,
+`-fps_mode passthrough -enc_time_base 1/90000`; no inherited bitrate cap, B-frame
+reordering or unconditional VPP field doubling. A bounded local H.264 TFF
+fixture exercises the actual software-decode/bwdif/upload/QSV-encode path before
+allocation (at most two 10-second subprocess waits). Missing hardware, driver,
+decoder or encoder returns 503 without input/output allocation or CPU fallback.
+Hardware/codec failure after admission can still terminate the stream. The
+accepted FFmpeg standard policy shifts only the last valid A picture's second
+field by 20 ms at the unbounded truncated-video i25 cut; it does not preserve
+every original source-field PTS or permit extra concealed pictures. See
+[QSV normalization evidence and limits](QSV_NORMALIZATION.md).
+
 Optional trusted `LIVE_NORMALIZE_PROFILE` overrides the **CPU** default below
-(and is ignored for the fixed VAAPI template); required
+(and is ignored for the fixed VAAPI/QSV templates); required
 placeholders are `{input_url}` and `{output_args}`, with optional `{format}`.
 Changing the profile creates an isolated stream policy/ID; it does not modify
 already-running encoders. Keep a persistent MPEG-TS pipe output and test any
@@ -110,14 +126,16 @@ Offline acceptance (installed project dependencies; no providers or Emby needed)
 ```sh
 python -m pytest tests/test_live_normalization.py tests/test_normalization_quality.py -q
 # In a disposable --rm --network none --device /dev/dri sandbox only:
-RUN_VAAPI_QUALITY=1 NORMALIZATION_QUALITY_SIZE=1920x1080 python -m pytest tests/test_normalization_quality.py -q -s
+RUN_VAAPI_QUALITY=1 RUN_QSV_QUALITY=1 NORMALIZATION_QUALITY_SIZE=1920x1080 python -m pytest tests/test_normalization_quality.py -q -s
+RUN_QSV_QUALITY=1 python -m pytest tests/test_qsv_api_quality.py -q -s
 python tools/verify_live_normalization.py --encoder cpu
 # On an Intel VAAPI host/container with the render node and drivers available:
 python tools/verify_live_normalization.py --encoder vaapi
 ```
 
 The moving-video tests interleave a 50p `testsrc2` into real TFF fields before
-lossless fixture encoding, verify decoded interlace/parity flags, then check exact
+fixture encoding (compatible lossy 8-bit H.264 for QSV, FFV1 otherwise), verify
+decoded interlace/parity flags, then check exact
 frame counts, PTS intervals, progressive output and distinct frame hashes. They
 compare to a lossless bwdif field-rate reference of the same decoded source.
 SSIM >= 0.97 is a synthetic regression floor for these high-quality encodes;

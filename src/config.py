@@ -84,7 +84,8 @@ class Settings(BaseSettings):
     ENABLE_TRANSCODING_POOLING: bool = True
     # Opt in to the existing local FFmpeg manager without Redis; one process only.
     ENABLE_SINGLE_PROCESS_TRANSCODING: bool = False
-    # Persistent output normalizer for direct live MPEG-TS only (CPU encoding).
+    # Persistent output normalizer for direct live MPEG-TS only, off by default.
+    # This trusted template is CPU-only; VAAPI/QSV templates are server-owned.
     LIVE_NORMALIZE_OUTPUT: bool = False
     LIVE_NORMALIZE_PROFILE: str = (
         "-analyzeduration 1000000 -probesize 1000000 "

@@ -88,6 +88,18 @@ _FFMPEG_INPUT_ERROR_PATTERNS = (
     "protocol not found",
 )
 
+# Only the server-generated QSV normalization identity may defer these exact
+# H.264 decoder diagnostics to the existing output-timeout/process-exit checks.
+# An invalid packet at a non-IDR join can precede valid output; it is not an
+# input-open/demux/HTTP failure. Keep every other fatal pattern authoritative.
+_QSV_NORMALIZATION_PROFILE_RE = re.compile(r"live-normalize:qsv:[0-9a-f]{64}")
+_H264_PACKET_DIAGNOSTIC_RE = re.compile(
+    r"(?:\[vist#[^\]\r\n]+/h264 @ 0x[0-9a-f]+\] )?"
+    r"\[dec:h264 @ 0x[0-9a-f]+\] "
+    r"(?:error submitting packet to decoder|decoding error): "
+    r"invalid data found when processing input"
+)
+
 logger = logging.getLogger(__name__)
 
 try:
@@ -724,8 +736,17 @@ class SharedTranscodingProcess:
                             self.status = "failed"
                             break
 
-                    # Check for input/connection errors that should trigger failover
+                    # Check for input/connection errors that should trigger failover.
+                    # Do not reset status here: later warnings/progress must never
+                    # revive a process already failed by a genuine/write error.
+                    qsv_decoder_diagnostic = (
+                        not self.resolver_type
+                        and _QSV_NORMALIZATION_PROFILE_RE.fullmatch(self.profile)
+                        and _H264_PACKET_DIAGNOSTIC_RE.fullmatch(line_lower)
+                    )
                     for pattern in _FFMPEG_INPUT_ERROR_PATTERNS:
+                        if pattern == "invalid data found" and qsv_decoder_diagnostic:
+                            continue
                         if pattern in line_lower:
                             logger.error(
                                 f"FFmpeg input error detected for {self.stream_id}: {line_str}"

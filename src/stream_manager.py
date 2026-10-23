@@ -24,6 +24,7 @@ from fastapi.responses import StreamingResponse
 
 from config import settings
 from ts_overlap import OverlapTrimmer, TRIM_MATCHED, TRIM_NO_MATCH
+from ts_canonicalizer import TSCanonicalizer, TSCanonicalizationError
 from url_signing import sign_url, verify_url
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,33 @@ logger = logging.getLogger(__name__)
 
 class _DirectGenerationEnded(Exception):
     """Internal control flow: stale readers must run ordinary final cleanup."""
+
+
+@dataclass
+class _DirectInputRequest:
+    """State shared only by raw generators within one owned input response."""
+
+    max_attempts: int
+    closing_for_recovery: bool = False
+    attempts: int = 0
+    client: Optional["ClientInfo"] = None
+    connection_id: Optional[str] = None
+    cancel_event: Optional[asyncio.Event] = None
+
+    def is_active(self, clients, client_id) -> bool:
+        return self.connection_id is None or (
+            self.client is not None
+            and clients.get(client_id) is self.client
+            and self.client.active_connection_id == self.connection_id
+            and self.cancel_event is not None
+            and not self.cancel_event.is_set()
+        )
+
+    def reserve_failover(self) -> bool:
+        if self.attempts >= self.max_attempts:
+            return False
+        self.attempts += 1
+        return True
 
 
 @dataclass
@@ -1669,6 +1697,7 @@ class StreamManager:
         )
 
         async def _open_fresh_upstream():
+            nonlocal generation
             logger.info(
                 f"Promoted subscriber {client_id} opening new upstream connection "
                 f"for stream {stream_id} to {active_url}"
@@ -1684,6 +1713,9 @@ class StreamManager:
             except Exception:
                 await ctx.__aexit__(None, None, None)
                 raise
+            if self._is_qsv_owned_input(stream_info):
+                stream_info.direct_generation += 1
+                generation = stream_info.direct_generation
             logger.info(
                 f"Promoted primary connected: {resp.status_code} for stream {stream_id}"
             )
@@ -1851,8 +1883,166 @@ class StreamManager:
                 await self._end_direct_generation(stream_id, connection_id)
             self._signal_subscribers_end(stream_id, connection_id)
 
+    def _is_qsv_owned_input(self, stream_info: StreamInfo) -> bool:
+        """Only the reciprocal, server-created private input can opt in."""
+        outer = self.streams.get(stream_info.normalization_parent_id)
+        return bool(
+            outer is not None
+            and outer.normalization_input_id == stream_info.stream_id
+            and outer.metadata.get("normalization_encoder") == "qsv"
+        )
+
     async def stream_continuous_direct(
         self, stream_id: str, client_id: str, range_header: Optional[str] = None
+    ) -> StreamingResponse:
+        info = self.streams.get(stream_id)
+        if info is None or not self._is_qsv_owned_input(info):
+            return await self._stream_continuous_direct_original(
+                stream_id, client_id, range_header
+            )
+        configured_max = settings.MAX_FAILOVER_ATTEMPTS
+        request = _DirectInputRequest(
+            configured_max if configured_max > 0 else (
+                len(info.failover_urls) if info.failover_urls else 999
+            )
+        )
+        response = await self._stream_continuous_direct_original(
+            stream_id, client_id, range_header, _input_request=request
+        )
+
+        # Wrap the response, not just the primary generator: subscriber queues,
+        # promoted readers and seamless upstream handoffs all pass this boundary.
+        original = response.body_iterator
+        initial_epoch = info.direct_generation
+        initial_client = self.clients.get(client_id)
+        initial_connection_id = (
+            initial_client.active_connection_id if initial_client else None
+        )
+
+        async def canonicalized():
+            source = original
+            epoch = initial_epoch
+            connection_id = initial_connection_id
+            def request_is_active():
+                return request.is_active(self.clients, client_id)
+
+            output_started = False
+            while True:
+                adapter = TSCanonicalizer()
+                try:
+                    async with aclosing(source):
+                        try:
+                            if not request_is_active():
+                                return
+                            async for chunk in source:
+                                if self.streams.get(stream_id) is not info:
+                                    return
+                                current_epoch = info.direct_generation
+                                if current_epoch != epoch:
+                                    adapter.start_generation()
+                                    epoch = current_epoch
+                                # Source generators fence stale reads before yielding.
+                                data = adapter.feed(chunk)
+                                if data:
+                                    output_started = True
+                                    yield data
+                            tail = adapter.finish()
+                            if tail:
+                                yield tail
+                            return
+                        except TSCanonicalizationError:
+                            # This error lives outside the raw source generator and
+                            # must be recovered here, on the owned input (not FFmpeg's
+                            # outer stream). Never feed rejected bytes to the decoder.
+                            async with info.direct_recovery_lock:
+                                if (
+                                    not request_is_active()
+                                    or self.streams.get(stream_id) is not info
+                                    or not self._is_qsv_owned_input(info)
+                                    or epoch != info.direct_generation
+                                    or self._direct_broadcast_primary.get(stream_id)
+                                    not in (None, connection_id)
+                                ):
+                                    raise
+                                recovered = False
+                                # A failed adapter cannot be reused. Replacing it
+                                # after output would reset CC/codec ABI mid-encoder;
+                                # late errors therefore end this input cleanly.
+                                if (
+                                    not output_started
+                                    and (info.failover_resolver_url or info.failover_urls)
+                                    and request.reserve_failover()
+                                ):
+                                    recovered = await self._update_failover_url(
+                                        stream_id, "normalization_input_error",
+                                        expected_generation=epoch,
+                                    )
+                                if (
+                                    not request_is_active()
+                                    or self.streams.get(stream_id) is not info
+                                    or epoch != info.direct_generation
+                                    or not self._is_qsv_owned_input(info)
+                                ):
+                                    raise
+                                # Invalidate the rejected source before aclose can
+                                # promote subscribers or offer its upstream handoff.
+                                next_epoch = epoch + 1
+                                if (
+                                    connection_id is not None
+                                    and self._direct_broadcast_primary.get(stream_id)
+                                    == connection_id
+                                ):
+                                    await self._detach_direct_generation(stream_id, connection_id)
+                                else:
+                                    info.direct_generation += 1
+                                if not recovered:
+                                    raise
+                                epoch = next_epoch
+                                if (
+                                    not request_is_active()
+                                    or self.streams.get(stream_id) is not info
+                                    or epoch != info.direct_generation
+                                    or not self._is_qsv_owned_input(info)
+                                    or self._direct_broadcast_primary.get(stream_id)
+                                    not in (None, connection_id)
+                                ):
+                                    raise
+                                # Closing this raw reader is a source replacement,
+                                # not a disconnect of the owning HTTP request.
+                                request.closing_for_recovery = True
+                finally:
+                    reopening = request.closing_for_recovery
+                    request.closing_for_recovery = False
+                    if not reopening and connection_id is not None:
+                        await self.cleanup_client(client_id, connection_id)
+                # The old upstream is closed before opening the selected candidate.
+                # Keep this HTTP response open and reset all adapter discovery state.
+                if (
+                    not request_is_active()
+                    or self.streams.get(stream_id) is not info
+                    or epoch != info.direct_generation
+                    or not self._is_qsv_owned_input(info)
+                    or self._direct_broadcast_primary.get(stream_id)
+                    not in (None, connection_id)
+                ):
+                    if connection_id is not None:
+                        await self.cleanup_client(client_id, connection_id)
+                    return
+                if connection_id is not None:
+                    self.connection_cancel_events.pop(connection_id, None)
+                next_response = await self._stream_continuous_direct_original(
+                    stream_id, client_id, range_header, _input_request=request
+                )
+                source = next_response.body_iterator
+                epoch = info.direct_generation
+                connection_id = request.connection_id
+
+        response.body_iterator = canonicalized()
+        return response
+
+    async def _stream_continuous_direct_original(
+        self, stream_id: str, client_id: str, range_header: Optional[str] = None,
+        *, _input_request: Optional[_DirectInputRequest] = None,
     ) -> StreamingResponse:
         """
         Direct byte-for-byte proxy for continuous streams (.ts, .mp4, .mkv).
@@ -1896,6 +2086,36 @@ class StreamManager:
                 f"Client {client_id} now has active connection: {connection_id}"
             )
 
+        request_client = self.clients.get(client_id)
+        if _input_request is not None:
+            _input_request.client = request_client
+            _input_request.connection_id = connection_id
+            _input_request.cancel_event = cancel_event
+
+        def input_request_is_active():
+            return (
+                self.streams.get(stream_id) is stream_info
+                and generation == stream_info.direct_generation
+                and self._is_qsv_owned_input(stream_info)
+                and request_client is not None
+                and self.clients.get(client_id) is request_client
+                and request_client.active_connection_id == connection_id
+                and not cancel_event.is_set()
+            )
+
+        async def select_failover(selected_stream_id, reason):
+            if _input_request is None:
+                return await self._try_update_failover_url(selected_stream_id, reason)
+            # Transport and adapter selectors spend the same response budget.
+            # Recheck after lock acquisition; stale readers must not select again.
+            async with stream_info.direct_recovery_lock:
+                if not input_request_is_active() or not _input_request.reserve_failover():
+                    return False
+                recovered = await self._update_failover_url(
+                    selected_stream_id, reason, expected_generation=generation
+                )
+                return recovered and input_request_is_active()
+
         # --- Direct stream broadcasting (connection sharing) ---
         # For live (non-VOD) streams, if another client is already reading from upstream
         # for this stream_id, subscribe to its broadcast instead of opening a duplicate
@@ -1935,7 +2155,7 @@ class StreamManager:
                     stream_info.failover_resolver_url or stream_info.failover_urls
                 )
                 if has_failover:
-                    await self._try_update_failover_url(
+                    await select_failover(
                         stream_id, "circuit_breaker_bad_upstream"
                     )
                     current_url = stream_info.current_url or stream_info.original_url
@@ -1971,6 +2191,7 @@ class StreamManager:
 
         async def generate():
             """Generator that directly proxies bytes from provider to client with failover support"""
+            nonlocal generation
             nonlocal \
                 provider_status_code, \
                 provider_content_range, \
@@ -2206,6 +2427,15 @@ class StreamManager:
 
                         # Now we can call methods on the actual response object
                         response.raise_for_status()
+
+                        # QSV's private normalizer keeps one HTTP input across
+                        # source failures. A new successful upstream response is
+                        # a new TS identity epoch (not each output chunk).
+                        if generation != stream_info.direct_generation:
+                            raise _DirectGenerationEnded()
+                        if self._is_qsv_owned_input(stream_info):
+                            stream_info.direct_generation += 1
+                            generation = stream_info.direct_generation
 
                         # Capture provider response details for proper HTTP 206 handling
                         provider_status_code = response.status_code
@@ -2452,7 +2682,7 @@ class StreamManager:
                                                 f"(failover attempt {failover_count + 1}/{max_failovers})"
                                             )
                                             failover_ok = (
-                                                await self._try_update_failover_url(
+                                                await select_failover(
                                                     stream_id,
                                                     "chunk_timeout_after_retries",
                                                 )
@@ -2682,7 +2912,7 @@ class StreamManager:
                                                         f"Bitrate consistently below threshold for stream {stream_id}, "
                                                         f"triggering failover (attempt {failover_count + 1}/{max_failovers})"
                                                     )
-                                                    await self._try_update_failover_url(
+                                                    await select_failover(
                                                         stream_id, "low_bitrate"
                                                     )
                                                     # Reset bitrate monitoring for new connection
@@ -2798,7 +3028,7 @@ class StreamManager:
                                                         f"Persistent silence detected for stream {stream_id}, "
                                                         f"triggering failover (attempt {failover_count + 1}/{max_failovers})"
                                                     )
-                                                    await self._try_update_failover_url(
+                                                    await select_failover(
                                                         stream_id, "silence_detected"
                                                     )
                                                     silence_count = 0
@@ -2917,7 +3147,7 @@ class StreamManager:
                                     logger.info(
                                         "STRICT MODE: Attempting failover due to circuit breaker"
                                     )
-                                    failover_ok = await self._try_update_failover_url(
+                                    failover_ok = await select_failover(
                                         stream_id, "circuit_breaker_timeout"
                                     )
                                     failover_count += 1
@@ -3016,7 +3246,7 @@ class StreamManager:
                                     f"provider may have closed connection. "
                                     f"Attempting failover (attempt {failover_count + 1}/{max_failovers})"
                                 )
-                                failover_ok = await self._try_update_failover_url(
+                                failover_ok = await select_failover(
                                     stream_id, "live_stream_silent_close"
                                 )
                                 failover_count += 1
@@ -3128,6 +3358,8 @@ class StreamManager:
                         raise
 
                     except GeneratorExit:
+                        if _input_request and _input_request.closing_for_recovery:
+                            return
                         # Client disconnected — Starlette throws GeneratorExit into the
                         # async generator when the HTTP connection closes.  Without this
                         # handler, GeneratorExit (a BaseException) propagates through the
@@ -3259,7 +3491,7 @@ class StreamManager:
                                 logger.info(
                                     f"Retries exhausted, attempting automatic failover for client {client_id} (ReadError, no data)"
                                 )
-                                failover_ok = await self._try_update_failover_url(
+                                failover_ok = await select_failover(
                                     stream_id, "connection_error_after_retries"
                                 )
                                 failover_count += 1
@@ -3463,7 +3695,7 @@ class StreamManager:
                                 f"Retries exhausted, attempting automatic failover for client {client_id} "
                                 f"(failover attempt {failover_count + 1}/{max_failovers})"
                             )
-                            failover_ok = await self._try_update_failover_url(
+                            failover_ok = await select_failover(
                                 stream_id,
                                 f"stream_error_{type(e).__name__}_after_retries",
                             )
@@ -3644,7 +3876,7 @@ class StreamManager:
                                 logger.info(
                                     f"Retries exhausted, attempting automatic failover for client {client_id} (unknown error)"
                                 )
-                                failover_ok = await self._try_update_failover_url(
+                                failover_ok = await select_failover(
                                     stream_id,
                                     f"unknown_error_{type(e).__name__}_after_retries",
                                 )
@@ -3694,6 +3926,10 @@ class StreamManager:
                         if (
                             generation == stream_info.direct_generation
                             and stream_context is not None
+                            and (
+                                not self._is_qsv_owned_input(stream_info)
+                                or bool(self._direct_broadcast_queues.get(stream_id))
+                            )
                             and self._can_hand_off_upstream(
                                 stream_id, client_id, cancel_event
                             )
@@ -3856,11 +4092,19 @@ class StreamManager:
                 f"Returning 206 Partial Content with range: {provider_content_range} and length {provider_content_length}"
             )
 
+        # Capture ownership before disconnect/delete can remove the outer stream.
+        qsv_owned_input = self._is_qsv_owned_input(stream_info)
         # Create new generator that yields the first chunk then continues with the rest
         async def generate_with_first_chunk():
-            yield first_chunk
-            async for chunk in gen:
-                yield chunk
+            try:
+                yield first_chunk
+                async for chunk in gen:
+                    yield chunk
+            finally:
+                if qsv_owned_input:
+                    # Adapter rejection can happen on the prefetched first chunk.
+                    # Closing only this wrapper leaves the provider generator open.
+                    await gen.aclose()
 
         return StreamingResponse(
             generate_with_first_chunk(),
@@ -5537,7 +5781,8 @@ class StreamManager:
         return await self._update_failover_url(stream_id, reason)
 
     async def _update_failover_url(
-        self, stream_id: str, reason: str = "manual"
+        self, stream_id: str, reason: str = "manual",
+        *, expected_generation: Optional[int] = None,
     ) -> bool:
         """Update to next failover URL and signal all clients to reconnect
 
@@ -5564,6 +5809,13 @@ class StreamManager:
         # Resolve the next failover URL using the preferred method
         old_url = stream_info.current_url
         next_url = await self._resolve_next_failover_url(stream_id, reason=reason)
+
+        if expected_generation is not None and (
+            self.streams.get(stream_id) is not stream_info
+            or stream_info.direct_generation != expected_generation
+            or not self._is_qsv_owned_input(stream_info)
+        ):
+            return False
 
         if not next_url:
             logger.warning(f"No more failover URLs available for stream {stream_id}")

@@ -18,7 +18,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from config import Settings
-from live_normalization import VAAPI_PROFILE
+from live_normalization import VAAPI_PROFILE, QSV_PROFILE, QSV_DEVICE_ARGS, QSV_DECODING_ARGS
 
 DEINTERLACE = "bwdif=mode=send_field:parity=auto:deint=interlaced"
 
@@ -44,20 +44,30 @@ def test_standard_profile_quality_contract():
     assert "-rc_mode CQP -qp 18" in VAAPI_PROFILE
 
 
-@pytest.mark.parametrize("encoder", ["cpu", "vaapi"])
+@pytest.mark.parametrize("encoder", ["cpu", "vaapi", "qsv"])
 @pytest.mark.parametrize("source", ["i25", "p25", "p50"])
 def test_moving_video_field_rate_and_quality(tmp_path, encoder, source):
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
         pytest.skip("ffmpeg/ffprobe required for moving-video acceptance")
     if encoder == "vaapi" and os.environ.get("RUN_VAAPI_QUALITY") != "1":
         pytest.skip("VAAPI quality requires an explicit disposable device sandbox")
+    if encoder == "qsv" and os.environ.get("RUN_QSV_QUALITY") != "1":
+        pytest.skip("QSV quality requires an explicit disposable device sandbox")
     size = os.environ.get("NORMALIZATION_QUALITY_SIZE", "320x180")
     rate = 25 if source == "p25" else 50
-    original = tmp_path / "source.mkv"
+    original = tmp_path / ("source.ts" if encoder == "qsv" else "source.mkv")
     filters = "tinterlace=mode=interleave_top,setfield=tff" if source == "i25" else "setfield=prog"
+    fixture_codec = ["-c:v", "ffv1"]
+    if encoder == "qsv":
+        # Use the same realistic 8-bit H.264 source as the QSV handoff tests.
+        # Decode is explicitly software; QSV is only the output encoder.
+        fixture_codec = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
+                         "-pix_fmt", "yuv420p"]
+        if source == "i25":
+            fixture_codec += ["-flags", "+ilme+ildct", "-x264-params", "tff=1"]
     run("ffmpeg", "-v", "error", "-f", "lavfi", "-i",
         f"testsrc2=size={size}:rate={rate}:duration=2", "-vf", filters,
-        "-c:v", "ffv1", "-threads", "2", original)
+        *fixture_codec, "-threads", "2", original)
     before = probe(original)
     frames = before["frames"]
     assert len(frames) == (50 if source != "p50" else 100)
@@ -67,7 +77,9 @@ def test_moving_video_field_rate_and_quality(tmp_path, encoder, source):
     reference = tmp_path / "reference.mkv"
     run("ffmpeg", "-v", "error", "-i", original, "-vf", DEINTERLACE,
         "-fps_mode", "passthrough", "-c:v", "ffv1", "-threads", "2", reference)
-    template = VAAPI_PROFILE if encoder == "vaapi" else Settings.model_fields["LIVE_NORMALIZE_PROFILE"].default
+    template = {"vaapi": VAAPI_PROFILE, "qsv": QSV_PROFILE}.get(
+        encoder, Settings.model_fields["LIVE_NORMALIZE_PROFILE"].default
+    )
     # Exercise the exact server-owned output template; local fixture input avoids
     # reconnect/HTTP options, which apply only to the live private HTTP input.
     args = shlex.split(template.format(input_url="fixture", output_args="pipe:1"))
@@ -75,6 +87,8 @@ def test_moving_video_field_rate_and_quality(tmp_path, encoder, source):
     output_args[-1] = str(tmp_path / "output.ts")
     output_args[output_args.index("0:a:0")] = "0:a:0?"
     device = ["-vaapi_device", "/dev/dri/renderD128"] if encoder == "vaapi" else []
+    if encoder == "qsv":
+        device = [*QSV_DEVICE_ARGS, *QSV_DECODING_ARGS]
     run("ffmpeg", "-v", "error", *device, "-i", original, *output_args)
     output = Path(output_args[-1])
     after = probe(output)
@@ -85,7 +99,9 @@ def test_moving_video_field_rate_and_quality(tmp_path, encoder, source):
     assert all(f["interlaced_frame"] == 0 for f in actual)
     pts = [float(f["best_effort_timestamp_time"]) for f in actual]
     reference_pts = [float(f["best_effort_timestamp_time"]) for f in expected]
-    assert [p - pts[0] for p in pts] == pytest.approx(reference_pts, abs=0.00002)
+    assert [p - pts[0] for p in pts] == pytest.approx(
+        [p - reference_pts[0] for p in reference_pts], abs=0.00002
+    )
     step = 0.04 if source == "p25" else 0.02
     assert [b - a for a, b in zip(pts, pts[1:])] == pytest.approx([step] * (expected_count - 1), abs=0.00002)
     comparison = run("ffmpeg", "-v", "info", "-i", output, "-i", reference,

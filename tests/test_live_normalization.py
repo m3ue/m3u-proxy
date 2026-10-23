@@ -30,11 +30,12 @@ async def manager(monkeypatch):
     await sm.stop()
 
 
-@pytest.fixture(params=["cpu", "vaapi"])
+@pytest.fixture(params=["cpu", "vaapi", "qsv"])
 def encoder_policy(request, monkeypatch):
     import live_normalization
 
     monkeypatch.setattr(live_normalization, "validate_vaapi_encoder", AsyncMock())
+    monkeypatch.setattr(live_normalization, "validate_qsv_encoder", AsyncMock())
     return request.param
 
 
@@ -162,7 +163,7 @@ async def test_outer_control_routes_to_inner_without_encoder_restart(
 @pytest.mark.parametrize("cancel", [False, True])
 @pytest.mark.parametrize("after_allocation", [False, True])
 async def test_partial_failure_rolls_back(
-    manager, monkeypatch, cancel, after_allocation
+    manager, monkeypatch, cancel, after_allocation, encoder_policy
 ):
     import asyncio
 
@@ -179,7 +180,7 @@ async def test_partial_failure_rolls_back(
 
     monkeypatch.setattr(manager, "get_or_create_stream", create)
     with pytest.raises(asyncio.CancelledError if cancel else HTTPException):
-        await api.create_stream(payload(normalize_live_output=True), scope())
+        await api.create_stream(payload(normalize_live_output=True, normalization_encoder=encoder_policy), scope())
     assert not manager.streams
 
 

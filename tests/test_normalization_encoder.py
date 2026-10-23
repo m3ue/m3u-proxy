@@ -50,9 +50,10 @@ async def test_encoder_isolates_both_identities_and_preserves_cpu_custom(manager
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("encoder", ["cpu", "vaapi"])
+@pytest.mark.parametrize("encoder", ["cpu", "vaapi", "qsv"])
 async def test_outer_encoder_metadata_unspoofable(manager, monkeypatch, encoder):
     monkeypatch.setattr(normalization, "validate_vaapi_encoder", AsyncMock())
+    monkeypatch.setattr(normalization, "validate_qsv_encoder", AsyncMock())
     request = payload(normalize_live_output=True, normalization_encoder=encoder)
     request.metadata.update(normalization_encoder="forged", normalize_live_output="false")
     result = await api.create_stream(request, scope())
@@ -77,7 +78,7 @@ async def test_default_and_explicit_cpu_reuse_and_off_ignores_encoder(manager, m
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("encoder", ["nvenc", "qsv", "VAAPI", "", None, "/dev/dri/renderD129"])
+@pytest.mark.parametrize("encoder", ["nvenc", "QSV", "VAAPI", "", None, "/dev/dri/renderD129"])
 async def test_invalid_encoder_http_422_before_allocation(manager, monkeypatch, encoder):
     monkeypatch.setattr(settings, "API_TOKEN", "")
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=api.app), base_url="http://fixture:12345") as client:

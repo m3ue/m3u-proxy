@@ -37,6 +37,87 @@ VAAPI_PROFILE = (
 )
 
 
+# Decode and field-aware bwdif stay on the CPU; only encoding uses QSV.
+# Hardware decoding conceals truncated unbounded H.264 PES despite explode/ec=0.
+# This is a static correctness-first preset, not a runtime software fallback.
+QSV_DEVICE_ARGS = (
+    "-init_hw_device", "vaapi=va:/dev/dri/renderD128",
+    "-init_hw_device", "qsv=qs@va", "-filter_hw_device", "qs",
+)
+# Strict H.264 recovery can loop on an initial broken access unit with frame
+# threading. Serialize only this software input decoder, not the QSV encoder.
+QSV_DECODING_ARGS = (
+    "-hwaccel", "none", "-err_detect:v", "explode", "-ec:v", "0",
+    "-threads:v", "1",
+)
+QSV_FILTER = (
+    "bwdif=mode=send_field:parity=auto:deint=interlaced,"
+    "format=nv12,hwupload=extra_hw_frames=64"
+)
+QSV_ENCODING_ARGS = (
+    "-fps_mode", "passthrough", "-enc_time_base", "1/90000",
+    "-c:v", "h264_qsv", "-global_quality", "18", "-g", "25", "-bf", "0",
+)
+QSV_PROFILE = (
+    " ".join(QSV_DEVICE_ARGS) + " "
+    "-analyzeduration 1000000 -probesize 1000000 "
+    "-reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 "
+    "-reconnect_delay_max 2 -reconnect_max_retries 5 "
+    "-fflags +genpts+discardcorrupt -merge_pmt_versions 1 "
+    "-dts_delta_threshold 1 " + " ".join(QSV_DECODING_ARGS) + " -i {input_url} "
+    "-map 0:v:0 -map 0:a:0 -vf " + QSV_FILTER + " "
+    + " ".join(QSV_ENCODING_ARGS) + " "
+    "-af aresample=async=1:first_pts=0 -c:a aac -b:a 128k "
+    "-f mpegts {output_args}"
+)
+
+
+async def validate_qsv_encoder():
+    """Exercise software decode/bwdif/QSV upload/encode before stream allocation.
+
+    Generate a tiny compatible H.264 TFF fixture in RAM, never a provider URL or
+    lossless H.264. Both child processes are bounded/reaped.
+    No cached admission and no automatic software/VAAPI fallback.
+    """
+    if not _intel_device_available():
+        raise HTTPException(503, "Intel QSV renderD128 is unavailable")
+    fixture = None
+    commands = (
+        (
+            "-f", "lavfi", "-i", "testsrc2=size=320x180:rate=50:duration=0.16",
+            "-vf", "tinterlace=mode=interleave_top,setfield=tff",
+            "-frames:v", "4", "-c:v", "libx264", "-preset", "ultrafast",
+            "-crf", "18", "-pix_fmt", "yuv420p", "-flags", "+ilme+ildct",
+            "-x264-params", "tff=1", "-an", "-f", "mpegts", "pipe:1",
+        ),
+        (*QSV_DEVICE_ARGS, *QSV_DECODING_ARGS, "-fflags", "+genpts+discardcorrupt",
+         "-i", "pipe:0", "-vf", QSV_FILTER,
+         *QSV_ENCODING_ARGS, "-an", "-f", "null", "-"),
+    )
+    for index, command in enumerate(commands):
+        process = None
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "ffmpeg", "-hide_banner", "-v", "error", "-nostdin", *command,
+                stdin=asyncio.subprocess.PIPE if index else asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL if index else asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            output, _ = await asyncio.wait_for(
+                process.communicate(input=fixture), timeout=10
+            )
+            if process.returncode != 0 or (index == 0 and not output):
+                raise HTTPException(503, "Intel QSV H.264 pipeline probe failed")
+            if index == 0:
+                fixture = output
+        except (OSError, asyncio.TimeoutError) as exc:
+            raise HTTPException(503, "Intel QSV H.264 pipeline probe unavailable") from exc
+        finally:
+            if process is not None and process.returncode is None:
+                process.kill()
+                await process.wait()
+
+
 def _intel_device_available():
     try:
         return (
@@ -114,6 +195,9 @@ async def create_normalized_stream(manager, payload, request):
     if encoder == "vaapi":
         await validate_vaapi_encoder()
         parameters = VAAPI_PROFILE
+    elif encoder == "qsv":
+        await validate_qsv_encoder()
+        parameters = QSV_PROFILE
     try:
         fields = {
             name
