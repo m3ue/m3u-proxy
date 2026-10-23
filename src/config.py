@@ -82,6 +82,23 @@ class Settings(BaseSettings):
     REDIS_PASSWORD: Optional[str] = None
     REDIS_ENABLED: bool = False
     ENABLE_TRANSCODING_POOLING: bool = True
+    # Opt in to the existing local FFmpeg manager without Redis; one process only.
+    ENABLE_SINGLE_PROCESS_TRANSCODING: bool = False
+    # Persistent output normalizer for direct live MPEG-TS only (CPU encoding).
+    LIVE_NORMALIZE_OUTPUT: bool = False
+    LIVE_NORMALIZE_PROFILE: str = (
+        "-analyzeduration 1000000 -probesize 1000000 "
+        "-reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 "
+        "-reconnect_delay_max 2 -reconnect_max_retries 5 "
+        "-fflags +genpts+discardcorrupt -merge_pmt_versions 1 "
+        "-dts_delta_threshold 1 -i {input_url} "
+        "-map 0:v:0 -map 0:a:0 "
+        "-vf bwdif=mode=send_field:parity=auto:deint=interlaced "
+        "-fps_mode passthrough "
+        "-af aresample=async=1:first_pts=0 "
+        "-c:v libx264 -preset ultrafast -crf 18 -tune zerolatency -threads 2 "
+        "-g 25 -bf 0 -c:a aac -b:a 128k -f mpegts {output_args}"
+    )
     MAX_CLIENTS_PER_SHARED_STREAM: int = 10
     CHANGE_BUFFER_CHUNKS: int = 100
 
@@ -159,6 +176,9 @@ class Settings(BaseSettings):
     # seconds of that retry, fail over as before. 0 (default) disables the same-URL
     # retry; m3u-editor can enable it per stream with silent_close_retry_window.
     LIVE_SILENT_CLOSE_RETRY_WINDOW_SECONDS: float = 0.0
+    # Direct live only; downstream must explicitly request a new HTTP session.
+    LIVE_END_SESSION_ON_RECONNECT: bool = False
+    LIVE_SINGLE_RECOVERY_PER_EXIT: bool = False
 
     # Overlap trimming on silent reconnect (Strict Live TS Mode only).
     # Providers that close periodically usually restart from their rolling buffer,

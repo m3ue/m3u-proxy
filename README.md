@@ -15,6 +15,7 @@ Join our [Discord](https://discord.gg/rS3abJ5dz7) server to ask questions and ge
 ## Features
 
 ### Core Streaming
+- **Opt-in direct-live recovery**: [end HTTP sessions at reconnect boundaries and avoid double recovery](docs/LIVE_RECOVERY.md). Both switches default off; this is **not** seamless codec/timestamp normalization or a guarantee that a player reconnects.
 - 🚀 **Pure HTTP Proxy**: Zero transcoding, direct byte-for-byte streaming
 - 🔗 **Connection Sharing**: Multiple viewers share one upstream provider connection (HLS, Transcoded, and live Direct/TS streams)
 - ⚡️ **Truly Ephemeral**: Provider connections open only when clients are consuming; close when the last client disconnects

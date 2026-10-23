@@ -4,6 +4,29 @@
 
 This guide shows how to add Redis support to enable connection pooling and multi-worker coordination.
 
+## Opt-in single-process transcoding without Redis
+
+`ENABLE_SINGLE_PROCESS_TRANSCODING` defaults to `false`. To expose the existing
+local FFmpeg manager through `/transcode` without Redis, set:
+
+```sh
+REDIS_ENABLED=false
+ENABLE_TRANSCODING_POOLING=true
+ENABLE_SINGLE_PROCESS_TRANSCODING=true
+```
+
+Run exactly one server process, with `WORKER_ID` unset. The application rejects
+`WORKER_ID`, spawned multiprocessing workers (including Uvicorn `--workers`), and
+`WEB_CONCURRENCY` / `UVICORN_WORKERS` values other than an unset value or `1`.
+Arbitrary external prefork launchers or multiple replicas are not supported;
+operators must explicitly configure one process and one replica. No Redis client
+or distributed sharing is enabled, and Redis health/info fields remain disabled.
+Existing configuration defaults and Redis mode remain unchanged.
+
+This switch only enables access to the existing transcoder. It does not change
+FFmpeg profiles or guarantee automatic source recovery, codec switching, or
+client playback continuity.
+
 ## Current Architecture
 
 ### ✅ What We Have

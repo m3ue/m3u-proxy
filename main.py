@@ -126,7 +126,7 @@ def main():
         logger.info("🔄 Auto-reload is enabled.")
 
     # If pooling is enabled, perform a quick Redis connectivity check and log result
-    if should_use_pooling():
+    if should_use_pooling() and settings.REDIS_ENABLED:
         try:
             import redis.asyncio as redis_async
 

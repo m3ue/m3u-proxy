@@ -29,6 +29,10 @@ from url_signing import sign_url, verify_url
 logger = logging.getLogger(__name__)
 
 
+class _DirectGenerationEnded(Exception):
+    """Internal control flow: stale readers must run ordinary final cleanup."""
+
+
 @dataclass
 class ClientInfo:
     client_id: str
@@ -98,6 +102,9 @@ class StreamInfo:
     headers: Dict[str, str] = field(default_factory=dict)
     # Transcoding configuration
     is_transcoded: bool = False
+    # Server-assigned ownership, never hydrated from request metadata.
+    normalization_parent_id: Optional[str] = None
+    normalization_input_id: Optional[str] = None
     transcode_profile: Optional[str] = None
     transcode_ffmpeg_args: List[str] = field(default_factory=list)
     transcode_process: Optional[asyncio.subprocess.Process] = None
@@ -130,6 +137,12 @@ class StreamInfo:
     silence_monitoring_grace_period: Optional[float] = None
     # Same-URL retry window on a live silent close (None = use global ENV default)
     silent_close_retry_window: Optional[float] = None
+    # Effective direct-live policies, resolved once from nullable API overrides.
+    end_session_on_reconnect: bool = False
+    single_recovery_per_exit: bool = False
+    direct_generation: int = 0
+    direct_recovery_revision: int = 0
+    direct_recovery_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     # Last HTTP error status code from upstream - passed to failover resolver
     last_error_status_code: Optional[int] = None
 
@@ -431,6 +444,7 @@ class ShieldedUpstreamReader:
 class StreamManager:
     def __init__(self, redis_url: Optional[str] = None, enable_pooling: bool = True):
         self.streams: Dict[str, StreamInfo] = {}
+        self._normalization_lock = asyncio.Lock()
         self.clients: Dict[str, ClientInfo] = {}
         self.stream_clients: Dict[str, Set[str]] = {}
         self.client_timeout = settings.CLIENT_TIMEOUT
@@ -466,6 +480,7 @@ class StreamManager:
 
         # Pooling configuration
         self.enable_pooling = enable_pooling
+        self._redis_requested = bool(redis_url)
         # Will be PooledStreamManager if available
         self.pooled_manager: Optional[Any] = None
 
@@ -550,6 +565,11 @@ class StreamManager:
 
     async def _emit_event(self, event_type: str, stream_id: str, data: dict):
         """Helper method to emit events if event manager is available"""
+        stream = self.streams.get(stream_id)
+        if stream and stream.normalization_parent_id:
+            if event_type != "FAILOVER_TRIGGERED":
+                return
+            stream_id = stream.normalization_parent_id
         if self.event_manager:
             try:
                 from models import StreamEvent, EventType
@@ -751,6 +771,9 @@ class StreamManager:
         silence_failover_threshold: Optional[int] = None,
         silence_monitoring_grace_period: Optional[float] = None,
         silent_close_retry_window: Optional[float] = None,
+        end_session_on_reconnect: Optional[bool] = None,
+        single_recovery_per_exit: Optional[bool] = None,
+        identity_salt: Optional[str] = None,
     ) -> str:
         """Get or create a stream and return its ID
 
@@ -774,8 +797,34 @@ class StreamManager:
             silence_failover_threshold: Override consecutive silence count before failover for this stream
             silence_monitoring_grace_period: Override grace period (s) before monitoring starts for this stream
             silent_close_retry_window: Override the same-URL retry window (s) on a live silent close (0 = off)
+            end_session_on_reconnect: End direct-live HTTP bodies before replacing the upstream (None = ENV)
+            single_recovery_per_exit: Skip post-loop reclassification of handled exits (None = ENV)
         """
         import hashlib
+
+        # Resolve nullable overrides once. Never change a running stream's policy.
+        live_direct = (
+            not is_transcoded
+            and not urlparse(stream_url).path.lower().endswith(".mpd")
+            and self._detect_stream_type(stream_url)[2]
+        )
+        end_session = live_direct and (
+            settings.LIVE_END_SESSION_ON_RECONNECT
+            if end_session_on_reconnect is None
+            else end_session_on_reconnect
+        )
+        single_recovery = live_direct and (
+            settings.LIVE_SINGLE_RECOVERY_PER_EXIT
+            if single_recovery_per_exit is None
+            else single_recovery_per_exit
+        )
+        if (end_session or single_recovery) and (
+            settings.REDIS_ENABLED or settings.WORKER_ID or self._redis_requested
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="Live recovery policies require a single process without Redis/WORKER_ID",
+            )
 
         # Include transcoding info in the stream ID so that a direct stream and
         # a transcoded stream (or two differently-transcoded streams) for the
@@ -795,6 +844,23 @@ class StreamManager:
         else:
             stream_id = hashlib.md5(stream_url.encode()).hexdigest()
 
+        # Preserve historical IDs when both policies are disabled.
+        if end_session or single_recovery:
+            stream_id = hashlib.md5(
+                f"{stream_id}|live-recovery|{int(end_session)}|{int(single_recovery)}".encode()
+            ).hexdigest()
+
+        # Private composition identities must never expose the raw input.
+        if identity_salt:
+            stream_id = hashlib.md5(f"{stream_id}|{identity_salt}".encode()).hexdigest()
+
+        existing = self.streams.get(stream_id)
+        if existing and (
+            existing.normalization_input_id or existing.normalization_parent_id
+        ):
+            existing.last_access = datetime.now(timezone.utc)
+            return stream_id
+
         # If the stream exists but has no active clients, it's orphaned from a
         # previous session.  Delete it so we get a fresh StreamInfo below —
         # stale fields (failover state, error counts, circuit-breaker markers)
@@ -810,6 +876,10 @@ class StreamManager:
             active_clients = len(self.stream_clients.get(stream_id, set()))
             if active_clients == 0:
                 old_stream = self.streams[stream_id]
+                # Retain selected source across deliberate downstream resets.
+                if old_stream.end_session_on_reconnect:
+                    old_stream.last_access = datetime.now(timezone.utc)
+                    return stream_id
                 was_recycled = True
                 recycled_bytes = old_stream.total_bytes_served
                 recycled_segments = old_stream.total_segments_served
@@ -877,6 +947,8 @@ class StreamManager:
                 silence_failover_threshold=silence_failover_threshold,
                 silence_monitoring_grace_period=silence_monitoring_grace_period,
                 silent_close_retry_window=silent_close_retry_window,
+                end_session_on_reconnect=end_session,
+                single_recovery_per_exit=single_recovery,
             )
             self.stream_clients[stream_id] = set()
 
@@ -1173,6 +1245,37 @@ class StreamManager:
                 except asyncio.QueueFull:
                     pass
 
+    async def _end_direct_generation(self, stream_id: str, connection_id: str) -> None:
+        """End bodies rather than promote; retain current_url for a new request."""
+        # Let any in-flight source selection settle before exposing the next
+        # generation. This matters when the primary disconnects during a resolver
+        # request and a subscriber is already waiting for its handoff.
+        async with self.streams[stream_id].direct_recovery_lock:
+            await self._detach_direct_generation(stream_id, connection_id)
+
+    async def _detach_direct_generation(
+        self, stream_id: str, connection_id: str
+    ) -> None:
+        if self._direct_broadcast_primary.get(stream_id) != connection_id:
+            return
+        # Remove ownership and wake queues atomically before awaiting I/O.
+        self.streams[stream_id].direct_generation += 1
+        self._direct_broadcast_primary.pop(stream_id, None)
+        queues = self._direct_broadcast_queues.pop(stream_id, {})
+        for queue in queues.values():
+            while not queue.empty():
+                queue.get_nowait()
+            # False is distinct from legacy None (= promotion).
+            queue.put_nowait(False)
+        self._settle_handoff(stream_id)
+        self._handoff_settled.pop(stream_id, None)
+        handoff = self._handoff_upstream.pop(stream_id, None)
+        if handoff is not None:
+            try:
+                await handoff[0].__aexit__(None, None, None)
+            except Exception:
+                logger.warning("Could not close ended generation handoff")
+
     def _signal_subscribers_end(
         self, stream_id: str, primary_connection_id: str
     ) -> None:
@@ -1343,6 +1446,7 @@ class StreamManager:
         """Return a StreamingResponse that reads from a broadcast queue instead of upstream."""
         stream_info = self.streams[stream_id]
         queue: asyncio.Queue = asyncio.Queue(maxsize=512)
+        generation = stream_info.direct_generation
 
         if stream_id not in self._direct_broadcast_queues:
             self._direct_broadcast_queues[stream_id] = {}
@@ -1363,12 +1467,16 @@ class StreamManager:
             overlap_trimmer = self._promotion_overlap_trimmer(stream_info)
             try:
                 while True:
+                    if generation != stream_info.direct_generation:
+                        return
                     try:
                         chunk = await asyncio.wait_for(
                             queue.get(), timeout=queue_timeout
                         )
                     except asyncio.TimeoutError:
                         consecutive_timeouts += 1
+                        if generation != stream_info.direct_generation:
+                            return
                         if cancel_event.is_set():
                             return
                         # Check if stream still exists
@@ -1388,6 +1496,10 @@ class StreamManager:
                             if primary_cancel is None or primary_cancel.is_set():
                                 primary_gone = True
                         if not primary_gone and consecutive_timeouts >= 2:
+                            if stream_info.end_session_on_reconnect:
+                                # The primary owns upstream recovery. A slow
+                                # resolver must not start competing selectors.
+                                continue
                             # 2 × 10s = 20 seconds with zero data from primary
                             logger.info(
                                 f"Subscriber {client_id} has had {consecutive_timeouts} "
@@ -1423,6 +1535,8 @@ class StreamManager:
                             return
                         continue
 
+                    if chunk is False or generation != stream_info.direct_generation:
+                        return
                     if chunk is None:
                         # Primary reader stopped — promote this subscriber
                         # to primary so the stream continues without interruption.
@@ -1531,6 +1645,7 @@ class StreamManager:
         stream_info = self.streams[stream_id]
 
         # Register as the new primary reader for this stream.
+        generation = stream_info.direct_generation
         self._direct_broadcast_primary[stream_id] = connection_id
         if stream_id not in self._direct_broadcast_queues:
             self._direct_broadcast_queues[stream_id] = {}
@@ -1609,7 +1724,7 @@ class StreamManager:
                 except Exception as e:
                     logger.warning(
                         f"Inherited upstream for stream {stream_id} is unusable "
-                        f"({type(e).__name__}), opening a new connection"
+                        f"({type(e).__name__}), ending or reconnecting upstream"
                     )
                     try:
                         await stream_context.__aexit__(None, None, None)
@@ -1619,6 +1734,10 @@ class StreamManager:
                     stream_iterator = None
 
             if stream_iterator is None:
+                if stream_info.end_session_on_reconnect:
+                    # Let finally select failover before ending this generation;
+                    # resetting here would make its stale-generation guard skip it.
+                    return
                 stream_context, response = await _open_fresh_upstream()
                 stream_iterator = ShieldedUpstreamReader(
                     response.aiter_bytes(chunk_size=32768)
@@ -1646,6 +1765,8 @@ class StreamManager:
                 except StopAsyncIteration:
                     break
 
+                if generation != stream_info.direct_generation:
+                    return
                 if overlap_trimmer is not None and overlap_trimmer.pending:
                     chunk, trim_result = overlap_trimmer.feed(
                         chunk, asyncio.get_event_loop().time()
@@ -1702,7 +1823,10 @@ class StreamManager:
             logger.error(f"Error in promoted primary for stream {stream_id}: {e}")
         finally:
             if stream_context is not None:
-                if self._can_hand_off_upstream(stream_id, client_id, cancel_event):
+                if (
+                    generation == stream_info.direct_generation
+                    and self._can_hand_off_upstream(stream_id, client_id, cancel_event)
+                ):
                     self._offer_upstream_handoff(
                         stream_id,
                         client_id,
@@ -1715,6 +1839,16 @@ class StreamManager:
                         pass
             self._settle_handoff(stream_id)
             # Hand the stream to the next subscriber, if any remain.
+            if (
+                stream_info.end_session_on_reconnect
+                and not cancel_event.is_set()
+                and generation == stream_info.direct_generation
+            ):
+                if stream_info.failover_resolver_url or stream_info.failover_urls:
+                    await self._try_update_failover_url(
+                        stream_id, "promoted_upstream_ended"
+                    )
+                await self._end_direct_generation(stream_id, connection_id)
             self._signal_subscribers_end(stream_id, connection_id)
 
     async def stream_continuous_direct(
@@ -1743,6 +1877,7 @@ class StreamManager:
         current_url = stream_info.current_url or stream_info.original_url
 
         # Register this client
+        generation = stream_info.direct_generation
         if client_id not in self.clients:
             await self.register_client(client_id, stream_id)
 
@@ -1938,7 +2073,14 @@ class StreamManager:
             # after the while is unreachable).  The call is idempotent.
             try:
                 # Main streaming loop with automatic reconnection on failover
+                attempted_generation = False
                 while failover_count <= max_failovers:
+                    if generation != stream_info.direct_generation:
+                        break
+                    if attempted_generation and stream_info.end_session_on_reconnect:
+                        await self._end_direct_generation(stream_id, connection_id)
+                        break
+                    attempted_generation = True
                     # Check cancel_event at the top of each iteration so we
                     # exit promptly when the ASGI disconnect monitor fires
                     # instead of starting another connection attempt.
@@ -2140,6 +2282,8 @@ class StreamManager:
                                         chunk = await stream_iterator.__anext__()
 
                                     # Yield immediately - no separate storage needed
+                                    if generation != stream_info.direct_generation:
+                                        raise _DirectGenerationEnded
                                     # Inject discontinuity on the very first pre-buffer chunk
                                     # after a failover so the player reinitialises decoders
                                     # before it sees any post-splice data.
@@ -2205,6 +2349,7 @@ class StreamManager:
 
                         # Continue streaming from where pre-buffer left off (or from start if no pre-buffer)
                         broke_for_failover = False
+                        exit_reason = "eof"
                         while True:
                             try:
                                 # Read next chunk with a per-chunk timeout to detect silent stalls.
@@ -2230,6 +2375,9 @@ class StreamManager:
                                         )
                                     except asyncio.TimeoutError:
                                         # No data received within chunk timeout
+                                        if generation != stream_info.direct_generation:
+                                            raise _DirectGenerationEnded
+                                        exit_reason = "timeout"
                                         logger.warning(
                                             f"No data received for {chunk_timeout}s from upstream for stream {stream_id}, client {client_id}"
                                         )
@@ -2398,6 +2546,8 @@ class StreamManager:
                             except StopAsyncIteration:
                                 break
                             # Update last chunk time
+                            if generation != stream_info.direct_generation:
+                                raise _DirectGenerationEnded
                             last_chunk_time = asyncio.get_event_loop().time()
 
                             # Check if streaming should be cancelled
@@ -2720,10 +2870,20 @@ class StreamManager:
                         # If streaming was cancelled externally, skip failover and
                         # go straight to post-loop cleanup so subscribers are
                         # signaled and the client is cleaned up promptly.
-                        if cancel_event.is_set():
+                        if (
+                            cancel_event.is_set()
+                            or generation != stream_info.direct_generation
+                        ):
                             break
 
                         # Check circuit breaker after loop exits (if strict mode enabled)
+                        if stream_info.single_recovery_per_exit:
+                            if broke_for_failover or response is None:
+                                continue
+                            if exit_reason == "timeout":
+                                break
+
+                        # Legacy post-loop classification stays default-off.
                         # Skip for VOD/timeshift since failover doesn't make sense for provider-specific content
                         if (
                             strict_mode_enabled
@@ -3015,7 +3175,12 @@ class StreamManager:
                         await self.cleanup_client(client_id, connection_id)
                         return  # Exit the generator cleanly
 
+                    except _DirectGenerationEnded:
+                        break
+
                     except httpx.ReadError as e:
+                        if generation != stream_info.direct_generation:
+                            break
                         # ReadError often means client disconnected or provider closed connection
                         # This is especially common with Range requests on live streams
                         # MUST be caught before NetworkError since ReadError is a subclass
@@ -3218,6 +3383,8 @@ class StreamManager:
                         httpx.NetworkError,
                         httpx.HTTPError,
                     ) as e:
+                        if generation != stream_info.direct_generation:
+                            break
                         logger.warning(
                             f"Stream error for client {client_id}: {type(e).__name__}: {e}"
                         )
@@ -3381,6 +3548,8 @@ class StreamManager:
 
                     except Exception as e:
                         # Log with more detail for debugging
+                        if generation != stream_info.direct_generation:
+                            break
                         error_str = str(e) if str(e) else f"<empty {type(e).__name__}>"
                         logger.warning(
                             f"Stream error for client {client_id}: {type(e).__name__}: {error_str}"
@@ -3522,8 +3691,12 @@ class StreamManager:
                         # promoted subscriber instead of closing it.  This avoids
                         # opening a second connection (which could exceed provider
                         # limits) and eliminates the ~250ms gap/skip.
-                        if stream_context is not None and self._can_hand_off_upstream(
-                            stream_id, client_id, cancel_event
+                        if (
+                            generation == stream_info.direct_generation
+                            and stream_context is not None
+                            and self._can_hand_off_upstream(
+                                stream_id, client_id, cancel_event
+                            )
                         ):
                             self._offer_upstream_handoff(
                                 stream_id,
@@ -3546,6 +3719,8 @@ class StreamManager:
 
                 # Primary reader is exiting — promote one subscriber to take over.
                 # The rest stay attached and receive chunks from the new primary.
+                if stream_info.end_session_on_reconnect and not cancel_event.is_set():
+                    await self._end_direct_generation(stream_id, connection_id)
                 self._signal_subscribers_end(stream_id, connection_id)
 
                 # Update final stats (add any remaining bytes not yet counted)
@@ -3591,6 +3766,8 @@ class StreamManager:
                 # exits (GC, GeneratorExit, exception).  This is idempotent —
                 # if _signal_subscribers_end already ran via the post-loop code
                 # or the ASGI disconnect monitor, it's a no-op.
+                if stream_info.end_session_on_reconnect and not cancel_event.is_set():
+                    await self._end_direct_generation(stream_id, connection_id)
                 self._signal_subscribers_end(stream_id, connection_id)
 
         # Determine content type
@@ -3662,7 +3839,9 @@ class StreamManager:
             headers["Content-Length"] = provider_content_length
 
         # In strict mode for live TS, NEVER return 206 or Content-Length
-        if strict_mode_enabled and stream_info.is_live_continuous:
+        if (
+            strict_mode_enabled or stream_info.end_session_on_reconnect
+        ) and stream_info.is_live_continuous:
             status_code = 200
             # Do NOT include Content-Length or Content-Range for live streams in strict mode
             headers.pop("Content-Length", None)
@@ -5340,6 +5519,26 @@ class StreamManager:
     async def _try_update_failover_url(
         self, stream_id: str, reason: str = "manual"
     ) -> bool:
+        info = self.streams.get(stream_id)
+        if info is not None and info.end_session_on_reconnect:
+            generation = info.direct_generation
+            revision = info.direct_recovery_revision
+            async with info.direct_recovery_lock:
+                if (
+                    generation != info.direct_generation
+                    or revision != info.direct_recovery_revision
+                ):
+                    # Another selector already handled this generation's exit.
+                    return True
+                try:
+                    return await self._update_failover_url(stream_id, reason)
+                finally:
+                    info.direct_recovery_revision += 1
+        return await self._update_failover_url(stream_id, reason)
+
+    async def _update_failover_url(
+        self, stream_id: str, reason: str = "manual"
+    ) -> bool:
         """Update to next failover URL and signal all clients to reconnect
 
         Args:
@@ -5476,6 +5675,47 @@ class StreamManager:
         for client_id in inactive_clients:
             await self.cleanup_client(client_id)
 
+    def normalization_source(self, stream: StreamInfo) -> StreamInfo:
+        inner = self.streams.get(stream.normalization_input_id)
+        if inner and inner.normalization_parent_id == stream.stream_id:
+            return inner
+        return stream
+
+    def normalization_stats(self, stream: StreamInfo) -> Dict:
+        source = self.normalization_source(stream)
+        if source is stream:
+            return {}
+        return {
+            "original_url": source.original_url,
+            "current_url": source.current_url,
+            "has_failover": bool(source.failover_urls or source.failover_resolver_url),
+            "failover_urls": source.failover_urls,
+            "failover_resolver_url": source.failover_resolver_url,
+            "current_failover_index": source.current_failover_index,
+            "failover_attempts": source.failover_attempts,
+            "last_failover_time": source.last_failover_time.isoformat()
+            if source.last_failover_time
+            else None,
+            "normalization_input_stream_id": source.stream_id,
+        }
+
+    async def cleanup_normalization_input(self, outer: StreamInfo):
+        """Delete only the input whose reciprocal ownership matches this outer."""
+        inner = self.normalization_source(outer)
+        if inner is outer:
+            return
+        for client_id in list(self.stream_clients.get(inner.stream_id, set())):
+            await self.cleanup_client(client_id)
+        handoff = self._handoff_upstream.pop(inner.stream_id, None)
+        if handoff:
+            await handoff[0].__aexit__(None, None, None)
+        self._direct_broadcast_primary.pop(inner.stream_id, None)
+        self._direct_broadcast_queues.pop(inner.stream_id, None)
+        self._handoff_settled.pop(inner.stream_id, None)
+        self.stream_clients.pop(inner.stream_id, None)
+        self.streams.pop(inner.stream_id, None)
+        self._stats.active_streams = max(0, self._stats.active_streams - 1)
+
     async def _cleanup_inactive_streams(self):
         """Clean up streams with no active clients"""
         current_time = datetime.now(timezone.utc)
@@ -5483,6 +5723,8 @@ class StreamManager:
 
         for stream_id, stream_info in self.streams.items():
             # Count only ACTIVE clients for this stream
+            if stream_info.normalization_parent_id in self.streams:
+                continue
             active_client_count = 0
             if stream_id in self.stream_clients:
                 for client_id in self.stream_clients[stream_id]:
@@ -5545,6 +5787,9 @@ class StreamManager:
                             "metadata": stream_info.metadata,
                         },
                     )
+
+                # Owned input cleanup is part of the public encoder lifecycle.
+                await self.cleanup_normalization_input(stream_info)
 
                 # Clean up broadcast state (may be stale if primary's
                 # finally block didn't run or _signal_subscribers_end missed).
@@ -5661,7 +5906,9 @@ class StreamManager:
         """Get comprehensive stats - aggregates variant stream stats into parent streams"""
         # Only count non-variant streams
         non_variant_streams = [
-            s for s in self.streams.values() if not s.is_variant_stream
+            s
+            for s in self.streams.values()
+            if not s.is_variant_stream and not s.normalization_parent_id
         ]
 
         # Build a map of aggregated stats for parent streams
@@ -5732,16 +5979,22 @@ class StreamManager:
             and stream.is_active
         )
 
-        # Count only connected clients
-        active_client_count = sum(
-            1 for client in self.clients.values() if client.is_connected
-        )
+        public_clients = [
+            client
+            for client in self.clients.values()
+            if not (
+                client.stream_id in self.streams
+                and self.streams[client.stream_id].normalization_parent_id
+            )
+        ]
+        # Do not count the encoder's loopback input as another viewer.
+        active_client_count = sum(1 for client in public_clients if client.is_connected)
 
         return {
             "proxy_stats": {
                 "total_streams": len(non_variant_streams),
                 "active_streams": active_stream_count,
-                "total_clients": len(self.clients),
+                "total_clients": len(public_clients),
                 "active_clients": active_client_count,
                 "total_bytes_served": self._stats.total_bytes_served,
                 "total_segments_served": self._stats.total_segments_served,
@@ -5790,6 +6043,7 @@ class StreamManager:
                     "headers": stream.headers,
                     "media_info": self._get_media_info(stream),
                     "output_media_info": self._get_output_media_info(stream),
+                    **self.normalization_stats(stream),
                 }
                 for stream in non_variant_streams
             ],
@@ -5806,7 +6060,7 @@ class StreamManager:
                     "last_access": client.last_access.isoformat(),
                     "is_connected": client.is_connected,
                 }
-                for client in self.clients.values()
+                for client in public_clients
                 if client.is_connected  # Only include connected clients
             ],
         }

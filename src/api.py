@@ -277,6 +277,10 @@ class StreamCreateRequest(BaseModel):
     # Seconds to retry the same URL before failover on a live silent close
     # (None = use the LIVE_SILENT_CLOSE_RETRY_WINDOW_SECONDS ENV default, 0 = off)
     silent_close_retry_window: Optional[float] = None
+    end_session_on_reconnect: Optional[bool] = None
+    single_recovery_per_exit: Optional[bool] = None
+    normalize_live_output: Optional[bool] = None
+    normalization_encoder: Literal["cpu", "vaapi"] = "cpu"
 
     @field_validator("url")
     @classmethod
@@ -396,8 +400,10 @@ class TranscodeCreateRequest(BaseModel):
 
 # Global stream manager and event manager
 redis_config = get_redis_config()
-redis_url = redis_config.get("redis_url") if should_use_pooling() else None
 enable_pooling = should_use_pooling()
+redis_url = (
+    redis_config.get("redis_url") if settings.REDIS_ENABLED and enable_pooling else None
+)
 
 stream_manager = StreamManager(redis_url=redis_url, enable_pooling=enable_pooling)
 event_manager = EventManager()
@@ -669,7 +675,7 @@ async def get_info():
     Includes hardware acceleration status, Redis pooling, transcoding profiles, and other details.
     """
     redis_config = get_redis_config()
-    use_pooling = should_use_pooling()
+    use_pooling = should_use_pooling() and settings.REDIS_ENABLED
     profile_manager = get_profile_manager()
 
     # Build the info response
@@ -777,32 +783,46 @@ async def resolve_stream_id(
 
 
 @app.post("/streams", dependencies=[Depends(verify_token)])
-async def create_stream(request: StreamCreateRequest):
+async def create_stream(request: StreamCreateRequest, http_request: Request = None):
     """Create a new stream with optional failover URLs, custom user agent, and metadata"""
     try:
-        stream_id = await stream_manager.get_or_create_stream(
-            request.url,
-            request.failover_urls,
-            request.failover_resolver_url,
-            request.user_agent,
-            metadata=request.metadata,
-            headers=request.headers,
-            strict_live_ts=request.strict_live_ts,
-            use_sticky_session=request.use_sticky_session,
-            enable_silence_detection=request.enable_silence_detection,
-            silence_threshold_db=request.silence_threshold_db,
-            silence_duration=request.silence_duration,
-            silence_check_interval=request.silence_check_interval,
-            silence_failover_threshold=request.silence_failover_threshold,
-            silence_monitoring_grace_period=request.silence_monitoring_grace_period,
-            silent_close_retry_window=request.silent_close_retry_window,
+        normalize = (
+            settings.LIVE_NORMALIZE_OUTPUT
+            if request.normalize_live_output is None
+            else request.normalize_live_output
         )
+        if normalize:
+            from live_normalization import create_normalized_stream
+
+            stream_id = await create_normalized_stream(
+                stream_manager, request, http_request
+            )
+        else:
+            stream_id = await stream_manager.get_or_create_stream(
+                request.url,
+                request.failover_urls,
+                request.failover_resolver_url,
+                request.user_agent,
+                metadata=request.metadata,
+                headers=request.headers,
+                strict_live_ts=request.strict_live_ts,
+                use_sticky_session=request.use_sticky_session,
+                enable_silence_detection=request.enable_silence_detection,
+                silence_threshold_db=request.silence_threshold_db,
+                silence_duration=request.silence_duration,
+                silence_check_interval=request.silence_check_interval,
+                silence_failover_threshold=request.silence_failover_threshold,
+                silence_monitoring_grace_period=request.silence_monitoring_grace_period,
+                silent_close_retry_window=request.silent_close_retry_window,
+                end_session_on_reconnect=request.end_session_on_reconnect,
+                single_recovery_per_exit=request.single_recovery_per_exit,
+            )
 
         # Determine the appropriate endpoint based on stream type
         if is_dash_stream(request.url):
             stream_endpoint = f"/dash/{stream_id}/manifest.mpd"
             stream_type = "dash"
-        elif is_direct_stream(request.url):
+        elif normalize or is_direct_stream(request.url):
             stream_endpoint = f"/stream/{stream_id}"
             stream_type = "direct"
         else:
@@ -840,10 +860,14 @@ async def create_stream(request: StreamCreateRequest):
         }
 
         # Include metadata in response if provided
-        if request.metadata:
+        if normalize:
+            response["metadata"] = stream_manager.streams[stream_id].metadata
+        elif request.metadata:
             response["metadata"] = request.metadata
 
         return response
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error creating stream: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -2123,7 +2147,7 @@ async def get_streams_by_metadata(
 
     for stream_id, stream_info in stream_manager.streams.items():
         # Skip variant streams - they don't have independent client counts
-        if stream_info.is_variant_stream:
+        if stream_info.is_variant_stream or stream_info.normalization_parent_id:
             continue
 
         # Check metadata field match (compare as strings to avoid type
@@ -2156,7 +2180,8 @@ async def get_streams_by_metadata(
                 "metadata": stream_info.metadata,
                 "last_access": stream_info.last_access.isoformat(),
                 "is_active": stream_info.is_active,
-                "url": stream_info.current_url or stream_info.original_url,
+                "url": stream_manager.normalization_source(stream_info).current_url
+                or stream_info.original_url,
                 "stream_type": "Transcoding"
                 if stream_info.metadata.get("transcoding")
                 else (
@@ -2164,6 +2189,7 @@ async def get_streams_by_metadata(
                     if stream_info.is_hls
                     else ("VOD" if stream_info.is_vod else "Live Continuous")
                 ),
+                **stream_manager.normalization_stats(stream_info),
             }
         )
 
@@ -2195,7 +2221,7 @@ async def get_streams_counts_by_metadata(
     counts = {v: 0 for v in requested}
 
     for stream_id, stream_info in stream_manager.streams.items():
-        if stream_info.is_variant_stream:
+        if stream_info.is_variant_stream or stream_info.normalization_parent_id:
             continue
 
         if not stream_info.is_active:
@@ -2290,6 +2316,8 @@ async def delete_oldest_stream_by_metadata(
 
         # Find the oldest stream that matches the metadata criteria
         for stream_id, stream_info in stream_manager.streams.items():
+            if stream_info.normalization_parent_id:
+                continue
             metadata = stream_info.metadata or {}
 
             # Check if this stream matches the filter criteria
@@ -2331,6 +2359,11 @@ async def delete_oldest_stream_by_metadata(
                     ffmpeg_args=stream_info.transcode_ffmpeg_args,
                     metadata=stream_info.metadata,
                 )
+                if (
+                    stream_info.normalization_input_id
+                    and stream_info.transcode_stream_key
+                ):
+                    stream_key = stream_info.transcode_stream_key
                 await stream_manager.pooled_manager.force_stop_stream(stream_key)
             except Exception as e:
                 logger.warning(
@@ -2362,6 +2395,9 @@ async def delete_oldest_stream_by_metadata(
                     "metadata": stream_info.metadata,
                 },
             )
+
+        if stream_info.normalization_input_id:
+            await stream_manager.cleanup_normalization_input(stream_info)
 
         # Remove stream
         if oldest_stream_id in stream_manager.streams:
@@ -2428,6 +2464,8 @@ async def delete_streams_by_metadata(
 
         # Find all streams that match the metadata criteria
         for stream_id, stream_info in list(stream_manager.streams.items()):
+            if stream_info.normalization_parent_id:
+                continue
             metadata = stream_info.metadata or {}
 
             # Check if this stream matches the filter criteria
@@ -2485,7 +2523,10 @@ async def delete_streams_by_metadata(
                             metadata=stream_info.metadata,
                         )
                         await stream_manager.pooled_manager.force_stop_stream(
-                            stream_key
+                            stream_info.transcode_stream_key
+                            if stream_info.normalization_input_id
+                            and stream_info.transcode_stream_key
+                            else stream_key
                         )
                     except Exception as e:
                         logger.warning(
@@ -2512,6 +2553,9 @@ async def delete_streams_by_metadata(
                             "metadata": stream_info.metadata,
                         },
                     )
+
+                if stream_info.normalization_input_id:
+                    await stream_manager.cleanup_normalization_input(stream_info)
 
                 # Remove stream
                 if stream_id in stream_manager.streams:
@@ -2543,6 +2587,11 @@ async def delete_stream(stream_id: str):
             raise HTTPException(status_code=404, detail="Stream not found")
 
         stream_info = stream_manager.streams[stream_id]
+        if stream_info.normalization_parent_id:
+            raise HTTPException(
+                status_code=409,
+                detail="Owned normalization input cannot be deleted directly; delete its parent stream",
+            )
 
         # For transcoded streams, force stop the FFmpeg process immediately
         if stream_info.is_transcoded and stream_manager.pooled_manager:
@@ -2555,6 +2604,8 @@ async def delete_stream(stream_id: str):
                 ffmpeg_args=stream_info.transcode_ffmpeg_args,
                 metadata=stream_info.metadata,
             )
+            if stream_info.normalization_input_id and stream_info.transcode_stream_key:
+                stream_key = stream_info.transcode_stream_key
             await stream_manager.pooled_manager.force_stop_stream(stream_key)
 
         # Get all clients for this stream and clean them up
@@ -2575,6 +2626,9 @@ async def delete_stream(stream_id: str):
                     "metadata": stream_info.metadata,
                 },
             )
+
+        if stream_info.normalization_input_id:
+            await stream_manager.cleanup_normalization_input(stream_info)
 
         # Remove stream
         if stream_id in stream_manager.streams:
@@ -2599,7 +2653,9 @@ async def trigger_failover(stream_id: str):
         if stream_id not in stream_manager.streams:
             raise HTTPException(status_code=404, detail="Stream not found")
 
-        stream_info = stream_manager.streams[stream_id]
+        stream_info = stream_manager.normalization_source(
+            stream_manager.streams[stream_id]
+        )
 
         # Check if any failover mechanism is available
         has_failovers = bool(
@@ -2616,7 +2672,9 @@ async def trigger_failover(stream_id: str):
         # 2. Signal all active clients via failover_event
         # 3. For transcoded streams, restart FFmpeg with new URL
         # 4. Emit FAILOVER_TRIGGERED event
-        success = await stream_manager._try_update_failover_url(stream_id, "manual")
+        success = await stream_manager._try_update_failover_url(
+            stream_info.stream_id, "manual"
+        )
 
         if success:
             return {
@@ -2624,7 +2682,7 @@ async def trigger_failover(stream_id: str):
                 "new_url": stream_info.current_url,
                 "failover_index": stream_info.current_failover_index,
                 "failover_attempts": stream_info.failover_attempts,
-                "active_clients": len(stream_info.connected_clients),
+                "active_clients": len(stream_manager.streams[stream_id].connected_clients),
                 "stream_type": "Transcoded"
                 if stream_info.is_transcoded
                 else (

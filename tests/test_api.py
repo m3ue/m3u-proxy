@@ -180,7 +180,13 @@ class TestAPI:
         mock_stream_manager.cleanup_client = AsyncMock()
         mock_stream_manager._emit_event = AsyncMock()
         mock_stream_manager.stream_clients = {"test_stream_123": {"client1"}}
-        mock_stream_manager.streams = {"test_stream_123": Mock(is_transcoded=False)}
+        mock_stream_manager.streams = {
+            "test_stream_123": Mock(
+                is_transcoded=False,
+                normalization_input_id=None,
+                normalization_parent_id=None,
+            )
+        }
 
         response = client.delete("/streams/test_stream_123")
         assert response.status_code == 200
@@ -546,6 +552,8 @@ class TestDeleteStreamsByMetadata:
 
     def _make_stream(self, is_transcoded=False, stream_stopped_emitted=False):
         stream = Mock()
+        stream.normalization_parent_id = None
+        stream.normalization_input_id = None
         stream.is_transcoded = is_transcoded
         stream.stream_stopped_emitted = stream_stopped_emitted
         stream.metadata = {"playlist_uuid": "test-uuid-123"}

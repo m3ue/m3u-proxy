@@ -2,6 +2,7 @@
 Configuration for Redis pooling and multi-worker coordination.
 """
 
+import multiprocessing
 import os
 from config import settings
 
@@ -43,5 +44,25 @@ def get_redis_config() -> dict:
 
 
 def should_use_pooling() -> bool:
-    """Check if pooling should be used"""
-    return settings.REDIS_ENABLED and settings.ENABLE_TRANSCODING_POOLING
+    """Enable Redis pooling or explicitly opted-in, single-process transcoding."""
+    if not settings.ENABLE_TRANSCODING_POOLING:
+        return False
+    if settings.REDIS_ENABLED:
+        return True
+    if not settings.ENABLE_SINGLE_PROCESS_TRANSCODING:
+        return False
+    # Reject declared multi-worker topologies before allocating any stream state.
+    # External launchers must also be configured for exactly one process.
+    if (
+        settings.WORKER_ID
+        or multiprocessing.parent_process() is not None
+        or any(
+            os.getenv(name, "1") != "1"
+            for name in ("WEB_CONCURRENCY", "UVICORN_WORKERS")
+        )
+    ):
+        raise ValueError(
+            "Single-process transcoding requires a single process without WORKER_ID; "
+            "WEB_CONCURRENCY and UVICORN_WORKERS must be unset or 1"
+        )
+    return True
