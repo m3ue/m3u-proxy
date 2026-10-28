@@ -132,9 +132,9 @@ async def test_reject_non_live_before_allocation(manager, url):
 @pytest.mark.parametrize(
     "setting,value",
     [
-        ("REDIS_ENABLED", True),
         ("ENABLE_SINGLE_PROCESS_TRANSCODING", False),
         ("ENABLE_TRANSCODING_POOLING", False),
+        # Local (non-Redis) transcoding is single-instance only.
         ("WORKER_ID", "worker"),
     ],
 )
@@ -143,6 +143,80 @@ async def test_preflight(manager, monkeypatch, setting, value):
     with pytest.raises(HTTPException):
         await api.create_stream(payload(normalize_live_output=True), scope())
     assert not manager.streams
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("env", ["WEB_CONCURRENCY", "UVICORN_WORKERS"])
+async def test_sibling_workers_on_one_port_rejected(manager, monkeypatch, env):
+    # The encoder reads its input over 127.0.0.1, which a sibling worker could answer.
+    monkeypatch.setenv(env, "2")
+    with pytest.raises(HTTPException) as error:
+        await api.create_stream(payload(normalize_live_output=True), scope())
+    assert error.value.status_code == 400
+    assert "one server process" in error.value.detail
+    assert not manager.streams
+
+
+@pytest_asyncio.fixture
+async def redis_manager(monkeypatch):
+    """A Redis-pooled manager, as the embedded and modular deployments run it.
+
+    Never started, so no Redis I/O: creation only allocates stream state.
+    """
+    monkeypatch.setattr(settings, "REDIS_ENABLED", True)
+    monkeypatch.setattr(settings, "WORKER_ID", None)
+    monkeypatch.setattr(settings, "ENABLE_SINGLE_PROCESS_TRANSCODING", False)
+    monkeypatch.setattr(settings, "ENABLE_TRANSCODING_POOLING", True)
+    monkeypatch.setattr(settings, "LIVE_NORMALIZE_OUTPUT", False)
+    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+    monkeypatch.delenv("UVICORN_WORKERS", raising=False)
+    sm = StreamManager(redis_url="redis://unused.invalid:6379/6", enable_pooling=True)
+    monkeypatch.setattr(api, "stream_manager", sm)
+    yield sm
+    await sm.stop()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("worker_id", [None, "worker-1"])
+async def test_redis_pooling_and_separate_instances_supported(
+    redis_manager, monkeypatch, worker_id
+):
+    monkeypatch.setattr(settings, "WORKER_ID", worker_id)
+    assert redis_manager.pooled_manager.enable_sharing
+    result = await api.create_stream(payload(normalize_live_output=True), scope())
+    outer = redis_manager.streams[result["stream_id"]]
+    inner = redis_manager.normalization_source(outer)
+    assert outer.is_transcoded and not inner.is_transcoded
+    assert inner.single_recovery_per_exit and inner.end_session_on_reconnect is False
+    assert outer.original_url == f"http://127.0.0.1:12345/stream/{inner.stream_id}"
+    again = await api.create_stream(payload(normalize_live_output=True), scope())
+    assert again["stream_id"] == outer.stream_id
+
+
+@pytest.mark.asyncio
+async def test_identity_is_scoped_to_this_process(redis_manager, monkeypatch):
+    # Instances sharing Redis must not resolve to one encoder key: the owned input
+    # is only reachable over this process's loopback.
+    first = await api.create_stream(payload(normalize_live_output=True), scope())
+    other = StreamManager(
+        redis_url="redis://unused.invalid:6379/6", enable_pooling=True
+    )
+    try:
+        monkeypatch.setattr(api, "stream_manager", other)
+        second = await api.create_stream(payload(normalize_live_output=True), scope())
+        assert second["stream_id"] != first["stream_id"]
+        first_input = redis_manager.normalization_source(
+            redis_manager.streams[first["stream_id"]]
+        )
+        second_input = other.normalization_source(other.streams[second["stream_id"]])
+        assert first_input.stream_id != second_input.stream_id
+        # The transcoder profile itself is unchanged (QSV diagnostics match on it).
+        assert (
+            redis_manager.streams[first["stream_id"]].transcode_profile
+            == other.streams[second["stream_id"]].transcode_profile
+        )
+    finally:
+        await other.stop()
 
 
 @pytest.mark.asyncio
@@ -180,15 +254,23 @@ async def test_partial_failure_rolls_back(
 
     monkeypatch.setattr(manager, "get_or_create_stream", create)
     with pytest.raises(asyncio.CancelledError if cancel else HTTPException):
-        await api.create_stream(payload(normalize_live_output=True, normalization_encoder=encoder_policy), scope())
+        await api.create_stream(
+            payload(normalize_live_output=True, normalization_encoder=encoder_policy),
+            scope(),
+        )
     assert not manager.streams
 
 
 @pytest.mark.asyncio
-async def test_idle_cascade_and_metadata_cannot_forge_ownership(manager, encoder_policy):
+async def test_idle_cascade_and_metadata_cannot_forge_ownership(
+    manager, encoder_policy
+):
     from datetime import datetime, timezone, timedelta
 
-    result = await api.create_stream(payload(normalize_live_output=True, normalization_encoder=encoder_policy), scope())
+    result = await api.create_stream(
+        payload(normalize_live_output=True, normalization_encoder=encoder_policy),
+        scope(),
+    )
     outer = manager.streams[result["stream_id"]]
     inner = manager.normalization_source(outer)
     foreign = await manager.get_or_create_stream(
@@ -257,7 +339,10 @@ async def test_active_input_retained_and_concurrent_posts_share_encoder(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("oldest", [False, True])
 async def test_metadata_delete_counts_one_and_cascades(manager, oldest, encoder_policy):
-    result = await api.create_stream(payload(normalize_live_output=True, normalization_encoder=encoder_policy), scope())
+    result = await api.create_stream(
+        payload(normalize_live_output=True, normalization_encoder=encoder_policy),
+        scope(),
+    )
     outer = manager.streams[result["stream_id"]]
     inner = manager.normalization_source(outer)
     if oldest:
@@ -325,7 +410,9 @@ async def test_private_profile_policy_id_and_ownership_not_metadata(
 
 
 @pytest.mark.asyncio
-async def test_owned_input_delete_rejected_without_disrupting_outer(manager, monkeypatch, encoder_policy):
+async def test_owned_input_delete_rejected_without_disrupting_outer(
+    manager, monkeypatch, encoder_policy
+):
     import httpx
 
     monkeypatch.setattr(settings, "API_TOKEN", "offline-fixture-only")
@@ -339,9 +426,14 @@ async def test_owned_input_delete_rejected_without_disrupting_outer(manager, mon
     ) as client:
         raw = await api.create_stream(payload(), scope())
         unrelated = manager.streams[raw["stream_id"]]
-        await manager.register_client("unrelated", unrelated.stream_id, "test", "127.0.0.1")
+        await manager.register_client(
+            "unrelated", unrelated.stream_id, "test", "127.0.0.1"
+        )
         created = await client.post(
-            "/streams", json=payload(normalize_live_output=True, normalization_encoder=encoder_policy).model_dump()
+            "/streams",
+            json=payload(
+                normalize_live_output=True, normalization_encoder=encoder_policy
+            ).model_dump(),
         )
         assert created.status_code == 200
         outer = manager.streams[created.json()["stream_id"]]

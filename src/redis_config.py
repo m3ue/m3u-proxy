@@ -43,6 +43,18 @@ def get_redis_config() -> dict:
     }
 
 
+def shares_listener_with_workers() -> bool:
+    """Whether sibling worker processes accept connections on this process's port.
+
+    Uvicorn --workers (spawned multiprocessing children) and declared worker counts.
+    A request to 127.0.0.1 can then reach a process that does not hold the stream.
+    Separate instances (one process each, distinguished by WORKER_ID) do not count.
+    """
+    return multiprocessing.parent_process() is not None or any(
+        os.getenv(name, "1") != "1" for name in ("WEB_CONCURRENCY", "UVICORN_WORKERS")
+    )
+
+
 def should_use_pooling() -> bool:
     """Enable Redis pooling or explicitly opted-in, single-process transcoding."""
     if not settings.ENABLE_TRANSCODING_POOLING:
@@ -53,14 +65,7 @@ def should_use_pooling() -> bool:
         return False
     # Reject declared multi-worker topologies before allocating any stream state.
     # External launchers must also be configured for exactly one process.
-    if (
-        settings.WORKER_ID
-        or multiprocessing.parent_process() is not None
-        or any(
-            os.getenv(name, "1") != "1"
-            for name in ("WEB_CONCURRENCY", "UVICORN_WORKERS")
-        )
-    ):
+    if settings.WORKER_ID or shares_listener_with_workers():
         raise ValueError(
             "Single-process transcoding requires a single process without WORKER_ID; "
             "WEB_CONCURRENCY and UVICORN_WORKERS must be unset or 1"

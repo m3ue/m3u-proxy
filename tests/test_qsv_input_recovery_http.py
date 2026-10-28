@@ -1,4 +1,5 @@
 """Real loopback HTTP API/private-input/resolver; no encoder or provider."""
+
 import asyncio
 import json
 import socket
@@ -18,7 +19,9 @@ import live_normalization
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("exhausted", [False, True])
-async def test_private_input_http_recovers_or_ends_after_bounded_resolver(manager, monkeypatch, exhausted):
+async def test_private_input_http_recovers_or_ends_after_bounded_resolver(
+    manager, monkeypatch, exhausted
+):
     monkeypatch.setattr(live_normalization, "validate_qsv_encoder", AsyncMock())
     monkeypatch.setattr(settings, "API_TOKEN", "")
     monkeypatch.setattr(settings, "MAX_FAILOVER_ATTEMPTS", 2)
@@ -35,19 +38,41 @@ async def test_private_input_http_recovers_or_ends_after_bounded_resolver(manage
             lines = head.decode().split("\r\n")
             method, path, _ = lines[0].split()
             if method == "POST":
-                size = int(next(line.split(":", 1)[1] for line in lines if line.lower().startswith("content-length:")))
+                size = int(
+                    next(
+                        line.split(":", 1)[1]
+                        for line in lines
+                        if line.lower().startswith("content-length:")
+                    )
+                )
                 resolutions.append(json.loads(await reader.readexactly(size)))
                 next_path = "/live/b.ts" if len(resolutions) == 1 else "/live/c.ts"
                 body = json.dumps({"next_url": base + next_path}).encode()
-                writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body)
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+                    + str(len(body)).encode()
+                    + b"\r\nConnection: close\r\n\r\n"
+                    + body
+                )
                 await writer.drain()
             else:
                 opened.append(path)
                 # Unknown private PES must still fail closed, not become raw TS.
-                data = b"!" * 188 if path == "/live/a.ts" else dvb_fixture(b"") if exhausted or path == "/live/b.ts" else fixture()
+                data = (
+                    b"!" * 188
+                    if path == "/live/a.ts"
+                    else dvb_fixture(b"")
+                    if exhausted or path == "/live/b.ts"
+                    else fixture()
+                )
                 # httpx upstream aiter_bytes uses fixed-size proxy chunks.
                 data *= 1024
-                writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nTransfer-Encoding: chunked\r\n\r\n" + f"{len(data):x}\r\n".encode() + data + b"\r\n")
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nTransfer-Encoding: chunked\r\n\r\n"
+                    + f"{len(data):x}\r\n".encode()
+                    + data
+                    + b"\r\n"
+                )
                 await writer.drain()
                 await reader.read()
         finally:
@@ -63,17 +88,28 @@ async def test_private_input_http_recovers_or_ends_after_bounded_resolver(manage
     listener.bind(("127.0.0.1", 0))
     listener.listen()
     port = listener.getsockname()[1]
-    server = uvicorn.Server(uvicorn.Config(api.app, lifespan="off", log_level="critical", timeout_graceful_shutdown=1))
+    server = uvicorn.Server(
+        uvicorn.Config(
+            api.app, lifespan="off", log_level="critical", timeout_graceful_shutdown=1
+        )
+    )
     server_task = asyncio.create_task(server.serve(sockets=[listener]))
     try:
         async with asyncio.timeout(5):
             while not server.started:
                 await asyncio.sleep(0.01)
-        async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", trust_env=False, timeout=5) as client:
-            created = await client.post("/streams", json={
-                "url": base + "/live/a.ts", "normalize_live_output": True,
-                "normalization_encoder": "qsv", "failover_resolver_url": base + "/resolver",
-            })
+        async with httpx.AsyncClient(
+            base_url=f"http://127.0.0.1:{port}", trust_env=False, timeout=5
+        ) as client:
+            created = await client.post(
+                "/streams",
+                json={
+                    "url": base + "/live/a.ts",
+                    "normalize_live_output": True,
+                    "normalization_encoder": "qsv",
+                    "failover_resolver_url": base + "/resolver",
+                },
+            )
             assert created.status_code == 200, created.text
             outer = manager.streams[created.json()["stream_id"]]
             inner = manager.streams[outer.normalization_input_id]
@@ -91,7 +127,9 @@ async def test_private_input_http_recovers_or_ends_after_bounded_resolver(manage
                 assert outer.failover_attempts == 0
                 assert outer.transcode_stream_key is None
                 assert len(resolutions) == 2
-                assert all(row["reason"] == "normalization_input_error" for row in resolutions)
+                assert all(
+                    row["reason"] == "normalization_input_error" for row in resolutions
+                )
             async with asyncio.timeout(3):
                 while len(closed) < 3:
                     await asyncio.sleep(0.01)

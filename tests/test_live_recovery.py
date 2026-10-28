@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
@@ -31,6 +31,8 @@ async def chunks(data=b"A", count=2, hang=False):
 async def manager(monkeypatch):
     monkeypatch.setattr(settings, "REDIS_ENABLED", False)
     monkeypatch.setattr(settings, "WORKER_ID", None)
+    monkeypatch.delenv("WEB_CONCURRENCY", raising=False)
+    monkeypatch.delenv("UVICORN_WORKERS", raising=False)
     monkeypatch.setattr(settings, "STREAM_RETRY_ATTEMPTS", 0)
     monkeypatch.setattr(settings, "LIVE_SILENT_RECONNECT_MIN_CHUNKS", 5)
     monkeypatch.setattr(settings, "STRICT_LIVE_TS_PREBUFFER_SIZE", 0)
@@ -87,22 +89,47 @@ async def test_policy_global_override_and_identity(manager, monkeypatch, name, e
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("env", ["WEB_CONCURRENCY", "UVICORN_WORKERS"])
+@pytest.mark.parametrize(
+    "policy", ["end_session_on_reconnect", "single_recovery_per_exit"]
+)
+async def test_topology_rejected_before_state(manager, monkeypatch, env, policy):
+    from fastapi import HTTPException
+
+    monkeypatch.setenv(env, "2")
+    with pytest.raises(HTTPException) as error:
+        await manager.get_or_create_stream(A, **{policy: True})
+    assert error.value.status_code == 400
+    assert not manager.streams and not manager.clients
+
+
+@pytest.mark.asyncio
+async def test_spawned_worker_rejected_before_state(manager):
+    from fastapi import HTTPException
+
+    with patch("redis_config.multiprocessing.parent_process", return_value=object()):
+        with pytest.raises(HTTPException) as error:
+            await manager.get_or_create_stream(A, single_recovery_per_exit=True)
+    assert error.value.status_code == 400
+    assert not manager.streams and not manager.clients
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "setting,value", [("REDIS_ENABLED", True), ("WORKER_ID", "worker")]
 )
 @pytest.mark.parametrize(
     "policy", ["end_session_on_reconnect", "single_recovery_per_exit"]
 )
-async def test_topology_rejected_before_state(
+async def test_redis_and_separate_instances_supported(
     manager, monkeypatch, setting, value, policy
 ):
-    from fastapi import HTTPException
-
+    # Direct streams and their recovery state stay in this process; Redis only
+    # coordinates transcoders, and each WORKER_ID instance has its own listener.
     monkeypatch.setattr(settings, setting, value)
-    with pytest.raises(HTTPException) as error:
-        await manager.get_or_create_stream(A, **{policy: True})
-    assert error.value.status_code == 400
-    assert not manager.streams and not manager.clients
+    manager._redis_requested = setting == "REDIS_ENABLED"
+    stream_id = await manager.get_or_create_stream(A, **{policy: True})
+    assert getattr(manager.streams[stream_id], policy) is True
 
 
 @pytest.mark.asyncio
@@ -519,9 +546,12 @@ async def test_api_nullable_forwarding_and_unsupported_topology(manager, monkeyp
         assert enabled.status_code == disabled.status_code == 200
         assert inherited.json()["stream_id"] == enabled.json()["stream_id"]
         assert enabled.json()["stream_id"] != disabled.json()["stream_id"]
-        monkeypatch.setattr(settings, "REDIS_ENABLED", True)
+        monkeypatch.setenv("WEB_CONCURRENCY", "2")
         result = await client.post("/streams", json={"url": B})
-        assert result.status_code == 400 and "single process" in result.json()["detail"]
+        assert (
+            result.status_code == 400
+            and "one server process" in result.json()["detail"]
+        )
 
 
 @pytest.mark.asyncio

@@ -1,4 +1,5 @@
 """Request-scoped cancellation and shared QSV startup failover limits."""
+
 import asyncio
 
 import httpx
@@ -11,9 +12,13 @@ from ts_canonicalizer import TSCanonicalizationError
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("disconnect", ["cleanup", "cancel", "replace", "generation", "ownership"])
+@pytest.mark.parametrize(
+    "disconnect", ["cleanup", "cancel", "replace", "generation", "ownership"]
+)
 @pytest.mark.parametrize("stage", ["resolver", "detach"])
-async def test_adapter_resolver_does_not_revive_disconnected_request(manager, monkeypatch, disconnect, stage):
+async def test_adapter_resolver_does_not_revive_disconnected_request(
+    manager, monkeypatch, disconnect, stage
+):
     sid = await setup_input(manager)
     opened, closed = sources(monkeypatch, manager, {A: broken, B: good})
     entered, release = asyncio.Event(), asyncio.Event()
@@ -68,7 +73,9 @@ async def test_adapter_resolver_does_not_revive_disconnected_request(manager, mo
 @pytest.mark.asyncio
 @pytest.mark.parametrize("limit", [1, 2, 0])
 @pytest.mark.parametrize("first", ["transport", "adapter"])
-async def test_transport_and_adapter_share_one_response_budget(manager, monkeypatch, limit, first):
+async def test_transport_and_adapter_share_one_response_budget(
+    manager, monkeypatch, limit, first
+):
     monkeypatch.setattr(settings, "MAX_FAILOVER_ATTEMPTS", limit)
     sid = await setup_input(manager)
 
@@ -108,7 +115,9 @@ async def test_transport_and_adapter_share_one_response_budget(manager, monkeypa
 
 
 @pytest.mark.asyncio
-async def test_disconnect_during_replacement_prefetch_never_selects_again(manager, monkeypatch):
+async def test_disconnect_during_replacement_prefetch_never_selects_again(
+    manager, monkeypatch
+):
     sid = await setup_input(manager)
     entered, release = asyncio.Event(), asyncio.Event()
 
@@ -118,7 +127,9 @@ async def test_disconnect_during_replacement_prefetch_never_selects_again(manage
         async for chunk in broken():
             yield chunk
 
-    opened, closed = sources(monkeypatch, manager, {A: broken, B: blocked_broken, C: good})
+    opened, closed = sources(
+        monkeypatch, manager, {A: broken, B: blocked_broken, C: good}
+    )
     calls = []
 
     async def resolve(stream_id, reason):
@@ -143,7 +154,9 @@ async def test_disconnect_during_replacement_prefetch_never_selects_again(manage
 
 
 @pytest.mark.asyncio
-async def test_failover_budget_is_fresh_for_a_new_response_on_same_stream(manager, monkeypatch):
+async def test_failover_budget_is_fresh_for_a_new_response_on_same_stream(
+    manager, monkeypatch
+):
     monkeypatch.setattr(settings, "MAX_FAILOVER_ATTEMPTS", 1)
     sid = await setup_input(manager)
     factories = {A: broken, B: good, C: good}

@@ -2682,7 +2682,9 @@ async def trigger_failover(stream_id: str):
                 "new_url": stream_info.current_url,
                 "failover_index": stream_info.current_failover_index,
                 "failover_attempts": stream_info.failover_attempts,
-                "active_clients": len(stream_manager.streams[stream_id].connected_clients),
+                "active_clients": len(
+                    stream_manager.streams[stream_id].connected_clients
+                ),
                 "stream_type": "Transcoded"
                 if stream_info.is_transcoded
                 else (

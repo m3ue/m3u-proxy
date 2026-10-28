@@ -7,7 +7,17 @@ For players that **do not reconnect** when a live HTTP body ends, the existing
 pooled FFmpeg transcoder. No manual inner `/streams` + `/transcode` creation, URL
 rewrite, second player GET, or operator action is needed for automatic failover.
 
-Prerequisites (one process/instance, FFmpeg with libx264/AAC):
+Prerequisites (one server process per instance, FFmpeg with libx264/AAC, and
+transcoding pooling). Redis pooling, the default for M3U Editor deployments, works
+as is:
+
+```dotenv
+REDIS_ENABLED=true
+ENABLE_TRANSCODING_POOLING=true
+LIVE_NORMALIZE_OUTPUT=false
+```
+
+Without Redis, opt in to the local transcoder instead:
 
 ```dotenv
 REDIS_ENABLED=false
@@ -31,10 +41,14 @@ Content-Type: application/json
 Consume the returned `/stream/{stream_id}` normally. Nullable
 `normalize_live_output` inherits `LIVE_NORMALIZE_OUTPUT` (default `false`);
 explicit `false` overrides global `true`. Disabled mode keeps legacy identities
-and behavior. Redis, known multi-worker topologies, disabled local pooling,
-DASH/HLS/VOD inputs and missing ASGI server-port information are rejected before
-allocation. Replicas/external prefork deployments are not supported even if they
-cannot be detected. URL shape is validated without provider probing; sources and
+and behavior. Sibling workers sharing one listening port (Uvicorn `--workers`,
+`WEB_CONCURRENCY`/`UVICORN_WORKERS` other than 1), disabled pooling, DASH/HLS/VOD
+inputs and missing ASGI server-port information are rejected before allocation.
+Separate instances (one process each, with `WORKER_ID`) sharing Redis are
+supported: the private input and encoder identities include the process, so each
+instance runs its own encoder rather than finding another instance's key in Redis.
+External prefork launchers that set none of these variables cannot be detected;
+configure them for one process. URL shape is validated without provider probing; sources and
 resolver-returned backups must actually be compatible direct live MPEG-TS.
 
 The owned input uses strict-live + sticky sessions, `single_recovery_per_exit=true`
@@ -222,17 +236,16 @@ implicitly enabled by either switch.
 
 ## Supported topology and limits
 
-Use **one proxy process/instance**, without Redis or `WORKER_ID`. Policy-enabled
-live stream creation returns **HTTP 400 before allocating a stream or clients**
-if Redis is enabled, a Redis URL was supplied to the manager, or `WORKER_ID` is
-set. This deliberately rejects distributed/pool-coordinated operation rather
-than pretending that process-local generation barriers coordinate workers.
-Local, non-Redis transcoding-pool infrastructure may remain enabled; these
-policies only affect the direct-live path, never pooled transcoding output.
-External multi-process launchers/load balancers without Redis/worker configuration
-cannot be auto-detected: do not activate these options there. Sticky routing is
-not a substitute for generation coordination. Redis/device acceptance is not
-claimed; distributed support would need a separate implementation and tests.
+Use **one server process per proxy instance**. Policy-enabled live stream
+creation returns **HTTP 400 before allocating a stream or clients** when sibling
+workers share the listening port (Uvicorn `--workers`, or `WEB_CONCURRENCY` /
+`UVICORN_WORKERS` other than 1). Redis and separate `WORKER_ID` instances are
+allowed: direct streams and their generation barriers never leave the process
+that created them (Redis only coordinates pooled transcoders), and each instance
+has its own listener. Requests for a stream must still reach the instance that
+created it, as for every other stream type. External prefork launchers that set
+none of these variables cannot be auto-detected: do not activate these options
+there.
 
 This is **session-end**, not a player reconnect instruction. Emby, Kodi, TVs and
 other clients may stop playback instead of issuing a new request. Test actual

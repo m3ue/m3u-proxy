@@ -1,4 +1,5 @@
 """Owned QSV adapter recovery with synthetic sources only."""
+
 import asyncio
 from datetime import datetime, timezone
 
@@ -13,8 +14,10 @@ from tests.test_ts_canonicalizer import fixture
 
 async def setup_input(manager):
     sid = await manager.get_or_create_stream(
-        A, failover_resolver_url="http://resolver.invalid/next",
-        end_session_on_reconnect=False, single_recovery_per_exit=True,
+        A,
+        failover_resolver_url="http://resolver.invalid/next",
+        end_session_on_reconnect=False,
+        single_recovery_per_exit=True,
     )
     now = datetime.now(timezone.utc)
     outer = StreamInfo("outer", "http://127.0.0.1/inner", now, now)
@@ -36,7 +39,9 @@ async def good():
 
 
 @pytest.mark.asyncio
-async def test_adapter_start_error_uses_inner_resolver_without_ending_response(manager, monkeypatch):
+async def test_adapter_start_error_uses_inner_resolver_without_ending_response(
+    manager, monkeypatch
+):
     sid = await setup_input(manager)
     opened, closed = sources(monkeypatch, manager, {A: broken, B: good})
     calls = []
@@ -65,7 +70,9 @@ async def test_adapter_start_error_uses_inner_resolver_without_ending_response(m
 
 
 @pytest.mark.asyncio
-async def test_adapter_failure_after_output_ends_input_instead_of_resetting_abi(manager, monkeypatch):
+async def test_adapter_failure_after_output_ends_input_instead_of_resetting_abi(
+    manager, monkeypatch
+):
     sid = await setup_input(manager)
     calls = []
 
@@ -90,7 +97,9 @@ async def test_adapter_failure_after_output_ends_input_instead_of_resetting_abi(
 
 
 @pytest.mark.asyncio
-async def test_stale_adapter_resolver_cannot_overwrite_new_generation(manager, monkeypatch):
+async def test_stale_adapter_resolver_cannot_overwrite_new_generation(
+    manager, monkeypatch
+):
     sid = await setup_input(manager)
     opened, closed = sources(monkeypatch, manager, {A: broken, B: good, C: good})
     entered, release = asyncio.Event(), asyncio.Event()
@@ -119,7 +128,9 @@ async def test_stale_adapter_resolver_cannot_overwrite_new_generation(manager, m
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", ["limit", "exhausted", "static", "unknown_private"])
-async def test_rejected_candidates_are_bounded_and_never_forwarded(manager, monkeypatch, mode):
+async def test_rejected_candidates_are_bounded_and_never_forwarded(
+    manager, monkeypatch, mode
+):
     from tests.test_qsv_ts_integration import dvb_fixture
 
     monkeypatch.setattr(settings, "MAX_FAILOVER_ATTEMPTS", 2)
@@ -139,11 +150,13 @@ async def test_rejected_candidates_are_bounded_and_never_forwarded(manager, monk
         info.failover_resolver_url = None
         info.failover_urls = [B, C]
     else:
+
         async def resolve(stream_id, reason):
             calls.append((stream_id, reason))
             if mode == "exhausted":
                 return None
             return (B if len(calls) == 1 else C) if mode == "unknown_private" else B
+
         monkeypatch.setattr(manager, "_resolve_next_failover_url", resolve)
 
     opened, closed = sources(monkeypatch, manager, factories)
@@ -155,7 +168,13 @@ async def test_rejected_candidates_are_bounded_and_never_forwarded(manager, monk
         else:
             with pytest.raises(TSCanonicalizationError):
                 await asyncio.wait_for(anext(response.body_iterator), 1)
-            assert opened == ([A] if mode == "exhausted" else [A, B, C] if mode == "static" else [A, B, B])
+            assert opened == (
+                [A]
+                if mode == "exhausted"
+                else [A, B, C]
+                if mode == "static"
+                else [A, B, B]
+            )
     finally:
         await response.body_iterator.aclose()
     assert len(closed) == len(opened)
@@ -170,6 +189,7 @@ async def test_finish_failure_selects_next_candidate(manager, monkeypatch):
     # The raw generator handles transient EOF itself; isolate terminal EOF to
     # exercise the adapter.finish boundary without a second EOF recovery.
     from fastapi.responses import StreamingResponse
+
     sid = await setup_input(manager)
     opened, closed = [], []
 
@@ -196,7 +216,9 @@ async def test_finish_failure_selects_next_candidate(manager, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_rejected_primary_ends_old_subscriber_without_second_selection(manager, monkeypatch):
+async def test_rejected_primary_ends_old_subscriber_without_second_selection(
+    manager, monkeypatch
+):
     sid = await setup_input(manager)
     opened, closed = sources(monkeypatch, manager, {A: broken, B: good})
     calls = []
@@ -223,4 +245,3 @@ async def test_rejected_primary_ends_old_subscriber_without_second_selection(man
         await subscriber.body_iterator.aclose()
     assert len(closed) == 2
     assert not manager.connection_cancel_events
-

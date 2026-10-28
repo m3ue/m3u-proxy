@@ -5,6 +5,7 @@ SSIM >= .97 is a synthetic encode-regression floor, not a perceptual guarantee.
 The reference is field-rate bwdif on the *same decoded* interlaced source, not
 an impossible lossless reconstruction of the pre-interlaced progressive source.
 """
+
 import json
 import os
 from pathlib import Path
@@ -18,7 +19,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from config import Settings
-from live_normalization import VAAPI_PROFILE, QSV_PROFILE, QSV_DEVICE_ARGS, QSV_DECODING_ARGS
+from live_normalization import (
+    VAAPI_PROFILE,
+    QSV_PROFILE,
+    QSV_DEVICE_ARGS,
+    QSV_DECODING_ARGS,
+)
 
 DEINTERLACE = "bwdif=mode=send_field:parity=auto:deint=interlaced"
 
@@ -30,12 +36,27 @@ def run(*args):
 
 
 def probe(path):
-    return json.loads(run("ffprobe", "-v", "error", "-select_streams", "v:0",
-                          "-show_frames", "-show_streams", "-of", "json", path).stdout)
+    return json.loads(
+        run(
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_frames",
+            "-show_streams",
+            "-of",
+            "json",
+            path,
+        ).stdout
+    )
 
 
 def test_standard_profile_quality_contract():
-    for profile in (Settings.model_fields["LIVE_NORMALIZE_PROFILE"].default, VAAPI_PROFILE):
+    for profile in (
+        Settings.model_fields["LIVE_NORMALIZE_PROFILE"].default,
+        VAAPI_PROFILE,
+    ):
         args = shlex.split(profile)
         assert args[args.index("-vf") + 1].startswith(DEINTERLACE)
         assert args[args.index("-fps_mode") + 1] == "passthrough"
@@ -56,18 +77,42 @@ def test_moving_video_field_rate_and_quality(tmp_path, encoder, source):
     size = os.environ.get("NORMALIZATION_QUALITY_SIZE", "320x180")
     rate = 25 if source == "p25" else 50
     original = tmp_path / ("source.ts" if encoder == "qsv" else "source.mkv")
-    filters = "tinterlace=mode=interleave_top,setfield=tff" if source == "i25" else "setfield=prog"
+    filters = (
+        "tinterlace=mode=interleave_top,setfield=tff"
+        if source == "i25"
+        else "setfield=prog"
+    )
     fixture_codec = ["-c:v", "ffv1"]
     if encoder == "qsv":
         # Use the same realistic 8-bit H.264 source as the QSV handoff tests.
         # Decode is explicitly software; QSV is only the output encoder.
-        fixture_codec = ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "18",
-                         "-pix_fmt", "yuv420p"]
+        fixture_codec = [
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "18",
+            "-pix_fmt",
+            "yuv420p",
+        ]
         if source == "i25":
             fixture_codec += ["-flags", "+ilme+ildct", "-x264-params", "tff=1"]
-    run("ffmpeg", "-v", "error", "-f", "lavfi", "-i",
-        f"testsrc2=size={size}:rate={rate}:duration=2", "-vf", filters,
-        *fixture_codec, "-threads", "2", original)
+    run(
+        "ffmpeg",
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        f"testsrc2=size={size}:rate={rate}:duration=2",
+        "-vf",
+        filters,
+        *fixture_codec,
+        "-threads",
+        "2",
+        original,
+    )
     before = probe(original)
     frames = before["frames"]
     assert len(frames) == (50 if source != "p50" else 100)
@@ -75,15 +120,29 @@ def test_moving_video_field_rate_and_quality(tmp_path, encoder, source):
     if source == "i25":
         assert all(f["top_field_first"] == 1 for f in frames)
     reference = tmp_path / "reference.mkv"
-    run("ffmpeg", "-v", "error", "-i", original, "-vf", DEINTERLACE,
-        "-fps_mode", "passthrough", "-c:v", "ffv1", "-threads", "2", reference)
+    run(
+        "ffmpeg",
+        "-v",
+        "error",
+        "-i",
+        original,
+        "-vf",
+        DEINTERLACE,
+        "-fps_mode",
+        "passthrough",
+        "-c:v",
+        "ffv1",
+        "-threads",
+        "2",
+        reference,
+    )
     template = {"vaapi": VAAPI_PROFILE, "qsv": QSV_PROFILE}.get(
         encoder, Settings.model_fields["LIVE_NORMALIZE_PROFILE"].default
     )
     # Exercise the exact server-owned output template; local fixture input avoids
     # reconnect/HTTP options, which apply only to the live private HTTP input.
     args = shlex.split(template.format(input_url="fixture", output_args="pipe:1"))
-    output_args = args[args.index("-map"):]
+    output_args = args[args.index("-map") :]
     output_args[-1] = str(tmp_path / "output.ts")
     output_args[output_args.index("0:a:0")] = "0:a:0?"
     device = ["-vaapi_device", "/dev/dri/renderD128"] if encoder == "vaapi" else []
@@ -103,15 +162,46 @@ def test_moving_video_field_rate_and_quality(tmp_path, encoder, source):
         [p - reference_pts[0] for p in reference_pts], abs=0.00002
     )
     step = 0.04 if source == "p25" else 0.02
-    assert [b - a for a, b in zip(pts, pts[1:])] == pytest.approx([step] * (expected_count - 1), abs=0.00002)
-    comparison = run("ffmpeg", "-v", "info", "-i", output, "-i", reference,
-                     "-lavfi", "[0:v]setpts=PTS-STARTPTS[a];[1:v]setpts=PTS-STARTPTS[b];[a][b]ssim",
-                     "-an", "-f", "null", "-").stderr.decode()
+    assert [b - a for a, b in zip(pts, pts[1:])] == pytest.approx(
+        [step] * (expected_count - 1), abs=0.00002
+    )
+    comparison = run(
+        "ffmpeg",
+        "-v",
+        "info",
+        "-i",
+        output,
+        "-i",
+        reference,
+        "-lavfi",
+        "[0:v]setpts=PTS-STARTPTS[a];[1:v]setpts=PTS-STARTPTS[b];[a][b]ssim",
+        "-an",
+        "-f",
+        "null",
+        "-",
+    ).stderr.decode()
     score = float(re.search(r"All:([0-9.]+)", comparison).group(1))
     assert score >= 0.97, comparison
     # No CFR-created duplicates: each field-derived moving output is distinct.
-    hashes = run("ffmpeg", "-v", "error", "-i", output, "-an", "-fps_mode",
-                 "passthrough", "-f", "framemd5", "-").stdout.decode()
-    checksums = [line.rsplit(",", 1)[-1].strip() for line in hashes.splitlines() if not line.startswith("#")]
+    hashes = run(
+        "ffmpeg",
+        "-v",
+        "error",
+        "-i",
+        output,
+        "-an",
+        "-fps_mode",
+        "passthrough",
+        "-f",
+        "framemd5",
+        "-",
+    ).stdout.decode()
+    checksums = [
+        line.rsplit(",", 1)[-1].strip()
+        for line in hashes.splitlines()
+        if not line.startswith("#")
+    ]
     assert len(checksums) == expected_count and len(set(checksums)) == expected_count
-    print(f"QUALITY {encoder} {source} {size}: frames={len(actual)} step={step} progressive SSIM={score:.6f}")
+    print(
+        f"QUALITY {encoder} {source} {size}: frames={len(actual)} step={step} progressive SSIM={score:.6f}"
+    )

@@ -40,10 +40,14 @@ jobs:
           restore-keys: ${{ runner.os }}-pip-
 
       - name: Install dependencies
-        run: pip install ruff
+        # Pinned so the formatter's output only changes when we bump it.
+        run: pip install ruff==0.17.3
 
       - name: Lint with ruff
         run: ruff check --unsafe-fixes src/ tests/
+
+      - name: Check formatting with ruff
+        run: ruff format --check src/ tests/
 
   security:
     name: Security Scan
