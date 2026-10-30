@@ -30,8 +30,8 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def get_ffmpeg_version() -> Optional[str]:
-    """Get the ffmpeg version string"""
+def _read_ffmpeg_version() -> Optional[str]:
+    """Run `ffmpeg -version` and return its first line (blocking)"""
     try:
         result = subprocess.run(
             ["ffmpeg", "-version"], capture_output=True, text=True, timeout=5
@@ -46,8 +46,8 @@ def get_ffmpeg_version() -> Optional[str]:
         return None
 
 
-def get_resolver_version(binary: str) -> Optional[str]:
-    """Get the version string for a resolver binary (streamlink or yt-dlp)"""
+def _read_resolver_version(binary: str) -> Optional[str]:
+    """Run `<binary> --version` for streamlink or yt-dlp (blocking)"""
     try:
         result = subprocess.run(
             [binary, "--version"], capture_output=True, text=True, timeout=5
@@ -57,6 +57,44 @@ def get_resolver_version(binary: str) -> Optional[str]:
         return None
     except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
         return None
+
+
+# Binary versions cannot change while the process runs, so each one is read
+# once. The subprocess runs in a worker thread: streamlink and yt-dlp are
+# Python programs that can take seconds to start on a loaded container, and
+# running them on the event loop stalls every active stream until they exit.
+# Only successful lookups are cached so a missing binary is re-checked.
+_binary_versions: Dict[str, str] = {}
+
+
+async def _cached_binary_version(binary: str, reader) -> Optional[str]:
+    cached = _binary_versions.get(binary)
+    if cached is not None:
+        return cached
+    version = await asyncio.to_thread(reader)
+    if version is not None:
+        _binary_versions[binary] = version
+    return version
+
+
+async def get_ffmpeg_version() -> Optional[str]:
+    """Get the ffmpeg version string"""
+    return await _cached_binary_version("ffmpeg", _read_ffmpeg_version)
+
+
+async def get_resolver_version(binary: str) -> Optional[str]:
+    """Get the version string for a resolver binary (streamlink or yt-dlp)"""
+    return await _cached_binary_version(binary, lambda: _read_resolver_version(binary))
+
+
+async def warm_binary_versions() -> None:
+    """Read binary versions in the background at startup so /info is instant"""
+    lookups = [get_ffmpeg_version()]
+    if settings.STREAMLINK_ENABLED:
+        lookups.append(get_resolver_version("streamlink"))
+    if settings.YTDLP_ENABLED:
+        lookups.append(get_resolver_version("yt-dlp"))
+    await asyncio.gather(*lookups, return_exceptions=True)
 
 
 def get_content_type(url: str) -> str:
@@ -423,6 +461,10 @@ async def lifespan(app: FastAPI):
     await stream_manager.start()
     await broadcast_manager.start()
 
+    # Read ffmpeg/resolver versions off the request path. Keep a reference so
+    # the task is not garbage-collected before it finishes.
+    app.state.binary_versions_task = asyncio.create_task(warm_binary_versions())
+
     # Set up custom event handlers
     def log_event_handler(event: StreamEvent):
         """Simple event handler that logs all events"""
@@ -682,11 +724,11 @@ async def get_info():
     info = {
         "version": VERSION,
         "python_version": platform.python_version(),
-        "ffmpeg_version": get_ffmpeg_version(),
-        "streamlink_version": get_resolver_version("streamlink")
+        "ffmpeg_version": await get_ffmpeg_version(),
+        "streamlink_version": await get_resolver_version("streamlink")
         if settings.STREAMLINK_ENABLED
         else None,
-        "ytdlp_version": get_resolver_version("yt-dlp")
+        "ytdlp_version": await get_resolver_version("yt-dlp")
         if settings.YTDLP_ENABLED
         else None,
         "hardware_acceleration": {
@@ -702,9 +744,6 @@ async def get_info():
             "pooling_enabled": use_pooling,
             "host": redis_config.get("host") if settings.REDIS_ENABLED else None,
             "port": redis_config.get("port") if settings.REDIS_ENABLED else None,
-            "password": redis_config.get("password")
-            if settings.REDIS_ENABLED
-            else None,
             "db": redis_config.get("db") if settings.REDIS_ENABLED else None,
             "max_clients_per_stream": settings.MAX_CLIENTS_PER_SHARED_STREAM
             if use_pooling
@@ -907,7 +946,7 @@ async def create_transcode_stream(request: TranscodeCreateRequest):
                 )
 
             # Verify the binary is available
-            if not get_resolver_version(resolver_binary):
+            if not await get_resolver_version(resolver_binary):
                 raise HTTPException(
                     status_code=503,
                     detail=f"{resolver_binary} is not installed or not accessible",
@@ -2778,7 +2817,7 @@ async def ytdlp_metadata(request: YtDlpMetadataRequest):
             detail="yt-dlp resolver is disabled (YTDLP_ENABLED=false)",
         )
 
-    if not get_resolver_version("yt-dlp"):
+    if not await get_resolver_version("yt-dlp"):
         raise HTTPException(
             status_code=503,
             detail="yt-dlp is not installed or not accessible on this proxy host",
