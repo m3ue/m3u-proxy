@@ -23,7 +23,7 @@ from log_anonymizer import AnonymizingFilter
 from pooled_stream_manager import SharedTranscodingProcess
 from redis_config import get_redis_config
 from stream_manager import StreamManager
-from url_signing import sign_url
+from url_signing import ROLE_DASH_FILE, ROLE_HLS_SEGMENT, sign_url
 
 
 # --- #89 Redis password encoding -------------------------------------------
@@ -148,12 +148,13 @@ async def test_ytdlp_metadata_cancellation_reaps_child(monkeypatch):
 @pytest.mark.parametrize("route", ["/hls/s1/segment", "/dash/s1/file"])
 def test_signed_segment_url_keeps_reserved_escapes(route):
     target = "http://cdn.invalid/seg.ts?token=a%2Fb%26c%3Dd"
+    role = ROLE_HLS_SEGMENT if "hls" in route else ROLE_DASH_FILE
     with patch("api.stream_manager") as manager:
         manager.register_client = AsyncMock()
         manager.proxy_hls_segment = AsyncMock(return_value=api.Response(b""))
         manager.proxy_dash_segment = AsyncMock(return_value=api.Response(b""))
         response = TestClient(app).get(
-            f"{route}?client_id=c1&url={quote(target, safe='')}&sig={sign_url(target)}"
+            f"{route}?client_id=c1&url={quote(target, safe='')}&sig={sign_url(target, stream_id='s1', role=role)}"
         )
         assert response.status_code == 200
         proxied = (
@@ -166,7 +167,7 @@ def test_dash_template_query_is_forwarded():
     from stream_manager import DashProcessor
 
     base = "http://cdn.invalid/live/"
-    encoded = DashProcessor.sign_base(base)
+    encoded = DashProcessor.sign_base(base, "s1")
     with patch("api.stream_manager") as manager:
         manager.register_client = AsyncMock()
         manager.proxy_dash_segment = AsyncMock(return_value=api.Response(b""))

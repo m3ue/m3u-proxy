@@ -1,7 +1,7 @@
 # Add src to path first
 from stream_manager import StreamManager
 from api import app, get_content_type, is_direct_stream
-from url_signing import sign_url
+from url_signing import ROLE_HLS_SEGMENT, sign_url
 import httpx
 import asyncio
 import pytest
@@ -245,7 +245,11 @@ class TestAPI:
             params={
                 "client_id": "test_client",
                 "url": "http://example.com/segment1.ts",
-                "sig": sign_url("http://example.com/segment1.ts"),
+                "sig": sign_url(
+                    "http://example.com/segment1.ts",
+                    stream_id="test_stream_123",
+                    role=ROLE_HLS_SEGMENT,
+                ),
             },
         )
         assert response.status_code == 200

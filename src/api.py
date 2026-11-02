@@ -23,7 +23,12 @@ from transcoding import get_profile_manager
 from redis_config import get_redis_config, should_use_pooling
 from hwaccel import hw_accel
 from broadcast_manager import BroadcastManager, BroadcastConfig
-from url_signing import verify_url
+from url_signing import (
+    ROLE_DASH_FILE,
+    ROLE_HLS_SEGMENT,
+    hls_playlist_role,
+    verify_url,
+)
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -791,13 +796,16 @@ async def resolve_stream_id(
     Also validates that the stream exists.
 
     A URL is only accepted when it carries the signature the proxy added while
-    rewriting a variant playlist, or when the request passes verify_token.
+    rewriting a variant playlist for this route's stream and `parent`, or when
+    the request passes verify_token.
     Otherwise this would be an unauthenticated fetch of any URL.
 
     If parent is provided, the created stream will be marked as a variant of the parent.
     """
     if url:
-        signed = verify_url(url, sig)
+        signed = verify_url(
+            url, sig, stream_id=stream_id, role=hls_playlist_role(parent)
+        )
         if not signed:
             await verify_token(x_api_token, api_token)
         try:
@@ -1351,8 +1359,9 @@ async def get_hls_segment(
     ),
 ):
     """Proxy HLS segment for a client"""
-    # Only segment URLs this proxy wrote into a playlist may be fetched.
-    if not verify_url(url, sig):
+    # Only segment URLs this proxy wrote into this stream's playlist may be
+    # fetched; the route's stream decides which upstream headers are sent.
+    if not verify_url(url, sig, stream_id=stream_id, role=ROLE_HLS_SEGMENT):
         raise HTTPException(status_code=403, detail="Invalid segment signature")
 
     try:
@@ -1614,7 +1623,7 @@ async def get_dash_segment_by_base(
     URL must stay on the signed base's scheme and host - a `path` such as
     `//other-host/x` would otherwise replace the host during urljoin.
     """
-    base_url = DashProcessor.verify_base(encoded_base)
+    base_url = DashProcessor.verify_base(encoded_base, stream_id)
     if base_url is None:
         raise HTTPException(status_code=403, detail="Invalid segment signature")
     segment_url = urljoin(base_url, path)
@@ -1663,7 +1672,7 @@ async def get_dash_file(
     """Proxy a fully-qualified DASH segment/init URL (SegmentList). This route is
     the direct DASH counterpart of the HLS segment route - identical signature
     (`client_id` + `url` required query params), identical body."""
-    if not verify_url(url, sig):
+    if not verify_url(url, sig, stream_id=stream_id, role=ROLE_DASH_FILE):
         raise HTTPException(status_code=403, detail="Invalid segment signature")
 
     try:
