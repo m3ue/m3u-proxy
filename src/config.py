@@ -2,7 +2,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from typing import Optional
 
 # Application version
-VERSION = "0.4.37"
+VERSION = "0.5.0"
 
 
 class Settings(BaseSettings):
