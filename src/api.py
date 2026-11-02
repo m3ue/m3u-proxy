@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Query, Response, Request, Depends, Header
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
 import asyncio
@@ -23,7 +23,12 @@ from transcoding import get_profile_manager
 from redis_config import get_redis_config, should_use_pooling
 from hwaccel import hw_accel
 from broadcast_manager import BroadcastManager, BroadcastConfig
-from url_signing import verify_url
+from url_signing import (
+    ROLE_DASH_FILE,
+    ROLE_HLS_SEGMENT,
+    hls_playlist_role,
+    verify_url,
+)
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -791,16 +796,22 @@ async def resolve_stream_id(
     Also validates that the stream exists.
 
     A URL is only accepted when it carries the signature the proxy added while
-    rewriting a variant playlist, or when the request passes verify_token.
+    rewriting a variant playlist for this route's stream and `parent`, or when
+    the request passes verify_token.
     Otherwise this would be an unauthenticated fetch of any URL.
 
     If parent is provided, the created stream will be marked as a variant of the parent.
     """
     if url:
-        if not verify_url(url, sig):
+        signed = verify_url(
+            url, sig, stream_id=stream_id, role=hls_playlist_role(parent)
+        )
+        if not signed:
             await verify_token(x_api_token, api_token)
         try:
-            decoded_url = unquote(url)
+            # A signed URL is exactly what the rewriter signed (FastAPI decoded the
+            # query once); only token-authenticated callers get the legacy decode.
+            decoded_url = url if signed else unquote(url)
             validate_url(decoded_url)
             # If parent is provided, this is a variant stream
             parent_id = parent if parent else None
@@ -1348,13 +1359,15 @@ async def get_hls_segment(
     ),
 ):
     """Proxy HLS segment for a client"""
-    # Only segment URLs this proxy wrote into a playlist may be fetched.
-    if not verify_url(url, sig):
+    # Only segment URLs this proxy wrote into this stream's playlist may be
+    # fetched; the route's stream decides which upstream headers are sent.
+    if not verify_url(url, sig, stream_id=stream_id, role=ROLE_HLS_SEGMENT):
         raise HTTPException(status_code=403, detail="Invalid segment signature")
 
     try:
-        # Decode the URL
-        segment_url = unquote(url)
+        # FastAPI already decoded the query parameter once; that is the exact
+        # URL the signature covers. Decoding again would change %2F/%26 etc.
+        segment_url = url
 
         # Get range header if present
         range_header = request.headers.get("range")
@@ -1610,10 +1623,14 @@ async def get_dash_segment_by_base(
     URL must stay on the signed base's scheme and host - a `path` such as
     `//other-host/x` would otherwise replace the host during urljoin.
     """
-    base_url = DashProcessor.verify_base(encoded_base)
+    base_url = DashProcessor.verify_base(encoded_base, stream_id)
     if base_url is None:
         raise HTTPException(status_code=403, detail="Invalid segment signature")
     segment_url = urljoin(base_url, path)
+    # A query on the SegmentTemplate (e.g. ?token=$Number$) arrives as this
+    # request's query; the proxy puts nothing of its own here, so pass it on.
+    if request.url.query:
+        segment_url = f"{segment_url}?{request.url.query}"
     parsed_base, parsed_segment = urlparse(base_url), urlparse(segment_url)
     if (parsed_segment.scheme, parsed_segment.netloc) != (
         parsed_base.scheme,
@@ -1655,11 +1672,12 @@ async def get_dash_file(
     """Proxy a fully-qualified DASH segment/init URL (SegmentList). This route is
     the direct DASH counterpart of the HLS segment route - identical signature
     (`client_id` + `url` required query params), identical body."""
-    if not verify_url(url, sig):
+    if not verify_url(url, sig, stream_id=stream_id, role=ROLE_DASH_FILE):
         raise HTTPException(status_code=403, detail="Invalid segment signature")
 
     try:
-        segment_url = unquote(url)
+        # Already decoded once by FastAPI - the signed value (see get_hls_segment).
+        segment_url = url
         range_header = request.headers.get("range")
 
         client_info_data = get_client_info(request)
@@ -2858,9 +2876,16 @@ async def ytdlp_metadata(request: YtDlpMetadataRequest):
         try:
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60.0)
         except asyncio.TimeoutError:
-            proc.kill()
-            await proc.communicate()
             raise HTTPException(status_code=504, detail="yt-dlp timed out")
+        finally:
+            # Covers the timeout and request cancellation alike: never leave the
+            # child running after this handler stops waiting on it.
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+                await asyncio.shield(proc.wait())
 
         stdout_text = stdout.decode("utf-8", errors="replace").strip()
         stderr_text = stderr.decode("utf-8", errors="replace").strip()
@@ -2921,7 +2946,19 @@ async def health_check():
         }
     except Exception as e:
         logger.error(f"Error in health check: {e}")
-        return {"status": "error", "error": str(e)}, 500
+        return JSONResponse(
+            status_code=500, content={"status": "error", "error": str(e)}
+        )
+
+
+@app.get("/health/live")
+async def liveness_check():
+    """Unauthenticated liveness probe for container healthchecks.
+
+    Reports only that the process is serving requests; detailed status stays
+    behind /health so it never needs a token in the probe command.
+    """
+    return {"status": "ok"}
 
 
 class TestConnectionRequest(BaseModel):
@@ -3057,15 +3094,17 @@ async def test_webhook(
         )
 
         # Find webhook and send test
-        webhook_found = False
-        for webhook in event_manager.webhooks:
-            if str(webhook.url) == webhook_url:
-                webhook_found = True
-                await event_manager._send_webhook(webhook, test_event)
-                break
-
-        if not webhook_found:
+        webhook = next(
+            (w for w in event_manager.webhooks if str(w.url) == webhook_url), None
+        )
+        if webhook is None:
             raise HTTPException(status_code=404, detail="Webhook not found")
+
+        if not await event_manager._send_webhook(webhook, test_event):
+            raise HTTPException(
+                status_code=502,
+                detail=f"Test event delivery failed after {webhook.retry_attempts + 1} attempt(s)",
+            )
 
         return {
             "message": f"Test event sent to {webhook_url}",

@@ -91,7 +91,7 @@ services:
       - CLEANUP_INTERVAL=60
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8085/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8085/health/live"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -189,6 +189,8 @@ GET /stats
 ```bash
 GET /health
 ```
+
+Requires the API token when `API_TOKEN` is set. For container healthchecks use the unauthenticated `GET /health/live` liveness probe, so the token never appears in the probe command or access logs.
 
 #### Client Information
 ```bash
@@ -564,6 +566,7 @@ python demo_events.py
 ├── Dockerfile               # Container build definition
 ├── main.py                  # Server entry point (uvloop support)
 ├── requirements.txt         # Python dependencies
+├── requirements-dev.txt     # Test dependencies
 ├── pytest.ini               # Test configuration
 └── README.md                # This file
 ```

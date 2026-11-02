@@ -51,7 +51,7 @@ When authentication is enabled, the following endpoints require the `X-API-Token
 - `GET /clients` - List all clients
 
 ### Health & Monitoring
-- `GET /health` - Health check endpoint
+- `GET /health` - Health check endpoint (returns HTTP 500 when status cannot be collected)
 
 ### Webhook Management
 - `POST /webhooks` - Add a webhook
@@ -71,12 +71,13 @@ The following endpoints do **NOT** require authentication, as they are used by m
 - `GET /dash/{stream_id}/manifest.mpd` - Get DASH manifest
 - `GET /dash/{stream_id}/segment/...` and `GET /dash/{stream_id}/file` - Get DASH segment
 - `GET /stream/{stream_id}` - Stream direct content
+- `GET /health/live` - Liveness probe for container healthchecks (returns only `{"status": "ok"}`)
 
-Playlists and manifests are served for streams created through the protected API. When the proxy rewrites them, it adds an HMAC signature to every upstream URL (`&sig=` on HLS and DASH file URLs, inside the path for DASH segment bases). The segment and file endpoints reject any URL without a valid signature, so they can't be used to fetch arbitrary URLs. Local files are only served from transcoder output directories (`HLS_TEMP_DIR/m3u_proxy_hls_*`).
+Playlists and manifests are served for streams created through the protected API. When the proxy rewrites them, it adds an HMAC signature to every upstream URL (`&sig=` on HLS and DASH file URLs, inside the path for DASH segment bases). The segment and file endpoints reject any URL without a valid signature, so they can't be used to fetch arbitrary URLs. Each signature is also bound to the stream that issued it and to its route type (HLS segment, HLS variant playlist, DASH file, DASH base), so a link from one stream's playlist is rejected under another stream's route and can never be fetched with that stream's upstream headers. Local files are only served from transcoder output directories (`HLS_TEMP_DIR/m3u_proxy_hls_*`).
 
-The signing key is derived from `API_TOKEN` (PBKDF2), so every worker sharing a token accepts each other's URLs. Signed URLs are visible to anyone who can load a playlist, so use a long random token (for example `openssl rand -hex 24`) rather than a memorable password. Without a token, a random key is generated at startup, and rewritten URLs stop working after a restart (players pick up new ones on their next playlist refresh).
+The signing key is derived from `API_TOKEN` (PBKDF2), so every worker sharing a token accepts each other's URLs. Signed URLs are visible to anyone who can load a playlist, so use a long random token (for example `openssl rand -hex 24`) rather than a memorable password. Without a token, a random key is generated at startup, and rewritten URLs stop working after a restart (players pick up new ones on their next playlist refresh). Rewritten URLs issued before upgrading to stream-bound signatures also stop working, and players pick up new ones on their next playlist refresh in the same way.
 
-The `?url=` parameter on the playlist, manifest and stream endpoints creates a stream for that URL. It only accepts a signed URL (variant playlists the proxy rewrote) or a request that passes the API token check above.
+The `?url=` parameter on the playlist, manifest and stream endpoints creates a stream for that URL. It only accepts a signed URL (a variant playlist link the proxy rewrote, on the same stream's route with the same `parent`) or a request that passes the API token check above.
 
 ## Usage Examples
 

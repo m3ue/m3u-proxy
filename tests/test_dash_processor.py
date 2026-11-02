@@ -1,5 +1,5 @@
 from stream_manager import DashProcessor
-from url_signing import sign_url
+from url_signing import ROLE_DASH_FILE, sign_url
 import logging
 
 import sys
@@ -85,7 +85,9 @@ MPD_MULTI_PERIOD = """<?xml version="1.0" encoding="UTF-8"?>
 
 class TestDashProcessorBaseUrlRewriting:
     def test_relative_baseurl_is_rewritten_and_resolved_against_manifest_base(self):
-        processor = DashProcessor("http://proxy.com/dash/stream123", "cid-1")
+        processor = DashProcessor(
+            "http://proxy.com/dash/stream123", "cid-1", stream_id="stream123"
+        )
 
         result = processor.process_manifest(
             MPD_WITH_RELATIVE_BASEURL,
@@ -101,7 +103,7 @@ class TestDashProcessorBaseUrlRewriting:
 
         token = result.split("/segment/cid-1/", 1)[1].split("/", 1)[0]
         assert (
-            DashProcessor.verify_base(token)
+            DashProcessor.verify_base(token, "stream123")
             == "https://upstream.example.com/live/dash/"
         )
 
@@ -111,7 +113,9 @@ class TestDashProcessorBaseUrlRewriting:
         assert "init-$RepresentationID$.m4s" in result
 
     def test_missing_baseurl_gets_one_injected(self):
-        processor = DashProcessor("http://proxy.com/dash/stream123", "cid-1")
+        processor = DashProcessor(
+            "http://proxy.com/dash/stream123", "cid-1", stream_id="stream123"
+        )
 
         result = processor.process_manifest(
             MPD_WITHOUT_BASEURL,
@@ -121,10 +125,15 @@ class TestDashProcessorBaseUrlRewriting:
 
         assert "<BaseURL>http://proxy.com/dash/stream123/segment/cid-1/" in result
         token = result.split("/segment/cid-1/", 1)[1].split("/", 1)[0]
-        assert DashProcessor.verify_base(token) == "https://upstream.example.com/live/"
+        assert (
+            DashProcessor.verify_base(token, "stream123")
+            == "https://upstream.example.com/live/"
+        )
 
     def test_multi_period_rewrites_each_period_baseurl_independently(self):
-        processor = DashProcessor("http://proxy.com/dash/stream123", "cid-1")
+        processor = DashProcessor(
+            "http://proxy.com/dash/stream123", "cid-1", stream_id="stream123"
+        )
 
         result = processor.process_manifest(
             MPD_MULTI_PERIOD,
@@ -133,7 +142,7 @@ class TestDashProcessorBaseUrlRewriting:
         )
 
         bases = [
-            DashProcessor.verify_base(chunk.split("/", 1)[0])
+            DashProcessor.verify_base(chunk.split("/", 1)[0], "stream123")
             for chunk in result.split("http://proxy.com/dash/stream123/segment/cid-1/")[
                 1:
             ]
@@ -270,7 +279,9 @@ class TestDashSegmentRoutes:
     def test_segment_route_registers_path_client_and_proxies(self):
         client, mock, patcher = self._make()
         try:
-            enc = DashProcessor.sign_base("https://upstream.example.com/live/dash/")
+            enc = DashProcessor.sign_base(
+                "https://upstream.example.com/live/dash/", "stream123"
+            )
             resp = client.get(f"/dash/stream123/segment/tab-B/{enc}/chunk-1.m4s")
 
             assert resp.status_code == 200
@@ -286,7 +297,9 @@ class TestDashSegmentRoutes:
     def test_pooled_viewers_are_billed_separately_by_their_path_client_id(self):
         client, mock, patcher = self._make()
         try:
-            enc = DashProcessor.sign_base("https://upstream.example.com/live/")
+            enc = DashProcessor.sign_base(
+                "https://upstream.example.com/live/", "stream123"
+            )
             client.get(f"/dash/stream123/segment/tab-A/{enc}/s.m4s")
             billed_a = mock.proxy_dash_segment.call_args.args[1]
             client.get(f"/dash/stream123/segment/tab-B/{enc}/s.m4s")
@@ -304,7 +317,11 @@ class TestDashSegmentRoutes:
                 params={
                     "client_id": "tab-777",
                     "url": "https://upstream.example.com/video/seg1.m4s",
-                    "sig": sign_url("https://upstream.example.com/video/seg1.m4s"),
+                    "sig": sign_url(
+                        "https://upstream.example.com/video/seg1.m4s",
+                        stream_id="stream123",
+                        role=ROLE_DASH_FILE,
+                    ),
                 },
             )
 

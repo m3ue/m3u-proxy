@@ -26,7 +26,14 @@ from config import settings
 from redis_config import shares_listener_with_workers
 from ts_overlap import OverlapTrimmer, TRIM_MATCHED, TRIM_NO_MATCH
 from ts_canonicalizer import TSCanonicalizer, TSCanonicalizationError
-from url_signing import sign_url, verify_url
+from url_signing import (
+    ROLE_DASH_BASE,
+    ROLE_DASH_FILE,
+    ROLE_HLS_SEGMENT,
+    hls_playlist_role,
+    sign_url,
+    verify_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -197,12 +204,15 @@ class M3U8Processor:
         user_agent: Optional[str] = None,
         original_url: Optional[str] = None,
         parent_stream_id: Optional[str] = None,
+        stream_id: str = "",
     ):
         self.base_url = base_url
         self.client_id = client_id
         self.user_agent = user_agent or settings.DEFAULT_USER_AGENT
         self.original_url = original_url or base_url
         self.parent_stream_id = parent_stream_id
+        # The stream whose route serves the rewritten links; signatures are bound to it
+        self.stream_id = stream_id
 
     def process_playlist(
         self, content: str, base_proxy_url: str, original_base_url: Optional[str] = None
@@ -282,17 +292,24 @@ class M3U8Processor:
     def _rewrite_url(self, original_url: str, base_proxy_url: str) -> str:
         """Rewrites a URL to point to the proxy, encoding and signing the original URL."""
         encoded_url = quote(original_url, safe="")
-        signature = sign_url(original_url)
         # Check path only — strip query params to handle URLs like *.m3u8?location=ABC123
         path = original_url.split("?", 1)[0].lower()
         if path.endswith(".m3u8"):
             # For variant playlists, include parent stream ID
+            signature = sign_url(
+                original_url,
+                stream_id=self.stream_id,
+                role=hls_playlist_role(self.parent_stream_id),
+            )
             parent_param = (
                 f"&parent={self.parent_stream_id}" if self.parent_stream_id else ""
             )
             return f"{base_proxy_url}/playlist.m3u8?url={encoded_url}&client_id={self.client_id}{parent_param}&sig={signature}"
 
         kind = self._segment_kind(original_url)
+        signature = sign_url(
+            original_url, stream_id=self.stream_id, role=ROLE_HLS_SEGMENT
+        )
         return f"{base_proxy_url}/segment.{kind}?url={encoded_url}&client_id={self.client_id}&sig={signature}"
 
 
@@ -316,12 +333,15 @@ class DashProcessor:
         client_id: str,
         user_agent: Optional[str] = None,
         original_url: Optional[str] = None,
+        stream_id: str = "",
     ):
         self.base_url = base_url
         self.client_id = client_id
         self.user_agent = user_agent or settings.DEFAULT_USER_AGENT
         self.original_url = original_url or base_url
         self.is_encrypted = False
+        # The stream whose route serves the rewritten links; signatures are bound to it
+        self.stream_id = stream_id
 
     @staticmethod
     def encode_base(absolute_base_url: str) -> str:
@@ -335,14 +355,17 @@ class DashProcessor:
         return base64.urlsafe_b64decode(padded.encode()).decode()
 
     @staticmethod
-    def sign_base(absolute_base_url: str) -> str:
+    def sign_base(absolute_base_url: str, stream_id: str) -> str:
         """Encode an upstream directory URL plus its signature as one path segment
         (`{encoded}.{signature}`; '.' never appears in URL-safe base64)."""
         encoded = DashProcessor.encode_base(absolute_base_url)
-        return f"{encoded}.{sign_url(absolute_base_url)}"
+        signature = sign_url(
+            absolute_base_url, stream_id=stream_id, role=ROLE_DASH_BASE
+        )
+        return f"{encoded}.{signature}"
 
     @staticmethod
-    def verify_base(token: str) -> Optional[str]:
+    def verify_base(token: str, stream_id: str) -> Optional[str]:
         """Reverse of sign_base. Returns the upstream base URL, or None when the
         token is malformed or its signature does not match."""
         encoded, _, signature = token.partition(".")
@@ -350,7 +373,11 @@ class DashProcessor:
             absolute_base_url = DashProcessor.decode_base(encoded)
         except ValueError:
             return None
-        return absolute_base_url if verify_url(absolute_base_url, signature) else None
+        if not verify_url(
+            absolute_base_url, signature, stream_id=stream_id, role=ROLE_DASH_BASE
+        ):
+            return None
+        return absolute_base_url
 
     def _rewrite_absolute_url(self, absolute_url: str, base_proxy_url: str) -> str:
         # Fully-qualified SegmentList <SegmentURL> entries are explicit URIs the
@@ -358,7 +385,10 @@ class DashProcessor:
         # is byte-for-byte the HLS rewrite (M3U8Processor._rewrite_url):
         # ?url=<encoded>&client_id=<id>&sig=<signature>.
         encoded_url = quote(absolute_url, safe="")
-        return f"{base_proxy_url}/file?url={encoded_url}&client_id={self.client_id}&sig={sign_url(absolute_url)}"
+        signature = sign_url(
+            absolute_url, stream_id=self.stream_id, role=ROLE_DASH_FILE
+        )
+        return f"{base_proxy_url}/file?url={encoded_url}&client_id={self.client_id}&sig={signature}"
 
     def _rewrite_base(self, absolute_base_url: str, base_proxy_url: str) -> str:
         # The ONE place DASH cannot match HLS: SegmentTemplate entries are
@@ -367,7 +397,7 @@ class DashProcessor:
         # string - so client_id cannot ride in the query the way it does on an
         # HLS segment line. It goes in the path instead (a path segment is
         # always preserved), so every resolved segment URL still carries it.
-        return f"{base_proxy_url}/segment/{quote(self.client_id, safe='')}/{self.sign_base(absolute_base_url)}/"
+        return f"{base_proxy_url}/segment/{quote(self.client_id, safe='')}/{self.sign_base(absolute_base_url, self.stream_id)}/"
 
     def process_manifest(
         self, content: str, base_proxy_url: str, original_base_url: Optional[str] = None
@@ -934,10 +964,13 @@ class StreamManager:
             # Detect stream type
             is_hls, is_vod, is_live_continuous = self._detect_stream_type(stream_url)
 
-            # If this is a variant stream, inherit user agent from parent
+            # If this is a variant stream, inherit user agent and source headers
+            # from the parent - an authenticated master needs them on its variants.
             is_variant = parent_stream_id is not None
             if is_variant and parent_stream_id in self.streams:
                 user_agent = self.streams[parent_stream_id].user_agent
+                if not headers:
+                    headers = dict(self.streams[parent_stream_id].headers)
 
             # Determine use_sticky_session: use parameter if provided, otherwise use global config
             effective_use_sticky_session = (
@@ -4857,7 +4890,13 @@ class StreamManager:
         # We need to fetch the NEW master playlist and extract the corresponding variant
         if stream_info.is_variant_stream and stream_info.parent_stream_id:
             parent_info = self.streams.get(stream_info.parent_stream_id)
-            if parent_info and parent_info.current_url != parent_info.original_url:
+            # Sticky sessions also move current_url (to the redirect target), so
+            # require a real failover before swapping the variant for the master.
+            if (
+                parent_info
+                and parent_info.failover_attempts > 0
+                and parent_info.current_url != parent_info.original_url
+            ):
                 logger.info(
                     f"Variant stream {stream_id} is stale after parent failover - "
                     f"using parent's current URL: {parent_info.current_url}"
@@ -5083,6 +5122,7 @@ class StreamManager:
                             stream_info.user_agent,
                             final_url,
                             parent_stream_id=parent_id,
+                            stream_id=stream_id,
                         )
                         processed_content = processor.process_playlist(
                             playlist_text, base_proxy_url, base_url
@@ -5174,6 +5214,7 @@ class StreamManager:
                     stream_info.user_agent,
                     final_url,
                     parent_stream_id=parent_id,
+                    stream_id=stream_id,
                 )
                 processed_content = processor.process_playlist(
                     content, base_proxy_url, base_url
@@ -5301,6 +5342,7 @@ class StreamManager:
                     client_id,
                     stream_info.user_agent,
                     final_url,
+                    stream_id=stream_id,
                 )
                 processed_content = processor.process_manifest(
                     content, base_proxy_url, base_url
@@ -5419,6 +5461,14 @@ class StreamManager:
                     logger.warning(
                         f"Error fetching DASH segment (attempt {retry_count + 1}/{max_retries + 1}): {e}"
                     )
+                    # Bytes already sent cannot be retracted, so restarting the
+                    # request would splice a second copy into this body. End the
+                    # response instead and let the player re-request the segment.
+                    if bytes_served > 0:
+                        logger.warning(
+                            f"DASH segment failed after {bytes_served} bytes for stream {stream_id}; not retrying a partially delivered segment"
+                        )
+                        raise
                     if isinstance(e, httpx.HTTPStatusError) and stream_info:
                         stream_info.last_error_status_code = e.response.status_code
 
@@ -5581,6 +5631,14 @@ class StreamManager:
                     logger.warning(
                         f"Error fetching HLS segment (attempt {retry_count + 1}/{max_retries + 1}): {e}"
                     )
+                    # Bytes already sent cannot be retracted, so restarting the
+                    # request would splice a second copy into this body. End the
+                    # response instead and let the player re-request the segment.
+                    if bytes_served > 0:
+                        logger.warning(
+                            f"HLS segment failed after {bytes_served} bytes for stream {stream_id}; not retrying a partially delivered segment"
+                        )
+                        raise
 
                     # Capture HTTP status code for failover resolver context
                     if isinstance(e, httpx.HTTPStatusError) and stream_info:

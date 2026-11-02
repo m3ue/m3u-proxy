@@ -101,8 +101,8 @@ class EventManager:
             # Wait for all webhooks to complete
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _send_webhook(self, webhook: WebhookConfig, event: StreamEvent):
-        """Send event to a single webhook."""
+    async def _send_webhook(self, webhook: WebhookConfig, event: StreamEvent) -> bool:
+        """Send event to a single webhook. Returns True once an attempt succeeds."""
         payload = {
             "event_id": event.event_id,
             "event_type": event.event_type,
@@ -125,7 +125,7 @@ class EventManager:
                     )
                     if response.status_code < 400:
                         logger.debug(f"Webhook sent successfully to {webhook.url}")
-                        return
+                        return True
                     else:
                         logger.warning(
                             f"Webhook failed with status {response.status_code}: {webhook.url}"
@@ -141,3 +141,4 @@ class EventManager:
                 await asyncio.sleep(2**attempt)  # Exponential backoff
 
         logger.error(f"All webhook attempts failed for {webhook.url}")
+        return False

@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from fastapi.testclient import TestClient
 import api
-from url_signing import sign_url
+from url_signing import ROLE_HLS_SEGMENT, sign_url
 
 
 def test_transcode_hls_segment_serving(monkeypatch):
@@ -102,7 +102,7 @@ segment1.ts
         params={
             "client_id": "test_client",
             "url": file_url,
-            "sig": sign_url(file_url),
+            "sig": sign_url(file_url, stream_id=stream_id, role=ROLE_HLS_SEGMENT),
         },
     )
     assert seg_resp.status_code == 200, seg_resp.text

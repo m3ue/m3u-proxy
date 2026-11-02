@@ -1,0 +1,5 @@
+# Test-only dependencies; the runtime image installs requirements.txt alone.
+-r requirements.txt
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+pytest-httpx>=0.22.0,<0.35.0
