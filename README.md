@@ -98,6 +98,21 @@ services:
       start_period: 10s
 ```
 
+## Source metadata probes
+
+`HEAD /stream/{stream_id}` uses the stream's configured source headers and user
+agent. Explicit source headers override defaults (case-insensitively), and the
+player's `Range` overrides a configured source range. Upstream 200/206 metadata
+and error statuses such as 401/403/404/416 are preserved. If the source omits a
+length, the proxy omits `Content-Length` rather than claiming an empty file.
+Sources rejecting HEAD with 405/501 retain a basic 200 response with unknown
+length; the proxy does not open a fallback GET. Network failures return 502.
+Strict live TS mode retains its local, no-upstream HEAD shortcut.
+
+Periodic health checks use the same configured source headers and user agent:
+GET for HLS playlists, HEAD for other streams. Source errors and network failures
+remain unhealthy; redirect handling is unchanged.
+
 ## Building from source
 
 ### 1. Clone Repo & Install Dependencies
