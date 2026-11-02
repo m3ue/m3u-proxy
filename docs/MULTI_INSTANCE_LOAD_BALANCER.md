@@ -97,7 +97,7 @@ services:
       - redis
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:8085/health?api_token=${API_TOKEN}"]
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8085/health/live"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -114,7 +114,7 @@ services:
       - redis
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:8085/health?api_token=${API_TOKEN}"]
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8085/health/live"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -131,7 +131,7 @@ services:
       - redis
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://127.0.0.1:8085/health?api_token=${API_TOKEN}"]
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8085/health/live"]
       interval: 30s
       timeout: 10s
       retries: 3

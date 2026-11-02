@@ -934,10 +934,13 @@ class StreamManager:
             # Detect stream type
             is_hls, is_vod, is_live_continuous = self._detect_stream_type(stream_url)
 
-            # If this is a variant stream, inherit user agent from parent
+            # If this is a variant stream, inherit user agent and source headers
+            # from the parent - an authenticated master needs them on its variants.
             is_variant = parent_stream_id is not None
             if is_variant and parent_stream_id in self.streams:
                 user_agent = self.streams[parent_stream_id].user_agent
+                if not headers:
+                    headers = dict(self.streams[parent_stream_id].headers)
 
             # Determine use_sticky_session: use parameter if provided, otherwise use global config
             effective_use_sticky_session = (
@@ -4857,7 +4860,13 @@ class StreamManager:
         # We need to fetch the NEW master playlist and extract the corresponding variant
         if stream_info.is_variant_stream and stream_info.parent_stream_id:
             parent_info = self.streams.get(stream_info.parent_stream_id)
-            if parent_info and parent_info.current_url != parent_info.original_url:
+            # Sticky sessions also move current_url (to the redirect target), so
+            # require a real failover before swapping the variant for the master.
+            if (
+                parent_info
+                and parent_info.failover_attempts > 0
+                and parent_info.current_url != parent_info.original_url
+            ):
                 logger.info(
                     f"Variant stream {stream_id} is stale after parent failover - "
                     f"using parent's current URL: {parent_info.current_url}"
@@ -5419,6 +5428,14 @@ class StreamManager:
                     logger.warning(
                         f"Error fetching DASH segment (attempt {retry_count + 1}/{max_retries + 1}): {e}"
                     )
+                    # Bytes already sent cannot be retracted, so restarting the
+                    # request would splice a second copy into this body. End the
+                    # response instead and let the player re-request the segment.
+                    if bytes_served > 0:
+                        logger.warning(
+                            f"DASH segment failed after {bytes_served} bytes for stream {stream_id}; not retrying a partially delivered segment"
+                        )
+                        raise
                     if isinstance(e, httpx.HTTPStatusError) and stream_info:
                         stream_info.last_error_status_code = e.response.status_code
 
@@ -5581,6 +5598,14 @@ class StreamManager:
                     logger.warning(
                         f"Error fetching HLS segment (attempt {retry_count + 1}/{max_retries + 1}): {e}"
                     )
+                    # Bytes already sent cannot be retracted, so restarting the
+                    # request would splice a second copy into this body. End the
+                    # response instead and let the player re-request the segment.
+                    if bytes_served > 0:
+                        logger.warning(
+                            f"HLS segment failed after {bytes_served} bytes for stream {stream_id}; not retrying a partially delivered segment"
+                        )
+                        raise
 
                     # Capture HTTP status code for failover resolver context
                     if isinstance(e, httpx.HTTPStatusError) and stream_info:

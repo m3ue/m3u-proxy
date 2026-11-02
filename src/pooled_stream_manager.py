@@ -528,10 +528,21 @@ class SharedTranscodingProcess:
             # Signal all clients that the stream has ended
             async with self._broadcaster_lock:
                 for queue in self.client_queues.values():
-                    try:
-                        queue.put_nowait(None)  # None signals end of stream
-                    except Exception:
-                        pass
+                    self._put_end_marker(queue)
+
+    @staticmethod
+    def _put_end_marker(queue: asyncio.Queue) -> None:
+        """Queue the None end-of-stream marker, dropping the oldest chunk if the
+        queue is full - same policy as live chunks - so a slow reader still sees
+        the end instead of waiting forever after FFmpeg exits."""
+        try:
+            queue.put_nowait(None)
+        except asyncio.QueueFull:
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            queue.put_nowait(None)
 
     async def _hls_watch_loop(self):
         """Watch HLS output directory and update last_chunk_time when new segments appear"""
@@ -812,10 +823,7 @@ class SharedTranscodingProcess:
             # Remove client's queue, sending None sentinel first so the
             # streaming generator exits its wait loop promptly.
             if client_id in self.client_queues:
-                try:
-                    self.client_queues[client_id].put_nowait(None)
-                except Exception:
-                    pass
+                self._put_end_marker(self.client_queues[client_id])
                 del self.client_queues[client_id]
 
     async def prune_stale_clients(self, timeout: int):

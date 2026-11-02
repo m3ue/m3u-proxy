@@ -8,7 +8,7 @@ import logging
 import re
 
 _URL_RE = re.compile(
-    r'(?:https?|rtmps?|ftps?|hls)://[^\s"\'<>\[\]{}\|\\^`]+',
+    r'(?:https?|rtmps?|ftps?|hls|rediss?)://[^\s"\'<>\[\]{}\|\\^`]+',
     re.IGNORECASE,
 )
 # Matches key=value, key: value, key='value', key="value".
@@ -23,7 +23,7 @@ _USER_RE = re.compile(
 # query-string form (`key=value`, e.g. Emby/Jellyfin's api_key) for both.
 # Group 1: keyword, group 2: separator + optional quote, group 3: quote, group 4: value.
 _TOKEN_RE = re.compile(
-    r"""(?i)\b(x-plex-token|x-emby-token|x-mediabrowser-token|api[_-]?key|access[_-]?token)(\s*[:=]\s*)(['"']?)([^&\s"'<>#,\)\]]+)\3""",
+    r"""(?i)\b(x-plex-token|x-emby-token|x-mediabrowser-token|api[_-]?key|api[_-]?token|access[_-]?token)(\s*[:=]\s*)(['"']?)([^&\s"'<>#,\)\]]+)\3""",
 )
 # Authorization-style headers carry more than a single bare token — a scheme prefix
 # + token separated by a space (`Bearer <token>`, `Basic <base64>`), or Emby's
@@ -32,7 +32,7 @@ _TOKEN_RE = re.compile(
 # and leave the actual credential exposed, so this redacts the entire header value
 # (everything after the colon up to end-of-line) instead of trying to parse it.
 _AUTH_HEADER_RE = re.compile(
-    r"""(?i)\b(authorization|x-emby-authorization)\s*:\s*[^\r\n]+""",
+    r"""(?i)\b(authorization|x-emby-authorization)\s*[:=]\s*[^\r\n]+""",
 )
 # UUIDs are resource identifiers that can be used to probe APIs
 _UUID_RE = re.compile(
@@ -72,4 +72,10 @@ class AnonymizingFilter(logging.Filter):
         # Store the scrubbed result back and clear args to avoid double-formatting.
         record.msg = _scrub(record.getMessage())
         record.args = None
+        # Tracebacks are rendered after filters run, so pre-render and scrub them;
+        # Formatter.format() reuses a populated exc_text instead of re-rendering.
+        if record.exc_info and not record.exc_text:
+            record.exc_text = _scrub(
+                logging.Formatter().formatException(record.exc_info)
+            )
         return True

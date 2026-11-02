@@ -15,7 +15,8 @@ m3u-proxy/
 │       └── test_integration.py  # End-to-end tests
 ├── pytest.ini                   # pytest configuration
 ├── run_tests.py                 # Test runner script
-└── requirements.txt             # includes testing dependencies
+├── requirements.txt             # runtime dependencies (installed in the image)
+└── requirements-dev.txt         # runtime + testing dependencies
 ```
 
 ## Testing Frameworks Used
@@ -174,7 +175,7 @@ jobs:
         python-version: 3.9
     - name: Install dependencies
       run: |
-        pip install -r requirements.txt
+        pip install -r requirements-dev.txt
     - name: Run tests
       run: python run_tests.py --coverage
 ```

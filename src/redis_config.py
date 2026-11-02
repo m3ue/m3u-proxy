@@ -4,6 +4,7 @@ Configuration for Redis pooling and multi-worker coordination.
 
 import multiprocessing
 import os
+from urllib.parse import quote
 from config import settings
 
 
@@ -14,11 +15,14 @@ def get_redis_config() -> dict:
     # Use REDIS_PASSWORD if set, otherwise fall back to API_TOKEN (same as M3U_PROXY_TOKEN)
     # This ensures both m3u-editor and m3u-proxy use the same password
     redis_password = settings.REDIS_PASSWORD or settings.API_TOKEN
+    # The password is percent-encoded for the URL userinfo so reserved characters
+    # (/ # % @ :) survive redis-py's parse_url() unchanged. An explicit REDIS_URL
+    # is used as-is.
 
     if redis_password:
         redis_url = os.getenv(
             "REDIS_URL",
-            f"redis://:{redis_password}@{settings.REDIS_HOST}:{settings.REDIS_SERVER_PORT}/{settings.REDIS_DB}",
+            f"redis://:{quote(redis_password, safe='')}@{settings.REDIS_HOST}:{settings.REDIS_SERVER_PORT}/{settings.REDIS_DB}",
         )
     else:
         redis_url = os.getenv(
