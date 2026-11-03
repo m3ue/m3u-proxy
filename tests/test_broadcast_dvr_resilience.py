@@ -13,6 +13,7 @@ segments (which broadcast GC then deleted as orphans). DVR captures now:
 - terminate a capture that stalls without exiting so it gets restarted too.
 """
 
+import shutil
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -46,6 +47,11 @@ def _fake_process(returncode=None):
     process.wait = AsyncMock(return_value=returncode)
     process.stderr = None
     return process
+
+
+def _listed_in_order(tmp_path):
+    lines = (tmp_path / "live.m3u8").read_text().splitlines()
+    return [ln.strip() for ln in lines if ln.strip() and not ln.startswith("#")]
 
 
 def _write_playlist(tmp_path, segments):
@@ -261,3 +267,175 @@ async def test_manager_restart_of_dvr_recording_resumes_instead_of_transitioning
     assert config.segment_start_number == 0
     assert config.add_discontinuity is False
     existing.cleanup_orphaned_segments.assert_not_called()
+
+
+# --- Hung-input recovery (FFmpeg blocked in a network read) -------------------
+#
+# Reproduced against FFmpeg 8.1: an FFmpeg blocked reading a silent input ignores
+# the first SIGTERM; a second SIGTERM makes it abort its final playlist write and
+# still rename the empty temp file over live.m3u8. The restart then found no
+# listed segments, started a new playlist, and the recording kept only what came
+# after the outage. The watchdog now escalates to SIGKILL (which leaves the last
+# written playlist intact), and a restart restores the last good playlist copy if
+# live.m3u8 was truncated anyway.
+
+
+def test_stalled_capture_gets_one_sigterm_then_sigkill(tmp_path):
+    proc = _make_process(tmp_path)
+    proc.process = _fake_process()
+    proc._last_segment_at = time.monotonic() - 31
+
+    proc._terminate_if_stalled()
+    proc.process.terminate.assert_called_once()
+    proc.process.kill.assert_not_called()
+
+    # Still hung well past another stall timeout: never a second SIGTERM.
+    proc._last_segment_at = time.monotonic() - 120
+    proc._stall_term_sent_at = time.monotonic() - 1
+    proc._terminate_if_stalled()
+    proc.process.terminate.assert_called_once()
+    proc.process.kill.assert_not_called()
+
+    proc._stall_term_sent_at = (
+        time.monotonic() - NetworkBroadcastProcess._DVR_STALL_KILL_GRACE_SECONDS - 1
+    )
+    proc._terminate_if_stalled()
+    proc.process.terminate.assert_called_once()
+    proc.process.kill.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_new_segment_clears_the_pending_sigterm(tmp_path):
+    proc = _make_process(tmp_path)
+    proc._stall_term_sent_at = time.monotonic() - 3
+    (tmp_path / "live000004.ts").write_bytes(b"x")
+
+    async def stop_after_one_poll(_interval):
+        proc._stopping = True
+
+    with patch("src.broadcast_manager.asyncio.sleep", stop_after_one_poll):
+        await proc._poll_bytes()
+
+    assert proc._stall_term_sent_at is None
+
+
+def test_playlist_snapshot_follows_growth_but_never_shrinks(tmp_path):
+    proc = _make_process(tmp_path)
+    snapshot = tmp_path / NetworkBroadcastProcess._DVR_PLAYLIST_SNAPSHOT
+
+    _write_playlist(tmp_path, ["live000000.ts", "live000001.ts", "live000002.ts"])
+    proc._snapshot_dvr_playlist()
+    assert len(proc.parse_playlist_segments(str(snapshot))) == 3
+
+    (tmp_path / "live.m3u8").write_text("")  # truncated by a dying FFmpeg
+    proc._snapshot_dvr_playlist()
+    assert len(proc.parse_playlist_segments(str(snapshot))) == 3
+
+
+@pytest.mark.asyncio
+async def test_restart_after_truncated_playlist_continues_the_recording(tmp_path):
+    segments = [f"live{n:06d}.ts" for n in range(16)]
+    _write_playlist(tmp_path, segments)
+    proc = _make_process(tmp_path)
+    proc._snapshot_dvr_playlist()
+    (tmp_path / "live.m3u8").write_text("")  # what the second SIGTERM left behind
+    (tmp_path / "live000016.ts").write_bytes(b"")  # the aborted in-flight segment
+
+    proc.process = _fake_process(returncode=255)
+    proc._deadline = time.monotonic() + 600
+    proc._stall_term_sent_at = time.monotonic() - 11
+
+    with (
+        patch("src.broadcast_manager.asyncio.sleep", AsyncMock()),
+        patch(
+            "src.broadcast_manager.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=_fake_process()),
+        ) as spawn,
+        patch.object(proc, "_log_stderr", AsyncMock()),
+    ):
+        assert await proc._restart_dvr_capture()
+
+    assert proc.parse_playlist_segments(str(tmp_path / "live.m3u8")) == set(segments)
+    cmd = list(spawn.call_args.args)
+    # Listed segments -> append_list continues the same playlist (not a new one at 17).
+    assert cmd[cmd.index("-start_number") + 1] == "0"
+    assert proc._stall_term_sent_at is None
+
+
+@pytest.mark.asyncio
+async def test_restart_leaves_a_complete_playlist_alone(tmp_path):
+    _write_playlist(tmp_path, ["live000000.ts", "live000001.ts"])
+    proc = _make_process(tmp_path)
+    proc._snapshot_dvr_playlist()
+    _write_playlist(tmp_path, ["live000000.ts", "live000001.ts", "live000002.ts"])
+
+    proc._restore_dvr_playlist_if_truncated()
+
+    assert len(proc.parse_playlist_segments(str(tmp_path / "live.m3u8"))) == 3
+
+
+@pytest.mark.asyncio
+async def test_restore_compares_membership_not_just_the_count(tmp_path):
+    # The playlist lost its first segments but gained as many new ones: same count,
+    # different segments. The lost ones are restored and the new ones kept, in order.
+    _write_playlist(tmp_path, ["live000000.ts", "live000001.ts", "live000002.ts"])
+    proc = _make_process(tmp_path)
+    proc._snapshot_dvr_playlist()
+    _write_playlist(tmp_path, ["live000002.ts", "live000003.ts", "live000004.ts"])
+
+    proc._restore_dvr_playlist_if_truncated()
+
+    assert _listed_in_order(tmp_path) == [f"live{i:06d}.ts" for i in range(5)]
+
+
+@pytest.mark.asyncio
+async def test_restore_keeps_a_segment_written_after_the_truncation(tmp_path):
+    _write_playlist(tmp_path, ["live000000.ts", "live000001.ts", "live000002.ts"])
+    proc = _make_process(tmp_path)
+    proc._snapshot_dvr_playlist()
+    _write_playlist(tmp_path, ["live000003.ts"])  # truncated, then one more segment
+
+    proc._restore_dvr_playlist_if_truncated()
+
+    assert _listed_in_order(tmp_path) == [f"live{i:06d}.ts" for i in range(4)]
+
+
+def test_snapshot_ignores_a_playlist_replaced_while_being_copied(tmp_path):
+    # FFmpeg can replace live.m3u8 between reads; a copy that lost segments (or
+    # lists different ones) must never replace the previous snapshot.
+    proc = _make_process(tmp_path)
+    snapshot = tmp_path / NetworkBroadcastProcess._DVR_PLAYLIST_SNAPSHOT
+    _write_playlist(tmp_path, ["live000000.ts", "live000001.ts", "live000002.ts"])
+    proc._snapshot_dvr_playlist()
+
+    real_copy = shutil.copyfile
+
+    def copy_after_truncation(src, dst):
+        (tmp_path / "live.m3u8").write_text("#EXTM3U\n#EXTINF:6.0,\nlive000003.ts\n")
+        return real_copy(src, dst)
+
+    _write_playlist(tmp_path, [f"live{n:06d}.ts" for n in range(4)])
+    with patch("src.broadcast_manager.shutil.copyfile", copy_after_truncation):
+        proc._snapshot_dvr_playlist()
+
+    assert proc.parse_playlist_segments(str(snapshot)) == {
+        "live000000.ts",
+        "live000001.ts",
+        "live000002.ts",
+    }
+    assert not (tmp_path / (snapshot.name + ".tmp")).exists()
+
+
+def test_snapshot_requires_the_previous_segments_not_just_as_many(tmp_path):
+    proc = _make_process(tmp_path)
+    snapshot = tmp_path / NetworkBroadcastProcess._DVR_PLAYLIST_SNAPSHOT
+    _write_playlist(tmp_path, ["live000000.ts", "live000001.ts"])
+    proc._snapshot_dvr_playlist()
+    _write_playlist(tmp_path, ["live000005.ts", "live000006.ts", "live000007.ts"])
+
+    proc._snapshot_dvr_playlist()
+
+    assert proc.parse_playlist_segments(str(snapshot)) == {
+        "live000000.ts",
+        "live000001.ts",
+    }
