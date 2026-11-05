@@ -14,6 +14,7 @@ from pydantic import BaseModel, field_validator
 from datetime import datetime, timezone
 import os
 import platform
+import httpx
 
 from stream_manager import StreamManager, DashProcessor
 from events import EventManager
@@ -2000,10 +2001,13 @@ async def head_direct_stream(
 
         # For HEAD requests, we need to make a HEAD request to the origin server
         # to get metadata like Content-Length for MP4 files
-        headers = {
-            "User-Agent": stream_info.user_agent or "Mozilla/5.0 (compatible)",
-            "Accept": "*/*",
-        }
+        headers = httpx.Headers(
+            {
+                "User-Agent": stream_info.user_agent or "Mozilla/5.0 (compatible)",
+                "Accept": "*/*",
+            }
+        )
+        headers.update(stream_info.headers)
 
         # If this is a range request, add the Range header
         if range_header:
@@ -2018,8 +2022,6 @@ async def head_direct_stream(
             async with stream_manager.http_client.stream(
                 "HEAD", stream_url, headers=headers, follow_redirects=True
             ) as response:
-                response.raise_for_status()
-
                 # Build response headers based on origin server response
                 response_headers = {
                     "Content-Type": content_type,
@@ -2033,50 +2035,33 @@ async def head_direct_stream(
                     "Access-Control-Expose-Headers": "*",
                 }
 
-                # Determine status code
-                status_code = 200
-                if range_header and response.status_code == 206:
-                    status_code = 206
-                    # Forward range-related headers
-                    if "content-range" in response.headers:
-                        response_headers["Content-Range"] = response.headers[
-                            "content-range"
-                        ]
+                # Keep the metadata-only compatibility response for sources without HEAD.
+                head_unsupported = response.status_code in (405, 501)
+                status_code = 200 if head_unsupported else response.status_code
+                if not head_unsupported:
+                    for name in (
+                        "Content-Type",
+                        "Accept-Ranges",
+                        "Content-Length",
+                        "Content-Range",
+                        "Last-Modified",
+                    ):
+                        if name in response.headers:
+                            response_headers[name] = response.headers[name]
 
-                # Forward important headers from origin
-                if "content-length" in response.headers:
-                    response_headers["Content-Length"] = response.headers[
-                        "content-length"
-                    ]
-                    logger.info(
-                        f"Content-Length for {stream_id}: {response.headers['content-length']}"
-                    )
-
-                if "last-modified" in response.headers:
-                    response_headers["Last-Modified"] = response.headers[
-                        "last-modified"
-                    ]
-
-                return Response(
+                result = Response(
                     content=None, status_code=status_code, headers=response_headers
                 )
+                # Starlette otherwise adds Content-Length: 0 for the empty HEAD body.
+                if "Content-Length" not in response_headers:
+                    del result.headers["content-length"]
+                return result
 
-        except Exception as e:
+        except httpx.RequestError as e:
             logger.warning(f"HEAD request failed for {stream_url}: {e}")
-            # Return basic HEAD response even if origin HEAD fails
-            return Response(
-                content=None,
-                status_code=200,
-                headers={
-                    "Content-Type": content_type,
-                    "Accept-Ranges": "bytes",
-                    "Cache-Control": "no-cache, no-store, must-revalidate",
-                    "Access-Control-Allow-Origin": "*",
-                    "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
-                    "Access-Control-Allow-Headers": "*",
-                    "Access-Control-Expose-Headers": "*",
-                },
-            )
+            raise HTTPException(
+                status_code=502, detail="Upstream HEAD request failed"
+            ) from e
 
     except HTTPException:
         raise

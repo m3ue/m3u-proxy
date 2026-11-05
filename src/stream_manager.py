@@ -5755,7 +5755,8 @@ class StreamManager:
         current_url = stream_info.current_url or stream_info.original_url
 
         try:
-            headers = {"User-Agent": stream_info.user_agent}
+            headers = httpx.Headers({"User-Agent": stream_info.user_agent})
+            headers.update(stream_info.headers)
             if stream_info.is_hls:
                 response = await self.http_client.get(
                     current_url, headers=headers, timeout=10.0
