@@ -1,0 +1,91 @@
+name: Bug report
+description: Report a reproducible problem with m3u-proxy.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please report one problem per issue and provide enough detail to reproduce it.
+        This is a public issue. Redact passwords, API keys, tokens, private playlist/stream URLs, and personal information from all text and attachments.
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues for this problem.
+          required: true
+        - label: I removed sensitive information from my report and attachments.
+          required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Describe the bug
+      description: Explain which feature is affected, what fails, and how often it happens. Include the exact error message if one is shown.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: m3u-proxy version
+      description: Give the exact release version or commit and image tag. A moving tag such as latest or dev alone is not enough.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Deployment and environment
+      description: Include installation method, host OS/architecture, client/player and version, and m3u-editor version if used. For streaming/transcoding issues, include stream type (live/VOD, HLS/TS), FFmpeg version, and hardware acceleration if enabled.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      description: Provide numbered steps, the endpoint/client used, relevant settings, and a minimal example using synthetic or redacted data. Say whether it affects all streams or only some.
+      placeholder: |
+        1. Configure...
+        2. Request...
+        3. Play...
+        4. Observe...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: Describe the result you expected from those steps.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: Describe what happened instead, including any error message or HTTP status code.
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Paste a redacted proxy/container log excerpt in a fenced code block or attach a .log/.txt file from the time of the failure. Include FFmpeg output for transcoding failures and client errors if available. If logs are unavailable or empty, explain where you checked and why.
+    validations:
+      required: true
+  - type: textarea
+    id: screenshots
+    attributes:
+      label: Screenshots or recording
+      description: Drag and drop screenshots or a short recording showing the problem and relevant settings. For a non-visual/API problem, explain why screenshots are not applicable. Redact sensitive details first.
+    validations:
+      required: true
+  - type: textarea
+    id: configuration
+    attributes:
+      label: Relevant configuration
+      description: Paste only the relevant redacted Compose/service configuration or settings in a fenced code block. Do not upload your full .env or private stream URLs. If no configuration is relevant, explain why.
+    validations:
+      required: true
+  - type: textarea
+    id: context
+    attributes:
+      label: Additional context
+      description: Optional workarounds, when this last worked, or related issues.
