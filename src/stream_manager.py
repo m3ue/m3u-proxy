@@ -501,6 +501,26 @@ class ShieldedUpstreamReader:
                 self._pending = None
 
 
+def build_source_headers(stream_info: StreamInfo, url: str) -> httpx.Headers:
+    """Build the provider request headers for a direct stream.
+
+    Configured source headers override the defaults case-insensitively.
+    """
+    parsed_url = urlparse(url)
+    origin = f"{parsed_url.scheme}://{parsed_url.netloc}"
+    headers = httpx.Headers(
+        {
+            "User-Agent": stream_info.user_agent or settings.DEFAULT_USER_AGENT,
+            "Referer": f"{origin}/",
+            "Origin": origin,
+            "Accept": "*/*",
+            "Connection": "keep-alive",
+        }
+    )
+    headers.update(stream_info.headers)
+    return headers
+
+
 class StreamManager:
     def __init__(self, redis_url: Optional[str] = None, enable_pooling: bool = True):
         self.streams: Dict[str, StreamInfo] = {}
@@ -1737,14 +1757,7 @@ class StreamManager:
         self._direct_broadcast_queues[stream_id].pop(connection_id, None)
 
         active_url = stream_info.current_url or stream_info.original_url
-        headers = {
-            "User-Agent": stream_info.user_agent,
-            "Referer": f"{urlparse(active_url).scheme}://{urlparse(active_url).netloc}/",
-            "Origin": f"{urlparse(active_url).scheme}://{urlparse(active_url).netloc}",
-            "Accept": "*/*",
-            "Connection": "keep-alive",
-        }
-        headers.update(stream_info.headers)
+        headers = build_source_headers(stream_info, active_url)
 
         client_to_use = (
             self.live_stream_client
@@ -2416,14 +2429,7 @@ class StreamManager:
                             )
 
                         # Prepare headers
-                        headers = {
-                            "User-Agent": stream_info.user_agent,
-                            "Referer": f"{urlparse(active_url).scheme}://{urlparse(active_url).netloc}/",
-                            "Origin": f"{urlparse(active_url).scheme}://{urlparse(active_url).netloc}",
-                            "Accept": "*/*",
-                            "Connection": "keep-alive",
-                        }
-                        headers.update(stream_info.headers)
+                        headers = build_source_headers(stream_info, active_url)
 
                         # IMPORTANT: Do NOT send Range headers for live continuous streams
                         # Live IPTV streams (.ts) are infinite and don't support range requests
@@ -5755,14 +5761,18 @@ class StreamManager:
         current_url = stream_info.current_url or stream_info.original_url
 
         try:
-            headers = {"User-Agent": stream_info.user_agent}
             if stream_info.is_hls:
+                # Same headers as the playlist fetch in get_playlist_content
+                headers = {"User-Agent": stream_info.user_agent}
+                headers.update(stream_info.headers)
                 response = await self.http_client.get(
                     current_url, headers=headers, timeout=10.0
                 )
             else:
                 response = await self.http_client.head(
-                    current_url, headers=headers, timeout=10.0
+                    current_url,
+                    headers=build_source_headers(stream_info, current_url),
+                    timeout=10.0,
                 )
 
             response.raise_for_status()

@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 import os
 import platform
 
-from stream_manager import StreamManager, DashProcessor
+from stream_manager import StreamManager, DashProcessor, build_source_headers
 from events import EventManager
 from models import StreamEvent, EventType, WebhookConfig
 from config import settings, VERSION
@@ -2000,13 +2000,11 @@ async def head_direct_stream(
 
         # For HEAD requests, we need to make a HEAD request to the origin server
         # to get metadata like Content-Length for MP4 files
-        headers = {
-            "User-Agent": stream_info.user_agent or "Mozilla/5.0 (compatible)",
-            "Accept": "*/*",
-        }
+        headers = build_source_headers(stream_info, stream_url)
 
-        # If this is a range request, add the Range header
-        if range_header:
+        # If this is a range request, add the Range header. Like GET, never send
+        # one for live continuous streams.
+        if range_header and not stream_info.is_live_continuous:
             headers["Range"] = range_header
             logger.info(
                 f"HEAD range request for stream {stream_id}: {stream_url}, Range: {range_header}"
