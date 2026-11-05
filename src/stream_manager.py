@@ -4,6 +4,7 @@ This version implements efficient per-client proxying for continuous streams
 while maintaining the shared buffer approach for HLS segments.
 """
 
+import hashlib
 import m3u8
 import asyncio
 import base64
@@ -806,6 +807,25 @@ class StreamManager:
 
         return "direct"
 
+    @staticmethod
+    def _custom_profile_fingerprint(
+        profile: Optional[str],
+        ffmpeg_args: Optional[List[str]] = None,
+    ) -> str:
+        """Fingerprint the rendered args of a custom (template) profile.
+
+        Every user-provided template resolves to the profile name "custom", so
+        the name alone cannot tell two templates apart. Without this, two HLS
+        templates for the same source URL (e.g. a copy/remux profile and a
+        GPU transcode profile) share one stream ID and pooling key, and the
+        second request is handed the first stream's process. Predefined
+        profiles keep their historical IDs (empty fingerprint).
+        """
+        if profile != "custom" or not ffmpeg_args:
+            return ""
+        joined = "\x1f".join(str(a) for a in ffmpeg_args)
+        return "|" + hashlib.sha256(joined.encode()).hexdigest()[:12]
+
     async def get_or_create_stream(
         self,
         stream_url: str,
@@ -859,8 +879,6 @@ class StreamManager:
             end_session_on_reconnect: End direct-live HTTP bodies before replacing the upstream (None = ENV)
             single_recovery_per_exit: Skip post-loop reclassification of handled exits (None = ENV)
         """
-        import hashlib
-
         # Resolve nullable overrides once. Never change a running stream's policy.
         live_direct = (
             not is_transcoded
@@ -899,7 +917,10 @@ class StreamManager:
                 )
             else:
                 output_mode = self._detect_output_mode(transcode_ffmpeg_args)
-                key_data = f"{stream_url}|transcoded|{transcode_profile or 'default'}|{output_mode}"
+                key_data = (
+                    f"{stream_url}|transcoded|{transcode_profile or 'default'}|{output_mode}"
+                    f"{self._custom_profile_fingerprint(transcode_profile, transcode_ffmpeg_args)}"
+                )
             stream_id = hashlib.md5(key_data.encode()).hexdigest()
         else:
             stream_id = hashlib.md5(stream_url.encode()).hexdigest()

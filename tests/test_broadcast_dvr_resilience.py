@@ -261,3 +261,100 @@ async def test_manager_restart_of_dvr_recording_resumes_instead_of_transitioning
     assert config.segment_start_number == 0
     assert config.add_discontinuity is False
     existing.cleanup_orphaned_segments.assert_not_called()
+
+
+# --- Hung-input recovery (FFmpeg blocked in a network read) -------------------
+#
+# Reproduced against FFmpeg 8.1: an FFmpeg blocked reading a silent input ignores
+# the first SIGTERM; a second SIGTERM makes it abort its final playlist write and
+# still rename the empty temp file over live.m3u8. The restart then found no
+# listed segments, started a new playlist, and the recording kept only what came
+# after the outage. The watchdog now escalates to SIGKILL, which leaves the last
+# written playlist intact.
+
+
+def test_stalled_capture_gets_one_sigterm_then_sigkill(tmp_path):
+    proc = _make_process(tmp_path)
+    proc.process = _fake_process()
+    proc._last_segment_at = time.monotonic() - 31
+
+    proc._terminate_if_stalled()
+    proc.process.terminate.assert_called_once()
+    proc.process.kill.assert_not_called()
+
+    # Still hung well past another stall timeout: never a second SIGTERM.
+    proc._last_segment_at = time.monotonic() - 120
+    proc._stall_term_sent_at = time.monotonic() - 1
+    proc._terminate_if_stalled()
+    proc.process.terminate.assert_called_once()
+    proc.process.kill.assert_not_called()
+
+    proc._stall_term_sent_at = (
+        time.monotonic() - NetworkBroadcastProcess._DVR_STALL_KILL_GRACE_SECONDS - 1
+    )
+    proc._terminate_if_stalled()
+    proc.process.terminate.assert_called_once()
+    proc.process.kill.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_new_segment_does_not_cancel_the_kill_after_sigterm(tmp_path):
+    # A SIGTERM can't be taken back: a segment appearing afterwards must not let the
+    # watchdog start over and send a second one.
+    proc = _make_process(tmp_path)
+    proc.process = _fake_process()
+    term_sent_at = time.monotonic() - 3
+    proc._stall_term_sent_at = term_sent_at
+    (tmp_path / "live000004.ts").write_bytes(b"x")
+
+    async def stop_after_one_poll(_interval):
+        proc._stopping = True
+
+    with patch("src.broadcast_manager.asyncio.sleep", stop_after_one_poll):
+        await proc._poll_bytes()
+
+    assert proc._stall_term_sent_at == term_sent_at
+    proc.process.terminate.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_stop_after_watchdog_sigterm_kills_instead_of_a_second_sigterm(tmp_path):
+    proc = _make_process(tmp_path)
+    proc.process = _fake_process()
+    proc._stall_term_sent_at = time.monotonic() - 2
+
+    await proc.stop(graceful=True)
+
+    proc.process.terminate.assert_not_called()
+    proc.process.kill.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_stop_without_a_watchdog_sigterm_stays_graceful(tmp_path):
+    proc = _make_process(tmp_path)
+    proc.process = _fake_process()
+
+    await proc.stop(graceful=True)
+
+    proc.process.terminate.assert_called_once()
+    proc.process.kill.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_restart_clears_the_pending_sigterm(tmp_path):
+    proc = _make_process(tmp_path)
+    proc.process = _fake_process(returncode=255)
+    proc._deadline = time.monotonic() + 600
+    proc._stall_term_sent_at = time.monotonic() - 11
+
+    with (
+        patch("src.broadcast_manager.asyncio.sleep", AsyncMock()),
+        patch(
+            "src.broadcast_manager.asyncio.create_subprocess_exec",
+            AsyncMock(return_value=_fake_process()),
+        ),
+        patch.object(proc, "_log_stderr", AsyncMock()),
+    ):
+        assert await proc._restart_dvr_capture()
+
+    assert proc._stall_term_sent_at is None
