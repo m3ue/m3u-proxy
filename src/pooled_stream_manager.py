@@ -1352,7 +1352,10 @@ class PooledStreamManager:
             from stream_manager import StreamManager
 
             output_mode = StreamManager._detect_output_mode(ffmpeg_args)
-            data = f"{url}|{profile}|{output_mode}"
+            fingerprint = StreamManager._custom_profile_fingerprint(
+                profile, ffmpeg_args
+            )
+            data = f"{url}|{profile}|{output_mode}{fingerprint}"
         return hashlib.sha256(data.encode()).hexdigest()[:16]
 
     async def get_or_create_shared_stream(

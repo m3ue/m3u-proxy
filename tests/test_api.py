@@ -1,7 +1,9 @@
 # Add src to path first
 from stream_manager import StreamManager
+from pooled_stream_manager import PooledStreamManager
 from api import app, get_content_type, is_direct_stream
 from url_signing import ROLE_HLS_SEGMENT, sign_url
+from datetime import datetime, timezone
 import httpx
 import asyncio
 import pytest
@@ -193,6 +195,57 @@ class TestAPI:
 
         data = response.json()
         assert "deleted" in data["message"].lower()
+
+    @pytest.mark.parametrize(
+        "path",
+        [
+            "/streams/resolver_stream",
+            "/streams/by-metadata?field=type&value=channel",
+            "/streams/oldest-by-metadata?field=type&value=channel",
+        ],
+    )
+    def test_delete_resolver_stream_stops_its_process(
+        self, client, mock_stream_manager, path
+    ):
+        """Resolver streams are pooled under a resolver key, not a profile key."""
+        pooled = PooledStreamManager.__new__(PooledStreamManager)
+        url = "https://provider.example/watch"
+        expected_key = pooled._generate_stream_key(
+            url,
+            "yt-dlp",
+            ffmpeg_args=[],
+            resolver_type="yt-dlp",
+            resolver_args="--format best",
+        )
+        mock_stream_manager.pooled_manager._generate_stream_key = (
+            pooled._generate_stream_key
+        )
+        mock_stream_manager.pooled_manager.force_stop_stream = AsyncMock()
+        mock_stream_manager.cleanup_client = AsyncMock()
+        mock_stream_manager._emit_event = AsyncMock()
+        mock_stream_manager.stream_clients = {}
+        mock_stream_manager.streams = {
+            "resolver_stream": Mock(
+                is_transcoded=True,
+                current_url=url,
+                original_url=url,
+                transcode_profile="yt-dlp",
+                transcode_ffmpeg_args=[],
+                resolver_type="yt-dlp",
+                resolver_args="--format best",
+                metadata={"type": "channel"},
+                created_at=datetime.now(timezone.utc),
+                normalization_input_id=None,
+                normalization_parent_id=None,
+            )
+        }
+
+        response = client.delete(path)
+
+        assert response.status_code == 200
+        mock_stream_manager.pooled_manager.force_stop_stream.assert_awaited_once_with(
+            expected_key
+        )
 
     def test_delete_stream_not_found(self, client, mock_stream_manager):
         mock_stream_manager.streams = {}

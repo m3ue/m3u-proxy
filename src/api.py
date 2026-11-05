@@ -2415,6 +2415,8 @@ async def delete_oldest_stream_by_metadata(
                     stream_info.transcode_profile or "default",
                     ffmpeg_args=stream_info.transcode_ffmpeg_args,
                     metadata=stream_info.metadata,
+                    resolver_type=stream_info.resolver_type,
+                    resolver_args=stream_info.resolver_args,
                 )
                 if (
                     stream_info.normalization_input_id
@@ -2578,6 +2580,8 @@ async def delete_streams_by_metadata(
                             stream_info.transcode_profile or "default",
                             ffmpeg_args=stream_info.transcode_ffmpeg_args,
                             metadata=stream_info.metadata,
+                            resolver_type=stream_info.resolver_type,
+                            resolver_args=stream_info.resolver_args,
                         )
                         await stream_manager.pooled_manager.force_stop_stream(
                             stream_info.transcode_stream_key
@@ -2660,6 +2664,8 @@ async def delete_stream(stream_id: str):
                 stream_info.transcode_profile or "default",
                 ffmpeg_args=stream_info.transcode_ffmpeg_args,
                 metadata=stream_info.metadata,
+                resolver_type=stream_info.resolver_type,
+                resolver_args=stream_info.resolver_args,
             )
             if stream_info.normalization_input_id and stream_info.transcode_stream_key:
                 stream_key = stream_info.transcode_stream_key
