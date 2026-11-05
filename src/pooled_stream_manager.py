@@ -1340,8 +1340,10 @@ class PooledStreamManager:
         The key includes the detected output mode (hls / file / direct) so
         that two transcoded streams with the same URL and profile name but
         different delivery formats (e.g. MPEGTS pipe vs HLS segments) are
-        never incorrectly pooled together.  This matters when both profiles
-        resolve to the same name (e.g. "custom" for user-provided templates).
+        never incorrectly pooled together.  It also includes a fingerprint of
+        the rendered FFmpeg args, so the same profile name with different args
+        (e.g. two "custom" templates, or differing profile_variables) never
+        shares a process.
 
         For resolver-based streams, the key includes the resolver type and args
         instead of the FFmpeg output mode.
@@ -1352,9 +1354,7 @@ class PooledStreamManager:
             from stream_manager import StreamManager
 
             output_mode = StreamManager._detect_output_mode(ffmpeg_args)
-            fingerprint = StreamManager._custom_profile_fingerprint(
-                profile, ffmpeg_args
-            )
+            fingerprint = StreamManager._ffmpeg_args_fingerprint(ffmpeg_args)
             data = f"{url}|{profile}|{output_mode}{fingerprint}"
         return hashlib.sha256(data.encode()).hexdigest()[:16]
 

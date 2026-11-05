@@ -828,20 +828,17 @@ class StreamManager:
         return "direct"
 
     @staticmethod
-    def _custom_profile_fingerprint(
-        profile: Optional[str],
-        ffmpeg_args: Optional[List[str]] = None,
-    ) -> str:
-        """Fingerprint the rendered args of a custom (template) profile.
+    def _ffmpeg_args_fingerprint(ffmpeg_args: Optional[List[str]] = None) -> str:
+        """Fingerprint rendered FFmpeg args for stream IDs and pooling keys.
 
-        Every user-provided template resolves to the profile name "custom", so
-        the name alone cannot tell two templates apart. Without this, two HLS
-        templates for the same source URL (e.g. a copy/remux profile and a
-        GPU transcode profile) share one stream ID and pooling key, and the
-        second request is handed the first stream's process. Predefined
-        profiles keep their historical IDs (empty fingerprint).
+        The profile name cannot identify the output on its own. Every
+        user-provided template resolves to "custom", and a predefined profile
+        renders differently per profile_variables and output_format. Without
+        this, two different encodes of one source URL share a stream ID and
+        pooling key, and the second request is handed the first stream's
+        process. Streams without FFmpeg args (e.g. resolvers) get no fingerprint.
         """
-        if profile != "custom" or not ffmpeg_args:
+        if not ffmpeg_args:
             return ""
         joined = "\x1f".join(str(a) for a in ffmpeg_args)
         return "|" + hashlib.sha256(joined.encode()).hexdigest()[:12]
@@ -939,7 +936,7 @@ class StreamManager:
                 output_mode = self._detect_output_mode(transcode_ffmpeg_args)
                 key_data = (
                     f"{stream_url}|transcoded|{transcode_profile or 'default'}|{output_mode}"
-                    f"{self._custom_profile_fingerprint(transcode_profile, transcode_ffmpeg_args)}"
+                    f"{self._ffmpeg_args_fingerprint(transcode_ffmpeg_args)}"
                 )
             stream_id = hashlib.md5(key_data.encode()).hexdigest()
         else:

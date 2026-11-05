@@ -1,9 +1,9 @@
-"""Two custom (template) profiles for the same source must not share an ID.
+"""Different FFmpeg args for the same source must not share a stream or process.
 
-Every user template resolves to the profile name "custom". Before the
-fingerprint, a copy/remux HLS template and a GPU-transcode HLS template on the
-same URL produced the same stream ID and pooling key, so the second request was
-handed the first stream's process.
+Every user template resolves to the profile name "custom", and a predefined
+profile renders differently per profile_variables. Before the fingerprint, two
+such encodes of one URL produced the same stream ID and pooling key, so the
+second request was handed the first stream's process.
 """
 
 import hashlib
@@ -13,6 +13,7 @@ import pytest_asyncio
 
 from config import settings
 from stream_manager import StreamManager
+from transcoding import get_profile_manager
 
 URL = "http://provider.example/live/u/p/123.ts"
 
@@ -38,23 +39,22 @@ REMOTE_720P = [
 ]
 
 
-def test_fingerprint_only_applies_to_custom_profiles():
-    assert StreamManager._custom_profile_fingerprint("720p", REMOTE_720P) == ""
-    assert StreamManager._custom_profile_fingerprint(None, REMOTE_720P) == ""
-    assert StreamManager._custom_profile_fingerprint("custom", None) == ""
-    assert StreamManager._custom_profile_fingerprint("custom", REMOTE_720P) != ""
+def test_fingerprint_is_empty_without_args():
+    assert StreamManager._ffmpeg_args_fingerprint(None) == ""
+    assert StreamManager._ffmpeg_args_fingerprint([]) == ""
+    assert StreamManager._ffmpeg_args_fingerprint(REMOTE_720P) != ""
 
 
 def test_fingerprint_is_stable_and_distinguishes_templates():
-    a = StreamManager._custom_profile_fingerprint("custom", PASSTHROUGH)
-    assert a == StreamManager._custom_profile_fingerprint("custom", list(PASSTHROUGH))
-    assert a != StreamManager._custom_profile_fingerprint("custom", REMOTE_720P)
+    a = StreamManager._ffmpeg_args_fingerprint(PASSTHROUGH)
+    assert a == StreamManager._ffmpeg_args_fingerprint(list(PASSTHROUGH))
+    assert a != StreamManager._ffmpeg_args_fingerprint(REMOTE_720P)
 
 
 def test_fingerprint_not_fooled_by_argument_boundaries():
     # ["-a", "b c"] and ["-a b", "c"] join to the same text with spaces.
-    one = StreamManager._custom_profile_fingerprint("custom", ["-a", "b c"])
-    two = StreamManager._custom_profile_fingerprint("custom", ["-a b", "c"])
+    one = StreamManager._ffmpeg_args_fingerprint(["-a", "b c"])
+    two = StreamManager._ffmpeg_args_fingerprint(["-a b", "c"])
     assert one != two
 
 
@@ -104,17 +104,57 @@ def test_pooling_keys_differ_for_two_custom_hls_profiles():
     k2 = pm._generate_stream_key(URL, "custom", REMOTE_720P)
     assert k1 != k2
     assert k1 == pm._generate_stream_key(URL, "custom", list(PASSTHROUGH))
-    # Predefined profiles keep their historical keys.
-    expected = hashlib.sha256(f"{URL}|720p|hls".encode()).hexdigest()[:16]
-    assert pm._generate_stream_key(URL, "720p", REMOTE_720P) == expected
+
+
+def _render_720p(**variables):
+    base = {"input_url": URL, "output_args": "pipe:1", "format": "mpegts"}
+    return get_profile_manager().get_profile("720p").render({**base, **variables})
 
 
 @pytest.mark.asyncio
-async def test_predefined_profile_keeps_historical_stream_id(manager):
-    stream_id = await manager.get_or_create_stream(
-        URL,
-        is_transcoded=True,
-        transcode_profile="720p",
-        transcode_ffmpeg_args=REMOTE_720P,
+async def test_predefined_profile_variables_get_distinct_stream_ids(manager):
+    high = _render_720p(video_bitrate="2500k")
+    low = _render_720p(video_bitrate="800k")
+
+    async def stream_id(args):
+        return await manager.get_or_create_stream(
+            URL,
+            is_transcoded=True,
+            transcode_profile="720p",
+            transcode_ffmpeg_args=args,
+        )
+
+    high_id = await stream_id(high)
+    low_id = await stream_id(low)
+    assert high_id != low_id
+    assert manager.streams[low_id].transcode_ffmpeg_args == low
+
+    # The same variables still pool onto the same stream.
+    assert await stream_id(_render_720p(video_bitrate="2500k")) == high_id
+
+
+def test_pooling_keys_differ_for_predefined_profile_variables():
+    from pooled_stream_manager import PooledStreamManager
+
+    pm = PooledStreamManager.__new__(PooledStreamManager)
+    high = _render_720p(video_bitrate="2500k")
+    low = _render_720p(video_bitrate="800k")
+    assert pm._generate_stream_key(URL, "720p", high) != pm._generate_stream_key(
+        URL, "720p", low
     )
-    assert stream_id == hashlib.md5(f"{URL}|transcoded|720p|hls".encode()).hexdigest()
+    assert pm._generate_stream_key(URL, "720p", high) == pm._generate_stream_key(
+        URL, "720p", _render_720p(video_bitrate="2500k")
+    )
+
+
+def test_resolver_keys_ignore_ffmpeg_args():
+    from pooled_stream_manager import PooledStreamManager
+
+    pm = PooledStreamManager.__new__(PooledStreamManager)
+    expected = hashlib.sha256(f"{URL}|resolver|ytdlp|best".encode()).hexdigest()[:16]
+    assert (
+        pm._generate_stream_key(
+            URL, "ytdlp", ffmpeg_args=[], resolver_type="ytdlp", resolver_args="best"
+        )
+        == expected
+    )
