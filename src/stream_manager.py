@@ -821,7 +821,7 @@ class StreamManager:
         second request is handed the first stream's process. Predefined
         profiles keep their historical IDs (empty fingerprint).
         """
-        if (profile or "default") != "custom" or not ffmpeg_args:
+        if profile != "custom" or not ffmpeg_args:
             return ""
         joined = "\x1f".join(str(a) for a in ffmpeg_args)
         return "|" + hashlib.sha256(joined.encode()).hexdigest()[:12]
@@ -879,8 +879,6 @@ class StreamManager:
             end_session_on_reconnect: End direct-live HTTP bodies before replacing the upstream (None = ENV)
             single_recovery_per_exit: Skip post-loop reclassification of handled exits (None = ENV)
         """
-        import hashlib
-
         # Resolve nullable overrides once. Never change a running stream's policy.
         live_direct = (
             not is_transcoded

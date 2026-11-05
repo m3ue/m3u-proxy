@@ -6,6 +6,8 @@ same URL produced the same stream ID and pooling key, so the second request was
 handed the first stream's process.
 """
 
+import hashlib
+
 import pytest
 import pytest_asyncio
 
@@ -103,6 +105,16 @@ def test_pooling_keys_differ_for_two_custom_hls_profiles():
     assert k1 != k2
     assert k1 == pm._generate_stream_key(URL, "custom", list(PASSTHROUGH))
     # Predefined profiles keep their historical keys.
-    assert pm._generate_stream_key(URL, "720p", REMOTE_720P) == pm._generate_stream_key(
-        URL, "720p", list(REMOTE_720P)
+    expected = hashlib.sha256(f"{URL}|720p|hls".encode()).hexdigest()[:16]
+    assert pm._generate_stream_key(URL, "720p", REMOTE_720P) == expected
+
+
+@pytest.mark.asyncio
+async def test_predefined_profile_keeps_historical_stream_id(manager):
+    stream_id = await manager.get_or_create_stream(
+        URL,
+        is_transcoded=True,
+        transcode_profile="720p",
+        transcode_ffmpeg_args=REMOTE_720P,
     )
+    assert stream_id == hashlib.md5(f"{URL}|transcoded|720p|hls".encode()).hexdigest()
