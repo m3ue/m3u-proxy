@@ -641,7 +641,9 @@ class NetworkBroadcastProcess:
 
         if self.process and self.process.returncode is None:
             try:
-                if graceful:
+                # After the stall watchdog's SIGTERM, a second one would make FFmpeg
+                # wipe live.m3u8 on its way out (see _terminate_if_stalled).
+                if graceful and self._stall_term_sent_at is None:
                     self.process.terminate()
                     try:
                         await asyncio.wait_for(self.process.wait(), timeout=5.0)
@@ -896,7 +898,6 @@ class NetworkBroadcastProcess:
                 return False
             self.config.duration_seconds = int(remaining) + 1
 
-        self._restore_dvr_playlist_if_truncated()
         self._stall_term_sent_at = None
         cmd = self._build_ffmpeg_command()
         logger.info(f"Restarting DVR capture {self.network_id}: {' '.join(cmd)}")
@@ -981,15 +982,12 @@ class NetworkBroadcastProcess:
                                 self._last_segment_at = time.monotonic()
                                 self._outage_started_at = None
                                 self._restart_count = 0
-                                self._stall_term_sent_at = None
                                 try:
                                     self._bytes_written += os.path.getsize(
                                         os.path.join(self.hls_dir, filename)
                                     )
                                 except OSError:
                                     pass
-                                if self.config.dvr_mode:
-                                    self._snapshot_dvr_playlist()
                     if self.config.dvr_mode:
                         self._terminate_if_stalled()
                 except Exception:
@@ -1050,77 +1048,6 @@ class NetworkBroadcastProcess:
             self.process.terminate()
         except ProcessLookupError:
             pass
-
-    # Copy of the last DVR playlist that listed every segment so far.
-    _DVR_PLAYLIST_SNAPSHOT = "live.m3u8.last-good"
-
-    def _snapshot_dvr_playlist(self) -> None:
-        """Keep a copy of the DVR playlist that never loses a segment, so a playlist
-        FFmpeg truncates on its way out can be put back before the capture restarts.
-
-        The copy itself is validated before it replaces the previous snapshot: FFmpeg
-        may replace live.m3u8 between any two reads, so only a copy that lists every
-        segment the previous snapshot listed is installed."""
-        playlist = os.path.join(self.hls_dir, "live.m3u8")
-        snapshot = os.path.join(self.hls_dir, self._DVR_PLAYLIST_SNAPSHOT)
-        tmp = snapshot + ".tmp"
-        try:
-            shutil.copyfile(playlist, tmp)
-            copied = self.parse_playlist_segments(tmp)
-            previous = self.parse_playlist_segments(snapshot)
-            if copied and copied >= previous:
-                os.replace(tmp, snapshot)
-            else:
-                os.remove(tmp)
-        except OSError as e:
-            logger.warning(
-                f"Broadcast {self.network_id}: playlist snapshot failed: {e}"
-            )
-
-    def _restore_dvr_playlist_if_truncated(self) -> None:
-        """Before a DVR restart: if live.m3u8 lost segments the last snapshot lists
-        (FFmpeg truncated it while exiting), put them back so append_list continues the
-        full recording instead of starting a new one. The snapshot's entries come first,
-        followed by any newer segments only live.m3u8 lists; membership is compared, not
-        just the number of segments."""
-        playlist = os.path.join(self.hls_dir, "live.m3u8")
-        snapshot = os.path.join(self.hls_dir, self._DVR_PLAYLIST_SNAPSHOT)
-        have = self.parse_playlist_segments(playlist)
-        good = self.parse_playlist_segments(snapshot)
-        if good <= have:
-            return
-        try:
-            with open(snapshot) as f:
-                merged = [
-                    ln for ln in f.read().splitlines() if ln.strip() != "#EXT-X-ENDLIST"
-                ]
-            newer, block = [], []
-            if os.path.exists(playlist):
-                with open(playlist) as f:
-                    for line in f.read().splitlines():
-                        stripped = line.strip()
-                        if not stripped or stripped.startswith("#EXTM3U"):
-                            continue
-                        if stripped.startswith("#EXT-X-") and not stripped.startswith(
-                            ("#EXT-X-DISCONTINUITY", "#EXT-X-PROGRAM-DATE-TIME")
-                        ):
-                            continue  # header tags: the snapshot's own are kept
-                        block.append(line)
-                        if not stripped.startswith("#"):
-                            if os.path.basename(stripped) not in good:
-                                newer += block
-                            block = []
-            tmp = playlist + ".restore"
-            with open(tmp, "w") as f:
-                f.write("\n".join(merged + newer) + "\n")
-            os.replace(tmp, playlist)
-            logger.warning(
-                f"Broadcast {self.network_id}: DVR playlist listed {len(have)} segments "
-                f"after FFmpeg exited, missing {len(good - have)} of the last good copy; "
-                f"restored them"
-            )
-        except OSError as e:
-            logger.error(f"Broadcast {self.network_id}: playlist restore failed: {e}")
 
     def _get_bytes_written(self) -> int:
         """Return cumulative bytes written across all segments ever seen."""

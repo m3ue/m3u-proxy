@@ -25,7 +25,10 @@ pytestmark = [
     pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg required"),
 ]
 
-MEDIA_SECONDS = 120
+MEDIA_SECONDS = 60
+# Sent at once on connect, as many providers do, so FFmpeg's probe doesn't need
+# real-time seconds of input and the short stall timeout below can't fire during it.
+BURST_SECONDS = 8
 
 
 @pytest.fixture(scope="module")
@@ -76,12 +79,13 @@ def source_ts(tmp_path_factory):
 
 
 class LiveSource:
-    """Serves a TS file as a live stream paced at real time; can be told to hang."""
+    """Serves a TS file as a live stream paced at real time after an initial burst;
+    can be told to hang."""
 
     def __init__(self, path):
         self.data = path.read_bytes()
         self.rate = len(self.data) / MEDIA_SECONDS
-        self.t0 = time.monotonic()
+        self.t0 = time.monotonic() - BURST_SECONDS
         self.hanging = False
 
     def _offset(self):
@@ -94,6 +98,11 @@ class LiveSource:
             while self.hanging:  # accepted, never answered
                 await asyncio.sleep(0.1)
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\n\r\n")
+            pos = self._offset() - int(BURST_SECONDS * self.rate) // 188 * 188
+            writer.write(
+                self.data[pos : pos + int(BURST_SECONDS * self.rate) // 188 * 188]
+            )
+            await writer.drain()
             pos, last = self._offset(), time.monotonic()
             while True:
                 await asyncio.sleep(0.1)
@@ -141,8 +150,8 @@ async def test_hung_input_keeps_segments_recorded_before_the_outage(
     config = BroadcastConfig(
         network_id="hung-input",
         stream_url=f"http://127.0.0.1:{port}/stream.ts",
-        duration_seconds=90,
-        segment_duration=2,
+        duration_seconds=20,
+        segment_duration=1,
         dvr_mode=True,
         hls_list_size=0,
     )
@@ -156,29 +165,29 @@ async def test_hung_input_keeps_segments_recorded_before_the_outage(
     playlist = os.path.join(proc.hls_dir, "live.m3u8")
 
     with (
-        patch("src.broadcast_manager.settings.DVR_STALL_TIMEOUT_SECONDS", 10.0),
+        patch("src.broadcast_manager.settings.DVR_STALL_TIMEOUT_SECONDS", 3.0),
         patch("src.broadcast_manager.settings.DVR_RESTART_WINDOW_SECONDS", 120.0),
-        patch.object(
-            NetworkBroadcastProcess, "_DVR_STALL_KILL_GRACE_SECONDS", 2.0, create=True
-        ),
+        patch.object(NetworkBroadcastProcess, "_DVR_STALL_KILL_GRACE_SECONDS", 1.0),
     ):
-        assert await proc.start()
-        for _ in range(60):
-            await asyncio.sleep(0.5)
-            if len(_listed(playlist)) >= 4:
-                break
-        before_outage = _listed(playlist)
-        assert len(before_outage) >= 4, "capture never got going"
+        try:
+            assert await proc.start()
+            for _ in range(60):
+                await asyncio.sleep(0.5)
+                if len(_listed(playlist)) >= 4:
+                    break
+            before_outage = _listed(playlist)
+            assert len(before_outage) >= 4, "capture never got going"
 
-        source.hanging = (
-            True  # watchdog: SIGTERM at 10s; the old code sent another at 20s
-        )
-        await asyncio.sleep(30)
-        source.hanging = False
+            # Watchdog: SIGTERM at 3s, kill at 4s; the old code's second SIGTERM came at 6s.
+            source.hanging = True
+            await asyncio.sleep(8)
+            source.hanging = False
 
-        await asyncio.wait_for(proc._monitor_task, timeout=90)
+            await asyncio.wait_for(proc._monitor_task, timeout=30)
+        finally:
+            await proc.stop(graceful=False)
+            server.close()
 
-    server.close()
     final = _listed(playlist)
 
     assert events == ["programme_ended"]
