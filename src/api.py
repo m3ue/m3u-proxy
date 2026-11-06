@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, Query, Response, Request, Depends, Header
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.types import ASGIApp, Receive, Scope, Send
 from contextlib import asynccontextmanager
 import asyncio
 import json
@@ -489,12 +490,29 @@ async def lifespan(app: FastAPI):
     await event_manager.stop()
 
 
+class RootPathMiddleware:
+    """Set the ASGI root_path so routes match with or without the prefix.
+
+    Replaces FastAPI's deprecated root_path parameter. uvicorn's root_path is
+    not equivalent: it prepends the prefix to every request path, so a reverse
+    proxy that forwards /m3u-proxy/... without stripping the prefix gets a 404.
+    """
+
+    def __init__(self, app: ASGIApp, root_path: str) -> None:
+        self.app = app
+        self.root_path = root_path
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if self.root_path:
+            scope["root_path"] = self.root_path
+        await self.app(scope, receive, send)
+
+
 app = FastAPI(
     title="m3u proxy",
     version=VERSION,
     description="Advanced IPTV streaming proxy with client management, stats, and failover support",
     lifespan=lifespan,
-    root_path=settings.ROOT_PATH if hasattr(settings, "ROOT_PATH") else "",
     docs_url=None,  # We'll create a minimal custom docs with logo/favicon
     # docs_url=settings.DOCS_URL if hasattr(settings, 'DOCS_URL') else "/docs",
     redoc_url=settings.REDOC_URL if hasattr(settings, "REDOC_URL") else "/redoc",
@@ -537,6 +555,7 @@ app.add_middleware(
     allow_headers=["*"],  # Allow all headers
     expose_headers=["*"],  # Expose all headers to the client
 )
+app.add_middleware(RootPathMiddleware, root_path=settings.ROOT_PATH)
 
 
 # Minimal custom Swagger UI with logo and favicon
@@ -548,9 +567,9 @@ async def custom_swagger_ui_html():
 <html>
 <head>
     <title>{app.title}</title>
-    <link rel="icon" type="image/svg+xml" href="{app.root_path}/static/favicon.svg">
-    <link rel="icon" type="image/png" href="{app.root_path}/static/favicon.png">
-    <link rel="shortcut icon" href="{app.root_path}/static/favicon.ico">
+    <link rel="icon" type="image/svg+xml" href="{settings.ROOT_PATH}/static/favicon.svg">
+    <link rel="icon" type="image/png" href="{settings.ROOT_PATH}/static/favicon.png">
+    <link rel="shortcut icon" href="{settings.ROOT_PATH}/static/favicon.ico">
     <link rel="stylesheet" type="text/css" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui.css">
     <style>
         .topbar {{ display: none; }}
@@ -563,7 +582,7 @@ async def custom_swagger_ui_html():
     <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
     <script>
     const ui = SwaggerUIBundle({{
-        url: '{app.root_path}{app.openapi_url}',
+        url: '{settings.ROOT_PATH}{app.openapi_url}',
         dom_id: '#swagger-ui',
         deepLinking: true,
         showExtensions: true,
@@ -577,7 +596,7 @@ async def custom_swagger_ui_html():
             const title = document.querySelector('.info .title');
             if (title && !document.querySelector('.custom-logo')) {{
                 const logo = document.createElement('img');
-                logo.src = '{app.root_path}/static/logo.svg';
+                logo.src = '{settings.ROOT_PATH}/static/logo.svg';
                 logo.alt = '{app.title}';
                 logo.className = 'custom-logo';
                 title.insertBefore(logo, title.firstChild);
