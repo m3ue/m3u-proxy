@@ -2967,10 +2967,13 @@ async def health_check():
             "total_bytes_served": proxy_stats["total_bytes_served"],
             "stats": proxy_stats,
         }
-    except Exception as e:
-        logger.error(f"Error in health check: {e}")
+    except Exception:
+        # Log the full traceback server-side; never echo exception text to the
+        # caller (CodeQL py/stack-trace-exposure).
+        logger.exception("Error in health check")
         return JSONResponse(
-            status_code=500, content={"status": "error", "error": str(e)}
+            status_code=500,
+            content={"status": "error", "error": "Health check failed"},
         )
 
 
