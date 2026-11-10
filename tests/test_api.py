@@ -104,6 +104,17 @@ class TestAPI:
         assert data["status"] == "healthy"
         assert "stats" in data
 
+    def test_health_endpoint_error_does_not_leak_exception_text(
+        self, client, mock_stream_manager
+    ):
+        mock_stream_manager.get_stats = Mock(
+            side_effect=RuntimeError("secret internal detail /var/lib/x")
+        )
+        response = client.get("/health")
+        assert response.status_code == 500
+        assert response.json() == {"status": "error", "error": "Health check failed"}
+        assert "secret internal detail" not in response.text
+
     def test_create_stream_post_valid(self, client, mock_stream_manager):
         payload = {
             "url": "http://example.com/stream.m3u8",
