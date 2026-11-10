@@ -86,7 +86,16 @@ _FFMPEG_INPUT_ERROR_PATTERNS = (
     "server returned 5",  # Matches 500, 502, 503, etc.
     "invalid data found",
     "protocol not found",
+    # Mid-stream upstream loss once -reconnect is exhausted, e.g.
+    # "[in#0/mpegts @ 0x...] Error during demuxing: I/O error".
+    "error during demuxing",
 )
+
+# ffmpeg prefixes its own messages about an input with "[in#N" (output
+# messages use "[out#N"). A write-error pattern on such a line (e.g. the short
+# "I/O error") describes the upstream, not our output, so it must trip
+# failover instead of being treated as a local write failure.
+_FFMPEG_INPUT_CONTEXT_PREFIX = "[in#"
 
 # Only the server-generated QSV normalization identity may defer these exact
 # H.264 decoder diagnostics to the existing output-timeout/process-exit checks.
@@ -736,9 +745,15 @@ class SharedTranscodingProcess:
                         self._parse_ffmpeg_progress(line_str)
 
                     line_lower = line_str.lower()
+                    is_input_context = line_lower.startswith(
+                        _FFMPEG_INPUT_CONTEXT_PREFIX
+                    )
 
-                    # Check for write errors
-                    for pattern in _FFMPEG_WRITE_ERROR_PATTERNS:
+                    # Check for write errors (never on input-context lines; see
+                    # _FFMPEG_INPUT_CONTEXT_PREFIX)
+                    for pattern in (
+                        () if is_input_context else _FFMPEG_WRITE_ERROR_PATTERNS
+                    ):
                         if pattern in line_lower:
                             logger.error(
                                 f"FFmpeg write error detected for {self.stream_id}: {line_str}"
@@ -755,7 +770,10 @@ class SharedTranscodingProcess:
                         and _QSV_NORMALIZATION_PROFILE_RE.fullmatch(self.profile)
                         and _H264_PACKET_DIAGNOSTIC_RE.fullmatch(line_lower)
                     )
-                    for pattern in _FFMPEG_INPUT_ERROR_PATTERNS:
+                    input_patterns = _FFMPEG_INPUT_ERROR_PATTERNS
+                    if is_input_context:
+                        input_patterns += _FFMPEG_WRITE_ERROR_PATTERNS
+                    for pattern in input_patterns:
                         if pattern == "invalid data found" and qsv_decoder_diagnostic:
                             continue
                         if pattern in line_lower:
