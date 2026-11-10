@@ -37,9 +37,7 @@ async def monitor(*chunks, status="running"):
 )
 async def test_input_context_io_errors_trip_failover(line, caplog):
     with caplog.at_level(logging.ERROR, logger="pooled_stream_manager"):
-        pooled = await monitor(
-            b"frame=100 fps=25 bitrate=1024kbits/s speed=1x\r", line
-        )
+        pooled = await monitor(b"frame=100 fps=25 bitrate=1024kbits/s speed=1x\r", line)
 
     assert pooled.status == "input_failed"
     assert "input error detected" in caplog.text
