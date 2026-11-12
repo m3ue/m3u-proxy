@@ -71,18 +71,12 @@ jobs:
       - name: Install pip-audit
         run: pip install pip-audit
 
-      # Both audits fail the job on any finding, and the publish workflows
-      # call this file and wait for it, so a vulnerability published between
-      # pushing and building still stops the release.
-      - name: Audit runtime dependencies (shipped in the image)
-        run: pip-audit -r requirements.txt --skip-editable
-
-      # Reviewed exceptions only, each with its tracking issue:
-      # - PYSEC-2026-1845 (GHSA-6w46-j5rx-g56g): pytest <9.0.3 tmpdir handling.
-      #   Test-only, never in the runtime image, and needs local access. The
-      #   fix is blocked on the httpx 0.28 upgrade; remove this once #92 lands.
-      - name: Audit test dependencies
-        run: pip-audit -r requirements-dev.txt --skip-editable --ignore-vuln PYSEC-2026-1845
+      # Fails the job on any finding, and the publish workflows call this file
+      # and wait for it, so a vulnerability published between pushing and
+      # building still stops the release. The script holds the reviewed
+      # exceptions and is what developers run locally before pushing.
+      - name: Audit dependencies
+        run: ./tools/security-scan.sh
 
   test:
     name: Tests
