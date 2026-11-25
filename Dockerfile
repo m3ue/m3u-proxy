@@ -1,6 +1,6 @@
 # Pinned to match the FFmpeg version embedded in m3u-editor (Alpine edge ffmpeg).
 # Bump both together.
-FROM linuxserver/ffmpeg:8.1.2
+FROM linuxserver/ffmpeg:9.0.2
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
@@ -14,11 +14,11 @@ RUN apt-get update && apt-get install -y \
 # Install Deno (default JS runtime for yt-dlp's EJS challenge solver — no extra flags needed)
 COPY --from=denoland/deno:latest /usr/bin/deno /usr/local/bin/deno
 
-# Python comes from uv (a standalone CPython build) instead of apt, because the
-# Ubuntu 24.04 base only ships 3.12. Keep PYTHON_VERSION on the same minor as
-# the python3 in m3u-editor's Alpine base image (Alpine 3.24: 3.14), which runs
-# this same code embedded. The venv's bin is first on PATH so python3,
-# streamlink and yt-dlp all resolve to it.
+# Python comes from uv (a standalone CPython build) instead of apt, so its version
+# doesn't depend on the Ubuntu release the FFmpeg image is built on. Keep
+# PYTHON_VERSION on the same minor as the python3 in m3u-editor's Alpine base
+# image (Alpine 3.24: 3.14), which runs this same code embedded. The venv's bin
+# is first on PATH so python3, streamlink and yt-dlp all resolve to it.
 ARG PYTHON_VERSION=3.14
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 ENV UV_PYTHON_INSTALL_DIR=/opt/python \
