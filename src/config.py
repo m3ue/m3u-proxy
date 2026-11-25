@@ -229,6 +229,10 @@ class Settings(BaseSettings):
     # connection makes most providers replay their buffer (viewers see the last
     # 10-20s again) and uses an extra provider connection slot.
     PRIMARY_HANDOFF_WAIT_SECONDS: float = 2.0
+    # How long (seconds) the primary reader of a shared direct stream may leave a chunk
+    # unread before the proxy keeps reading upstream without it, so a paused viewer
+    # doesn't stall the others (including DVR recordings). 0 disables this.
+    PRIMARY_STALL_SECONDS: float = 2.0
 
     # Maximum failover attempts before giving up on a stream.
     # Set to 0 to try all configured failover URLs (no limit).

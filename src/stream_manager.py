@@ -13,10 +13,12 @@ import logging
 import os
 import re
 import tempfile
+import time
 import uuid
 import xml.etree.ElementTree as ET
+from collections import deque
 from contextlib import aclosing
-from typing import Dict, Optional, List, Set, Any
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Set
 from urllib.parse import urlparse, urljoin, quote
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass, field
@@ -458,6 +460,84 @@ class DashProcessor:
             return content
 
 
+# Chunks (32 KB each) kept for a client of a shared direct stream that is reading
+# slower than the stream arrives. The oldest are dropped beyond this.
+DIRECT_QUEUE_CHUNKS = 512
+
+
+class PrimaryOutput:
+    """Relays a primary reader's chunks to its client, and can outrun that client.
+
+    The primary reads upstream only when its client asks for the next chunk, so a
+    client that stops reading (a paused player) would starve every subscriber.
+    ``drain()`` then advances the reader on the client's behalf - which is what
+    broadcasts to subscribers - keeping the newest chunks for when it resumes.
+    While the client keeps up, chunks pass straight through.
+    """
+
+    def __init__(self, source: AsyncGenerator[bytes, None], max_chunks: int) -> None:
+        self._source = source
+        self._pending: deque[bytes] = deque(maxlen=max_chunks)
+        self._read_lock = asyncio.Lock()
+        self._waiting_since: Optional[float] = None
+        self._drain_task: Optional[asyncio.Task] = None
+
+    def prepend(self, chunk: bytes) -> None:
+        """Queue a chunk that was read from the source before relaying started."""
+        self._pending.append(chunk)
+
+    def stalled_for(self) -> float:
+        """Seconds the client has had a chunk without asking for the next one."""
+        if self._waiting_since is None:
+            return 0.0
+        return time.monotonic() - self._waiting_since
+
+    @property
+    def draining(self) -> bool:
+        return self._drain_task is not None and not self._drain_task.done()
+
+    def start_drain(self, should_continue: Callable[[], bool]) -> None:
+        self._drain_task = asyncio.create_task(self._drain(should_continue))
+
+    async def _drain(self, should_continue: Callable[[], bool]) -> None:
+        try:
+            while self._waiting_since is not None and should_continue():
+                async with self._read_lock:
+                    if self._waiting_since is None:
+                        return
+                    self._pending.append(await self._source.__anext__())
+        except StopAsyncIteration:
+            pass
+        except Exception as e:
+            logger.warning(f"Primary reader failed while its client was stalled: {e}")
+
+    async def _next_chunk(self) -> bytes:
+        # A drain may be mid-read: the source can only be advanced by one reader.
+        if not self._pending:
+            async with self._read_lock:
+                if not self._pending:
+                    return await self._source.__anext__()
+        return self._pending.popleft()
+
+    async def relay(self) -> AsyncGenerator[bytes, None]:
+        try:
+            while True:
+                try:
+                    chunk = await self._next_chunk()
+                except StopAsyncIteration:
+                    return
+                self._waiting_since = time.monotonic()
+                yield chunk
+                self._waiting_since = None
+        finally:
+            # Stop the drain first: a generator that is being read can't be closed.
+            self._waiting_since = None
+            if self.draining:
+                self._drain_task.cancel()
+                await asyncio.gather(self._drain_task, return_exceptions=True)
+            await self._source.aclose()
+
+
 class ShieldedUpstreamReader:
     """Async iterator over upstream chunks whose in-flight read survives cancellation.
 
@@ -557,6 +637,11 @@ class StreamManager:
         # off its upstream connection, so the promoted subscriber can wait for
         # the handoff instead of racing it and opening a second connection.
         self._handoff_settled: Dict[str, asyncio.Event] = {}
+
+        # The current primaries' outputs, and a watcher per shared stream that keeps
+        # subscribers fed when the primary's own client stops reading.
+        self._primary_outputs: Dict[str, PrimaryOutput] = {}  # by connection_id
+        self._primary_stall_watchers: Dict[str, asyncio.Task] = {}  # by stream_id
 
         # Pooling configuration
         self.enable_pooling = enable_pooling
@@ -1346,6 +1431,62 @@ class StreamManager:
                 except asyncio.QueueFull:
                     pass
 
+    async def _relay_primary(
+        self,
+        connection_id: str,
+        source: AsyncGenerator[bytes, None],
+        first_chunk: Optional[bytes] = None,
+    ) -> AsyncGenerator[bytes, None]:
+        """Relay a primary reader's chunks to its client (see PrimaryOutput)."""
+        output = PrimaryOutput(source, DIRECT_QUEUE_CHUNKS)
+        if first_chunk is not None:
+            output.prepend(first_chunk)
+        self._primary_outputs[connection_id] = output
+        try:
+            async with aclosing(output.relay()) as chunks:
+                async for chunk in chunks:
+                    yield chunk
+        finally:
+            if self._primary_outputs.get(connection_id) is output:
+                del self._primary_outputs[connection_id]
+
+    def _watch_primary_stalls(self, stream_id: str) -> None:
+        """Keep a shared stream moving while its primary's client isn't reading."""
+        if settings.PRIMARY_STALL_SECONDS <= 0:
+            return
+        watcher = self._primary_stall_watchers.get(stream_id)
+        if watcher is None or watcher.done():
+            self._primary_stall_watchers[stream_id] = asyncio.create_task(
+                self._run_primary_stall_watcher(stream_id)
+            )
+
+    async def _run_primary_stall_watcher(self, stream_id: str) -> None:
+        try:
+            while self._direct_broadcast_queues.get(stream_id):
+                await asyncio.sleep(min(0.5, settings.PRIMARY_STALL_SECONDS))
+                primary = self._direct_broadcast_primary.get(stream_id)
+                output = self._primary_outputs.get(primary)
+                if (
+                    output is None
+                    or output.draining
+                    or output.stalled_for() < settings.PRIMARY_STALL_SECONDS
+                    or not self._direct_broadcast_queues.get(stream_id)
+                ):
+                    continue
+                logger.info(
+                    f"Primary client of stream {stream_id} stopped reading, "
+                    f"continuing upstream reads for its subscribers"
+                )
+                output.start_drain(
+                    lambda primary=primary: (
+                        self._direct_broadcast_primary.get(stream_id) == primary
+                        and bool(self._direct_broadcast_queues.get(stream_id))
+                    )
+                )
+        finally:
+            if self._primary_stall_watchers.get(stream_id) is asyncio.current_task():
+                del self._primary_stall_watchers[stream_id]
+
     async def _end_direct_generation(self, stream_id: str, connection_id: str) -> None:
         """End bodies rather than promote; retain current_url for a new request."""
         # Let any in-flight source selection settle before exposing the next
@@ -1546,12 +1687,13 @@ class StreamManager:
     ) -> StreamingResponse:
         """Return a StreamingResponse that reads from a broadcast queue instead of upstream."""
         stream_info = self.streams[stream_id]
-        queue: asyncio.Queue = asyncio.Queue(maxsize=512)
+        queue: asyncio.Queue = asyncio.Queue(maxsize=DIRECT_QUEUE_CHUNKS)
         generation = stream_info.direct_generation
 
         if stream_id not in self._direct_broadcast_queues:
             self._direct_broadcast_queues[stream_id] = {}
         self._direct_broadcast_queues[stream_id][connection_id] = queue
+        self._watch_primary_stalls(stream_id)
 
         logger.info(
             f"Client {client_id} subscribing to existing direct stream {stream_id} "
@@ -1622,7 +1764,7 @@ class StreamManager:
                                 f"(timeout path), promoting to primary"
                             )
                             async with aclosing(
-                                self._promoted_primary_generate(
+                                self._relay_promoted_primary(
                                     stream_id,
                                     client_id,
                                     connection_id,
@@ -1649,7 +1791,7 @@ class StreamManager:
                         # this one exits, so its finally (upstream handoff) runs
                         # immediately rather than whenever it is garbage collected.
                         async with aclosing(
-                            self._promoted_primary_generate(
+                            self._relay_promoted_primary(
                                 stream_id,
                                 client_id,
                                 connection_id,
@@ -1717,6 +1859,22 @@ class StreamManager:
             media_type=content_type,
             headers=headers,
         )
+
+    def _relay_promoted_primary(
+        self,
+        stream_id: str,
+        client_id: str,
+        connection_id: str,
+        cancel_event: asyncio.Event,
+        overlap_trimmer: Optional[OverlapTrimmer] = None,
+    ) -> AsyncGenerator[bytes, None]:
+        source = self._promoted_primary_generate(
+            stream_id, client_id, connection_id, cancel_event, overlap_trimmer
+        )
+        stream_info = self.streams.get(stream_id)
+        if stream_info is None or self._is_qsv_owned_input(stream_info):
+            return source
+        return self._relay_primary(connection_id, source)
 
     async def _promoted_primary_generate(
         self,
@@ -4175,8 +4333,15 @@ class StreamManager:
                     # Closing only this wrapper leaves the provider generator open.
                     await gen.aclose()
 
+        # Only live streams are shared. QSV inputs are read by FFmpeg and fence their
+        # chunks by generation, so they are never read ahead of it.
+        if stream_info.is_vod or qsv_owned_input:
+            body = generate_with_first_chunk()
+        else:
+            body = self._relay_primary(connection_id, gen, first_chunk)
+
         return StreamingResponse(
-            generate_with_first_chunk(),
+            body,
             status_code=status_code,
             media_type=content_type,
             headers=headers,
