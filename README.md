@@ -266,6 +266,9 @@ LIVE_CHUNK_TIMEOUT_SECONDS=15.0
 # When a shared stream's reading client disconnects, how long (seconds) the
 # client taking over waits to reuse its upstream connection before opening a new one
 PRIMARY_HANDOFF_WAIT_SECONDS=2.0
+# When a shared stream's reading client stops reading (e.g. it is paused), how long
+# (seconds) before the proxy keeps reading for the other clients without it (0 = never)
+PRIMARY_STALL_SECONDS=2.0
 
 # Sticky Session Handler (prevents playback loops with load-balanced providers)
 # Locks to specific backend after redirect to maintain playlist consistency
